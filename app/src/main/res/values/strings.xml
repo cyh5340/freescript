@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">poemeditor</string>
+    <string name="add_text_hint">Add text here</string>
 </resources>
