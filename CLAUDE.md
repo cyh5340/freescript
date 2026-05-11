@@ -34,6 +34,8 @@ FrameLayout rootFrame
 |   |               `-- EditText cells
 |   `-- LinearLayout bottomPanel
 |       |-- divider
+|       |-- LinearLayout selectionBar
+|       |   `-- visible only while isSelecting; contains 複製 + ✕ buttons
 |       |-- HorizontalScrollView punctToolbar
 |       |   `-- visible only while IME is visible
 |       `-- LinearLayout toolbar, 54dp, white
@@ -94,6 +96,11 @@ numColumns = MAX_COLUMNS = 50
 - `refreshModeChips()`: only place that recolors writing mode chips.
 - `columnDataToJson()`, `columnBreaksToJson()`, `loadColumnDataFromJson(...)`, `loadColumnBreaksFromJson(...)`: shared persistence helpers.
 - `buildPunctRow(...)` and `buildPunctButton(...)`: shared punctuation UI for IME toolbar and writing panel.
+- `insertCharsAt(insertCol, insertRow, newChars)`: flat-slice insert-shift for SEQUENTIAL; captures content from `(insertCol, insertRow)` forward, writes `newChars`, re-appends displaced content. Never crosses a `columnBreaks` boundary.
+- `performInsert(index, newChars)`: shared insert core; computes the `(iCol, iRow)` insertion point from `cursorBefore`, calls `insertCharsAt`, returns the focus target index after the inserted chars.
+- `deletePreviousSequentialCell(cellCol, cellRow, index)`: SEQUENTIAL backspace — removes the char at `(cellCol, cellRow-1)` (or last occupied in prev column when `cellRow==0`), reflows, refocuses.
+- `removeColumnBreak(cellCol)`: reverse of `insertColumnBreak`; removes the break marker at `cellCol`, reflows the two columns back together, and lands the cursor at the last occupied position in the preceding column.
+- `fillGapsForSequentialMode()`: when switching SCATTER→SEQUENTIAL, fills every empty slot between first and last occupied cell with a half-width space so auto-advance never skips a gap.
 
 ## Reflow
 
@@ -183,6 +190,38 @@ During CJK composition:
 - `showComposingPreview(text, startIndex)` renders chars after the first composing char into following empty cells in grey.
 - `clearComposingPreview()` clears preview cells and restores `gridTextColor`.
 - `isPreviewing` suppresses watcher side effects during preview updates.
+
+## Selection
+
+Multi-cell selection for clipboard copy.
+
+State variables:
+
+- `selectionStart`, `selectionEnd`: flat cell indices (-1 = inactive). `min/max` of the two determines the highlighted range.
+- `isSelecting`: true while selection is active.
+- `selectionBar`: LinearLayout in `bottomPanel`, shown only when `isSelecting`.
+
+Entry: long press on any cell triggers `enterSelectionMode(index)` via `Handler.postDelayed` (native `setOnLongClickListener` is blocked because `setOnTouchListener` returns `true` for `ACTION_DOWN`). `pendingLongPress` is cancelled on `ACTION_UP`/`ACTION_CANCEL`.
+
+Extension: while `isSelecting`, `ACTION_UP` on any cell sets `selectionEnd = index` and calls `updateSelectionHighlight()`. Normal tap + focus path is skipped.
+
+`enterSelectionMode(index)`:
+- Hides IME.
+- Sets `isSelecting = true`, `selectionStart = selectionEnd = index`.
+- Shows `selectionBar`.
+- Calls `updateSelectionHighlight()`.
+
+`updateSelectionHighlight()`: colors cells in `[min, max]` range with `R.color.selection_highlight` (#ADD8E6); all others get `Color.TRANSPARENT`.
+
+`clearSelection()`: resets all selection state, hides `selectionBar`, sets all cell backgrounds to `Color.TRANSPARENT`.
+
+`copySelectedText()`: iterates `columnData` from `from` to `to` by index. Appends `\n` when a column boundary that is also in `columnBreaks` is crossed. Puts result in `ClipboardManager` as plain text, shows "已複製" toast.
+
+`focusCell(...)` guards the background-clear of the previous cell with `if (!isSelecting)` so focus changes during selection do not wipe highlights.
+
+`refreshGrid()` calls `updateSelectionHighlight()` at the end if `isSelecting`.
+
+`rebuildGrid()` calls `clearSelection()` before tearing down views so stale highlight state never leaks into the new grid.
 
 ## Backgrounds
 

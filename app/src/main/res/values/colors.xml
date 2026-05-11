@@ -7,4 +7,20 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- UI chrome colours (fixed, not user-configurable) -->
+    <color name="panel_bg">#F7F7F7</color>
+    <color name="divider_dark">#DDDDDD</color>
+    <color name="divider">#E0E0E0</color>
+    <color name="stroke">#CCCCCC</color>
+    <color name="chip_active">#E3E3E3</color>
+    <color name="row_active">#EFEFEF</color>
+    <color name="text_darkest">#111111</color>
+    <color name="text_darker">#222222</color>
+    <color name="text_dark">#333333</color>
+    <color name="text_medium">#555555</color>
+    <color name="text_light">#888888</color>
+    <color name="text_lighter">#999999</color>
+    <color name="text_hint">#AAAAAA</color>
+    <color name="selection_highlight">#ADD8E6</color>
 </resources>

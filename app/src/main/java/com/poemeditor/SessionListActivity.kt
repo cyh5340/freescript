@@ -11,6 +11,8 @@ import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.widget.NestedScrollView
 import kotlin.math.roundToInt
+import android.app.AlertDialog
+import java.io.File
 
 class SessionListActivity : AppCompatActivity() {
 
@@ -174,6 +176,28 @@ class SessionListActivity : AppCompatActivity() {
             }
         }
     }
+    
+    private fun showDeleteConfirmDialog(meta: SessionMeta) {
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("刪除文檔")
+            .setMessage("確定要刪除「${meta.name}」嗎？此操作無法復原。")
+            .setPositiveButton("確定") { _, _ ->
+                // 執行刪除
+                val file = File(sessionsDir, "${meta.id}.json")
+                if (file.exists()) file.delete()
+                
+                // 重新載入列表
+                allSessions = loadAllSessions()
+                applyFilters()
+                Toast.makeText(this, "已刪除", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+
+        // 依照你的要求，將按鈕文字變為黑色
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(Color.BLACK)
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(Color.BLACK)
+    }
 
     private fun applyFilters() {
         val now = System.currentTimeMillis()
@@ -209,7 +233,7 @@ class SessionListActivity : AppCompatActivity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 layoutParams = LinearLayout.LayoutParams(MP, (52 * dp).roundToInt())
-                setPadding((16 * dp).roundToInt(), 0, (16 * dp).roundToInt(), 0)
+                setPadding((16 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0) // 調整 padding 給按鈕
                 setOnClickListener {
                     setResult(RESULT_OK, Intent().putExtra("session_id", meta.id))
                     finish()
@@ -225,6 +249,20 @@ class SessionListActivity : AppCompatActivity() {
                 setTextColor(Color.parseColor("#AAAAAA"))
                 layoutParams = LinearLayout.LayoutParams(WC, WC)
             })
+            
+            // --- 加入刪除按鈕 ---
+            row.addView(TextView(this).apply {
+                text = "✕"; textSize = 18f; gravity = Gravity.CENTER
+                setTextColor(Color.parseColor("#DDDDDD"))
+                layoutParams = LinearLayout.LayoutParams((44 * dp).roundToInt(), (44 * dp).roundToInt())
+                setOnClickListener { e ->
+                    // 阻止事件傳遞給 row (不觸發讀取文件)
+                    e.cancelPendingInputEvents() 
+                    showDeleteConfirmDialog(meta)
+                }
+            })
+            // ------------------
+
             listContainer.addView(row)
             listContainer.addView(View(this).apply {
                 layoutParams = LinearLayout.LayoutParams(MP, (1f * dp).roundToInt()).also {

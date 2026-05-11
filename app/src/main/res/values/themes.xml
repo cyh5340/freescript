@@ -10,5 +10,13 @@
         <item name="colorControlActivated">@color/black</item>
         <item name="android:statusBarColor">@color/white</item>
         <item name="android:windowLightStatusBar" tools:targetApi="23">true</item>
+        <item name="alertDialogTheme">@style/ThemeOverlay.App.Dialog</item>
+        <item name="android:buttonBarButtonStyle">@style/Widget.App.Button.TextButton</item>
+    </style>
+    <style name="ThemeOverlay.App.Dialog" parent="ThemeOverlay.MaterialComponents.MaterialAlertDialog">
+        <item name="colorAccent">@color/black</item> <item name="colorPrimary">@color/black</item>
+    </style>
+    <style name="Widget.App.Button.TextButton" parent="Widget.MaterialComponents.Button.TextButton">
+        <item name="android:textColor">@color/black</item>
     </style>
 </resources>

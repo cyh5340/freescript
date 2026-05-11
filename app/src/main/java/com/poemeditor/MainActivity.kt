@@ -234,7 +234,7 @@ class MainActivity : AppCompatActivity() {
         for (i in 0 until container.childCount) {
             val chip = container.getChildAt(i) as? TextView ?: continue
             (chip.background as? GradientDrawable)?.setColor(
-                if (chip.tag == inputMode) Color.parseColor("#E3E3E3") else Color.TRANSPARENT)
+                if (chip.tag == inputMode) getColor(R.color.chip_active) else Color.TRANSPARENT)
         }
     }
 
@@ -468,7 +468,7 @@ class MainActivity : AppCompatActivity() {
         // It is added directly to rootFrame in onCreate() so it never squeezes mainScrollView.
         expandHost = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#F7F7F7"))
+            setBackgroundColor(getColor(R.color.panel_bg))
             visibility = View.GONE
             layoutParams = FrameLayout.LayoutParams(MP, (120 * dp).roundToInt(), Gravity.BOTTOM)
             addView(styleCategoryPanel)
@@ -485,7 +485,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(MP, WC)
             addView(View(this@MainActivity).apply {
                 layoutParams = LinearLayout.LayoutParams(MP, (1f * dp).roundToInt())
-                setBackgroundColor(Color.parseColor("#DDDDDD"))
+                setBackgroundColor(getColor(R.color.divider_dark))
             })
             addView(punctToolbar)
             addView(toolbar)
@@ -534,7 +534,7 @@ class MainActivity : AppCompatActivity() {
     private fun iconText(ch: String, size: Float) = TextView(this).apply {
         text = ch
         textSize = size
-        setTextColor(Color.parseColor("#333333"))
+        setTextColor(getColor(R.color.text_dark))
         gravity = Gravity.CENTER
         layoutParams = LinearLayout.LayoutParams(WC, WC)
     }
@@ -542,7 +542,7 @@ class MainActivity : AppCompatActivity() {
     private fun labelText(text: String) = TextView(this).apply {
         this.text = text
         textSize = 9f
-        setTextColor(Color.parseColor("#999999"))
+        setTextColor(getColor(R.color.text_lighter))
         gravity = Gravity.CENTER
         layoutParams = LinearLayout.LayoutParams(WC, WC)
     }
@@ -554,12 +554,12 @@ class MainActivity : AppCompatActivity() {
             it.topMargin    = (12 * dp).roundToInt()
             it.bottomMargin = (12 * dp).roundToInt()
         }
-        setBackgroundColor(Color.parseColor("#E0E0E0"))
+        setBackgroundColor(getColor(R.color.divider))
     }
 
     private fun swatchDrawable(color: Int, dp: Float) = GradientDrawable().apply {
         setColor(color)
-        setStroke((1.5f * dp).roundToInt(), Color.parseColor("#AAAAAA"))
+        setStroke((1.5f * dp).roundToInt(), getColor(R.color.text_hint))
         cornerRadius = 5f * dp
     }
 
@@ -610,7 +610,7 @@ class MainActivity : AppCompatActivity() {
             text = entry.label
             typeface = entry.typeface
             textSize = if (compact) 14f else 16f
-            setTextColor(Color.parseColor("#222222"))
+            setTextColor(getColor(R.color.text_darker))
             gravity = if (compact) Gravity.CENTER else Gravity.CENTER_VERTICAL
             val hPad = ((if (compact) 4 else 16) * dp).roundToInt()
             val vPad = ((if (compact) 2 else 12) * dp).roundToInt()
@@ -635,7 +635,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(MP, WC)
             isHorizontalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
-            setBackgroundColor(Color.parseColor("#F7F7F7"))
+            setBackgroundColor(getColor(R.color.panel_bg))
             visibility = View.GONE
             addView(buildPunctRow(dp))
         }
@@ -656,10 +656,10 @@ class MainActivity : AppCompatActivity() {
             textSize = 20f
             typeface = selectedTypeface
             gravity = Gravity.CENTER
-            setTextColor(Color.parseColor("#333333"))
+            setTextColor(getColor(R.color.text_dark))
             background = GradientDrawable().apply {
                 setColor(Color.TRANSPARENT)
-                setStroke((1f * dp).roundToInt(), Color.parseColor("#CCCCCC"))
+                setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
                 cornerRadius = 8f * dp
             }
             val hPad = (10 * dp).roundToInt()
@@ -727,7 +727,7 @@ private fun insertPunct(punct: String) {
             BG_COLORS.forEach { option ->
                 addView(buildSwatchItem(option, swatchSz, dp) { applyBackground(option.color) })
             }
-            addView(buildSwatchItem(ColorOption(Color.parseColor("#E0E0E0"), "自訂"), swatchSz, dp) {
+            addView(buildSwatchItem(ColorOption(getColor(R.color.divider), "自訂"), swatchSz, dp) {
                 imagePickerLauncher.launch(arrayOf("image/*"))
             })
         }
@@ -777,7 +777,7 @@ private fun insertPunct(punct: String) {
             setPadding(h, v, h, v)
             val valueLabel = TextView(this@MainActivity).apply {
                 text = "${wordGapDp.toInt()} dp"
-                textSize = 12f; setTextColor(Color.parseColor("#555555"))
+                textSize = 12f; setTextColor(getColor(R.color.text_medium))
                 gravity = Gravity.CENTER
                 layoutParams = LinearLayout.LayoutParams((48 * dp).roundToInt(), WC)
             }
@@ -816,10 +816,10 @@ private fun insertPunct(punct: String) {
                         textSize = 13f
                         gravity = Gravity.CENTER
                         tag = mode
-                        setTextColor(Color.parseColor("#333333"))
+                        setTextColor(getColor(R.color.text_dark))
                         background = GradientDrawable().apply {
-                            setColor(if (inputMode == mode) Color.parseColor("#E3E3E3") else Color.TRANSPARENT)
-                            setStroke((1f * dp).roundToInt(), Color.parseColor("#CCCCCC"))
+                            setColor(if (inputMode == mode) getColor(R.color.chip_active) else Color.TRANSPARENT)
+                            setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
                             cornerRadius = 20f * dp
                         }
                         val hPad = (14 * dp).roundToInt(); val vPad = (6 * dp).roundToInt()
@@ -908,7 +908,7 @@ private fun insertPunct(punct: String) {
             "doc"     -> docCategoryCell
             else -> null
         }
-        val accentBg = Color.parseColor("#EFEFEF")
+        val accentBg = getColor(R.color.row_active)
 
         if (activePanelTag == tag) {
             // Closing: fade out, then remove padding and hide.
@@ -1021,7 +1021,7 @@ private fun insertPunct(punct: String) {
         addView(TextView(this@MainActivity).apply {
             text = "字體"
             textSize = 11f
-            setTextColor(Color.parseColor("#888888"))
+            setTextColor(getColor(R.color.text_light))
             layoutParams = LinearLayout.LayoutParams(WC, WC).also {
                 it.marginEnd = (6 * dp).roundToInt()
             }
@@ -1036,12 +1036,12 @@ private fun insertPunct(punct: String) {
                 it.marginStart = (8 * dp).roundToInt()
                 it.marginEnd   = (8 * dp).roundToInt()
             }
-            setBackgroundColor(Color.parseColor("#E0E0E0"))
+            setBackgroundColor(getColor(R.color.divider))
         })
         addView(TextView(this@MainActivity).apply {
             text = "字號"
             textSize = 11f
-            setTextColor(Color.parseColor("#888888"))
+            setTextColor(getColor(R.color.text_light))
             layoutParams = LinearLayout.LayoutParams(WC, WC).also {
                 it.marginEnd = (6 * dp).roundToInt()
             }
@@ -1053,7 +1053,7 @@ private fun insertPunct(punct: String) {
 
     private fun subDivider(dp: Float): View = View(this).apply {
         layoutParams = LinearLayout.LayoutParams(MP, (1f * dp).roundToInt())
-        setBackgroundColor(Color.parseColor("#E0E0E0"))
+        setBackgroundColor(getColor(R.color.divider))
     }
 
     private fun buildFontSizeSpinner(dp: Float): Spinner {
@@ -1866,10 +1866,10 @@ private fun insertPunct(punct: String) {
                 ).forEach { (label, action) ->
                     addView(TextView(this@MainActivity).apply {
                         text = label; textSize = 13f; gravity = Gravity.CENTER
-                        setTextColor(Color.parseColor("#333333"))
+                        setTextColor(getColor(R.color.text_dark))
                         background = GradientDrawable().apply {
                             setColor(Color.TRANSPARENT)
-                            setStroke((1f * dp).roundToInt(), Color.parseColor("#CCCCCC"))
+                            setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
                             cornerRadius = 20f * dp
                         }
                         val hP = (14 * dp).roundToInt(); val vP = (5 * dp).roundToInt()
@@ -1897,7 +1897,7 @@ private fun insertPunct(punct: String) {
         if (sessions.isEmpty()) {
             container.addView(TextView(this).apply {
                 text = "尚無文檔"
-                textSize = 12f; setTextColor(Color.parseColor("#AAAAAA"))
+                textSize = 12f; setTextColor(getColor(R.color.text_hint))
                 gravity = Gravity.CENTER
                 layoutParams = LinearLayout.LayoutParams(MP, WC)
                 setPadding(0, (10 * dp).roundToInt(), 0, 0)
@@ -1911,22 +1911,22 @@ private fun insertPunct(punct: String) {
                 gravity = Gravity.CENTER_VERTICAL
                 layoutParams = LinearLayout.LayoutParams(MP, (26 * dp).roundToInt())
                 setPadding((14 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0)
-                if (isActive) setBackgroundColor(Color.parseColor("#EFEFEF"))
+                if (isActive) setBackgroundColor(getColor(R.color.row_active))
             }
             row.addView(TextView(this).apply {
                 text = meta.name; textSize = 12f
-                setTextColor(if (isActive) Color.parseColor("#111111") else Color.parseColor("#333333"))
+                setTextColor(if (isActive) getColor(R.color.text_darkest) else getColor(R.color.text_dark))
                 layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
                 setOnClickListener { loadSessionFile(meta.id); refreshDocPanel() }
             })
             row.addView(TextView(this).apply {
                 text = meta.formattedDate(); textSize = 10f
-                setTextColor(Color.parseColor("#AAAAAA"))
+                setTextColor(getColor(R.color.text_hint))
                 layoutParams = LinearLayout.LayoutParams(WC, WC).also { it.marginEnd = (6 * dp).roundToInt() }
             })
             row.addView(TextView(this).apply {
                 text = "×"; textSize = 14f; gravity = Gravity.CENTER
-                setTextColor(Color.parseColor("#CCCCCC"))
+                setTextColor(getColor(R.color.stroke))
                 layoutParams = LinearLayout.LayoutParams((28 * dp).roundToInt(), (28 * dp).roundToInt())
                 setOnClickListener { deleteSession(meta.id); refreshDocPanel() }
             })
@@ -1950,7 +1950,10 @@ private fun insertPunct(punct: String) {
                 refreshDocPanel()
             }
             .setNegativeButton("取消", null)
-            .show()
+            .show().also { dialog ->
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(Color.BLACK)
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(Color.BLACK)
+            }
     }
 
     private fun listSessions(): List<SessionMeta> =
