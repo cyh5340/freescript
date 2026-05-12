@@ -841,7 +841,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         val iRow  = insertIdx % numRows
         val chars = raw.replace("\r\n", "\n").replace("\r", "\n").filter { it != '\n' }
         if (chars.isEmpty()) return
-        insertCharsAt(iCol, iRow, chars)
+        pasteCharsAt(iCol, iRow, chars)
         val focusTarget = (iCol * numRows + iRow + chars.length).coerceAtMost(editTextFields.size - 1)
         postRefreshFocusColumn(focusTarget)
         Toast.makeText(this, "已貼上", Toast.LENGTH_SHORT).show()
@@ -856,10 +856,27 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         val iRow  = insertIdx % numRows
         val chars = raw.replace("\r\n", "\n").replace("\r", "\n").filter { it != '\n' }
         if (chars.isEmpty()) return
-        insertCharsAt(iCol, iRow, chars)
+        pasteCharsAt(iCol, iRow, chars)
         val focusTarget = (iCol * numRows + iRow + chars.length).coerceAtMost(editTextFields.size - 1)
         postRefreshFocusColumn(focusTarget)
         Toast.makeText(this, "已貼上", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun pasteCharsAt(iCol: Int, iRow: Int, chars: String) {
+        val originalChar = columnData.getOrNull(iCol)?.getOrNull(iRow) ?: ""
+        if (inputMode == InputMode.SCATTER && originalChar.isBlank()) {
+            withRestoring {
+                var wc = iCol; var wr = iRow
+                for (ch in chars) {
+                    if (wc >= MAX_COLUMNS) break
+                    if (wc > iCol && columnBreaks.contains(wc)) break
+                    setColumnChar(wc, wr, ch.toString())
+                    wr++; if (wr >= numRows) { wr = 0; wc++ }
+                }
+            }
+        } else {
+            insertCharsAt(iCol, iRow, chars)
+        }
     }
 
     private fun selectEntireLine() {
