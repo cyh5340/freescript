@@ -51,7 +51,7 @@ object GridLogicHelper {
             for (r in rStart until colData.size) flat.add(colData[r])
             c++; rStart = 0
         }
-        while (flat.isNotEmpty() && flat.last().isEmpty()) flat.removeLast()
+        while (flat.isNotEmpty() && flat.last().isBlank()) flat.removeLast()
 
         c = insertCol; rStart = insertRow
         while (c < maxColumns) {

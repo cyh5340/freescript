@@ -1,6 +1,8 @@
 package com.poemeditor
 
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
@@ -35,40 +37,7 @@ enum class InputMode { SCATTER, SEQUENTIAL }
 
 private typealias SessionMeta = SessionManager.SessionMeta
 
-class MainActivity : AppCompatActivity() {
-
-    // ── Color configuration ────────────────────────────────────────────
-    // Both palettes are iterated at runtime to build panel UI dynamically.
-    private data class ColorOption(val color: Int, val label: String)
-
-    private val BG_COLORS = listOf(
-        ColorOption(Color.WHITE,                 "白"),
-        ColorOption(Color.parseColor("#FFF8E7"), "米"),
-        ColorOption(Color.parseColor("#F5E6CA"), "古"),
-        ColorOption(Color.parseColor("#E8F4F8"), "藍"),
-        ColorOption(Color.parseColor("#1A1A2E"), "夜"),
-        ColorOption(Color.parseColor("#2B2B2B"), "深"),
-        ColorOption(Color.BLACK,                 "黑"),
-    )
-
-    private val TEXT_COLORS = listOf(
-        ColorOption(Color.parseColor("#212121"), "墨"),
-        ColorOption(Color.parseColor("#333333"), "炭"),
-        ColorOption(Color.parseColor("#757575"), "灰"),
-        ColorOption(Color.WHITE,                 "白"),
-        ColorOption(Color.parseColor("#1B263B"), "藍墨"),
-        ColorOption(Color.parseColor("#B22222"), "硃"),
-        ColorOption(Color.parseColor("#D4AF37"), "金"),
-        ColorOption(Color.parseColor("#00A86B"), "翠"),
-        ColorOption(Color.parseColor("#4A192C"), "紫"),
-        ColorOption(Color.parseColor("#D32F2F"), "赤"),
-        ColorOption(Color.parseColor("#1976D2"), "藍"),
-    )
-
-    private val fontSizeList = listOf(
-        14f to "14", 16f to "16", 18f to "18", 20f to "20", 24f to "24",
-        28f to "28", 32f to "32", 36f to "36", 40f to "40", 48f to "48"
-    )
+class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
 
     // ── Settings ───────────────────────────────────────────────────────
     private var fontSizeSp       = 24f
@@ -77,7 +46,7 @@ class MainActivity : AppCompatActivity() {
     // it is never auto-derived from bgColor.
     private var gridTextColor    = Color.BLACK
     private var selectedTypeface = Typeface.DEFAULT
-    private var wordGapDp        = 0f
+    private var wordGapDp        = 3f
     private var inputMode        = InputMode.SEQUENTIAL
 
     // ── Widget refs for programmatic sync (session load / new) ─────────
@@ -100,14 +69,13 @@ class MainActivity : AppCompatActivity() {
     // ── UI refs ────────────────────────────────────────────────────────
     private lateinit var rootFrame:             FrameLayout
     private lateinit var gridContainer:         LinearLayout
-    private lateinit var allToolsPanel:         NestedScrollView
-    private lateinit var toolbar:               FrameLayout
+    private lateinit var allToolsPanel:         LinearLayout
     private var toolsCell:                      LinearLayout? = null
-    private var punctCellRef:                   LinearLayout? = null
     private lateinit var bottomPanel:           LinearLayout
     private lateinit var mainLayout:            LinearLayout
     private lateinit var mainScrollView:        NestedScrollView
     private lateinit var punctToolbar:          HorizontalScrollView
+    private lateinit var viewFactory:           ViewFactory
 
     // ── Persistence ────────────────────────────────────────────────────
     private lateinit var prefs: android.content.SharedPreferences
@@ -135,6 +103,39 @@ class MainActivity : AppCompatActivity() {
     private var toolsVisible = false     // true when allToolsPanel is showing instead of keyboard
     private val translateHandler by lazy { Handler(Looper.getMainLooper()) }
     private var translateRunnable: Runnable? = null
+
+    // ── Selection state ────────────────────────────────────────────────
+    private var isSelecting      = false
+    private var selectionStart   = -1
+    private var selectionEnd     = -1
+    private var selectionOptionsView: LinearLayout? = null
+    private var startHandle:     View? = null
+    private var endHandle:       View? = null
+    private var lastTapIndex     = -1
+    private var lastTapTime      = 0L
+    private var activeDragHandle: Boolean? = null  // true=start handle, false=end handle
+    private var handleDragged    = false           // true once finger moves ≥1 cell while on a handle
+    private var handlePasteView: TextView? = null  // mini bubble shown on handle tap (no drag)
+    private var tappedHandleIsStart: Boolean? = null
+
+    // ── Selection drag cache (populated once on ACTION_DOWN) ───────────
+    private val cachedGridLoc  = IntArray(2)
+    private val cachedRootLoc  = IntArray(2)
+    private var cachedCellSize = 0
+    private var cachedGridW    = 0
+    // Highlight range tracked to diff-update only changed cells
+    private var highlightFrom  = -1
+    private var highlightTo    = -1
+    // Popup dimensions cached after first measure so ACTION_MOVE skips measure()
+    private var cachedPopupW   = -1
+    private var cachedPopupH   = -1
+    // True when a postOnAnimation frame is already scheduled for this drag gesture
+    private var isFrameScheduled = false
+
+    // ── Lazy grid build ────────────────────────────────────────────────
+    private val builtColumns = HashSet<Int>()
+    private var incrementalBuildRunnable: Runnable? = null
+    private var buildGeneration = 0
 
     private fun setColumnChar(col: Int, row: Int, ch: String) =
         GridLogicHelper.setColumnChar(columnData, col, row, ch)
@@ -199,25 +200,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun refreshModeChips() {
-        val container = modeChipContainer ?: return
-        for (i in 0 until container.childCount) {
-            val chip = container.getChildAt(i) as? TextView ?: continue
-            (chip.background as? GradientDrawable)?.setColor(
-                if (chip.tag == inputMode) getColor(R.color.chip_active) else Color.TRANSPARENT)
-        }
-    }
-
-
     // Highlights the focused cell and records the logical insertion side (before/after).
     // cursorBefore: true  = next keystroke inserts BEFORE this cell's character.
     //               false = next keystroke inserts AFTER  (default).
     // showKeyboard: true  = open IME and re-bind it; false = keep IME closed (style rebuilds).
     // No Paint or Canvas work — purely a data + focus update.
     private fun focusCell(index: Int, cursorBefore: Boolean = true, showKeyboard: Boolean = true) {
+        ensureColumnBuilt(index / numRows.coerceAtLeast(1))
         val et = editTextFields.getOrNull(index) ?: return
         this.cursorBefore = cursorBefore
-        editTextFields.getOrNull(focusedCellIndex)?.setBackgroundColor(Color.TRANSPARENT)
+        if (!isSelecting) editTextFields.getOrNull(focusedCellIndex)?.setBackgroundColor(Color.TRANSPARENT)
         focusedCellIndex = index
         et.requestFocus()
         et.setSelection(0)  // top of cell = natural insertion point in vertical writing
@@ -273,8 +265,6 @@ class MainActivity : AppCompatActivity() {
     private val WC get() = ViewGroup.LayoutParams.WRAP_CONTENT
 
     // ── Font catalogue ─────────────────────────────────────────────────
-    data class FontEntry(val label: String, val typeface: Typeface)
-
     private fun loadFont(
         assetNames:   List<String> = emptyList(),
         systemPaths:  List<String> = emptyList(),
@@ -322,6 +312,93 @@ class MainActivity : AppCompatActivity() {
     private var fontIndex = 0
 
     // ── onCreate ───────────────────────────────────────────────────────
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (isSelecting && ev.pointerCount == 1) {
+            val sh = startHandle; val eh = endHandle
+            if (sh != null && eh != null && sh.visibility == View.VISIBLE) {
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        handleDragged = false
+                        handlePasteView?.visibility = View.GONE
+                        // Measure once: root offset and touch-in-rootFrame coords
+                        rootFrame.getLocationOnScreen(cachedRootLoc)
+                        val tx = ev.rawX - cachedRootLoc[0]; val ty = ev.rawY - cachedRootLoc[1]
+                        val hitR = 36f * resources.displayMetrics.density
+                        fun hcx(h: View) = h.x + (h.width.takeIf { it > 0 } ?: h.layoutParams.width) / 2f
+                        fun hcy(h: View) = h.y + (h.height.takeIf { it > 0 } ?: h.layoutParams.height) / 2f
+                        activeDragHandle = when {
+                            Math.hypot((tx - hcx(sh)).toDouble(), (ty - hcy(sh)).toDouble()) <= hitR -> true
+                            Math.hypot((tx - hcx(eh)).toDouble(), (ty - hcy(eh)).toDouble()) <= hitR -> false
+                            else -> null
+                        }
+                        if (activeDragHandle != null) {
+                            cachedCellSize = currentCellSize
+                            return true  // consume DOWN so cells underneath don't clear selection
+                        }
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dh = activeDragHandle
+                        if (dh != null) {
+                            val hit = fastCellIndexAtPoint(ev.rawX, ev.rawY)
+                            if (hit >= 0) {
+                                val prev = if (dh) selectionStart else selectionEnd
+                                if (hit != prev) {
+                                    handleDragged = true
+                                    // ── Logic only: update indices, no UI work ──────────
+                                    if (dh) selectionStart = hit else selectionEnd = hit
+                                    // ── Schedule one render per vsync ──────────────────
+                                    if (!isFrameScheduled) {
+                                        isFrameScheduled = true
+                                        rootFrame.postOnAnimation {
+                                            if (isSelecting) {
+                                                val activeDh = activeDragHandle
+                                                val newFrom = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
+                                                val newTo   = maxOf(selectionStart, selectionEnd)
+                                                    .coerceAtMost(editTextFields.size - 1)
+                                                updateHighlightDiff(newFrom, newTo)
+                                                if (activeDh != null) {
+                                                    val draggedIdx = (if (activeDh) selectionStart else selectionEnd)
+                                                        .coerceIn(0, editTextFields.size - 1)
+                                                    val otherIdx   = (if (activeDh) selectionEnd   else selectionStart)
+                                                        .coerceIn(0, editTextFields.size - 1)
+                                                    fastPositionHandleByIndex(
+                                                        if (activeDh) startHandle else endHandle,
+                                                        draggedIdx, atTop = (draggedIdx == newFrom))
+                                                    fastPositionHandleByIndex(
+                                                        if (activeDh) endHandle else startHandle,
+                                                        otherIdx, atTop = (otherIdx == newFrom))
+                                                }
+                                                positionSelectionOptionsView()
+                                            }
+                                            isFrameScheduled = false
+                                        }
+                                    }
+                                }
+                            }
+                            return true
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        val dh = activeDragHandle
+                        val dragged = handleDragged
+                        activeDragHandle = null
+                        handleDragged = false
+                        if (dh != null) {
+                            // Tap on handle (no real drag) → show paste bubble only if options bar is hidden
+                            if (!dragged && ev.actionMasked == MotionEvent.ACTION_UP
+                                    && selectionOptionsView?.visibility != View.VISIBLE) {
+                                val handle = if (dh) startHandle else endHandle
+                                if (handle != null) showHandlePasteMenu(handle, isStart = dh)
+                            }
+                            return true  // consume — prevent cell underneath from dismissing selection
+                        }
+                    }
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val dp = resources.displayMetrics.density
@@ -374,12 +451,26 @@ class MainActivity : AppCompatActivity() {
             addView(gridContainer)
         }
 
-        bottomPanel = buildBottomPanel(dp)
+        viewFactory      = ViewFactory(this, this)
+        bottomPanel      = viewFactory.buildBottomPanel(dp)
+        allToolsPanel    = viewFactory.allToolsPanel!!
+        punctToolbar     = viewFactory.punctToolbar!!
+        toolsCell        = viewFactory.toolsCell
+        docListContainer = viewFactory.docListContainer
+        fontSpinnerRef    = viewFactory.fontSpinnerRef
+        fontSizeLabelRef  = viewFactory.fontSizeLabelRef
+        gapValueLabelRef  = viewFactory.gapValueLabelRef
+        modeChipContainer = viewFactory.modeChipContainer
         mainLayout.addView(mainScrollView)
         mainLayout.addView(bottomPanel)
         rootFrame.addView(mainLayout)
         rootFrame.addView(allToolsPanel)
         setContentView(rootFrame)
+        val dp0 = resources.displayMetrics.density
+        startHandle = viewFactory.buildSelectionHandle(isStart = true,  dp0).also { rootFrame.addView(it) }
+        endHandle   = viewFactory.buildSelectionHandle(isStart = false, dp0).also { rootFrame.addView(it) }
+        selectionOptionsView = viewFactory.buildSelectionOptionsView(dp0).also { rootFrame.addView(it) }
+        handlePasteView = viewFactory.buildHandlePasteView(dp0).also { rootFrame.addView(it) }
         loadBgImageFromUri(bgImageUri)
 
         // Track keyboard height and manage scroll padding in sync with IME state.
@@ -389,12 +480,13 @@ class MainActivity : AppCompatActivity() {
             if (imeVisible && imeHeight > 0) lastKeyboardHeight = imeHeight
             punctToolbar.visibility = if (imeVisible) View.VISIBLE else View.GONE
             if (imeVisible) {
-                // Keyboard opened — if tools panel was showing, dismiss it now.
+                // Keyboard opened — dismiss tools panel and selection if active.
                 if (toolsVisible) {
                     allToolsPanel.visibility = View.GONE
                     toolsVisible = false
                     toolsCell?.setBackgroundColor(Color.TRANSPARENT)
                 }
+                if (isSelecting) clearSelection()
                 scheduleTranslateForKeyboard()
             } else if (!toolsVisible) {
                 // Keyboard closed and tools not shown — clear scroll padding.
@@ -430,228 +522,77 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    // ── Bottom panel ───────────────────────────────────────────────────
-    private fun buildBottomPanel(dp: Float): LinearLayout {
-        allToolsPanel = buildAllToolsPanel(dp)
-        toolbar = buildToolbar(dp)
-        punctToolbar = buildPunctToolbar(dp)
 
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            addView(View(this@MainActivity).apply {
-                layoutParams = LinearLayout.LayoutParams(MP, (1f * dp).roundToInt())
-                setBackgroundColor(getColor(R.color.divider_dark))
-            })
-            addView(punctToolbar)
-            addView(toolbar)
-        }
+    private fun showHandlePasteMenu(handle: View, isStart: Boolean) {
+        val pv = handlePasteView ?: return
+        tappedHandleIsStart = isStart
+        pv.measure(
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val pvW = pv.measuredWidth.toFloat()
+        val pvH = pv.measuredHeight.toFloat()
+        val dp = resources.displayMetrics.density
+        val gap = 6f * dp
+        val handleSz = handle.layoutParams.width.toFloat()
+        var pvX = handle.x + handleSz / 2f - pvW / 2f
+        var pvY = handle.y - pvH - gap
+        val rootW = rootFrame.width.toFloat()
+        pvX = pvX.coerceIn(gap, (rootW - pvW - gap).coerceAtLeast(gap))
+        if (pvY < gap) pvY = handle.y + handleSz + gap
+        pv.x = pvX; pv.y = pvY
+        pv.visibility = View.VISIBLE
     }
 
-    // ── Toolbar (always visible, 54 dp) ───────────────────────────────
-    // mainBar:  工具 | 標點   — default visible
-    // punctBar: ← | scrollable punct row — shown when 標點 is tapped
-    private fun buildToolbar(dp: Float): FrameLayout {
-        val toolbarH = (54 * dp).roundToInt()
-
-        var mainBarRef: LinearLayout? = null
-        var punctBarRef: LinearLayout? = null
-
-        val mainBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = FrameLayout.LayoutParams(MP, toolbarH)
-            setBackgroundColor(Color.WHITE)
-
-            toolsCell = buildCategoryCell("工具", toolbarH, dp) {
-                if (toolsVisible) switchToKeyboard() else switchToTools()
-            }
-            addView(toolsCell)
-            addView(divider(toolbarH, dp))
-
-            val pCell = buildCategoryCell("標點", toolbarH, dp) {
-                mainBarRef?.visibility = View.GONE
-                punctBarRef?.visibility = View.VISIBLE
-            }
-            punctCellRef = pCell
-            addView(pCell)
+    private fun positionSelectionOptionsView() {
+        val pop = selectionOptionsView ?: return
+        if (!isSelecting) return
+        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
+        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost(editTextFields.size - 1)
+        val etFrom = editTextFields.getOrNull(from) ?: return
+        val etTo   = editTextFields.getOrNull(to)   ?: return
+        if (cachedPopupW < 0) {
+            pop.measure(
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            )
+            cachedPopupW = pop.measuredWidth; cachedPopupH = pop.measuredHeight
         }
-        mainBarRef = mainBar
+        val popW = cachedPopupW.toFloat()
+        val dp = resources.displayMetrics.density
+        val gap = 8f * dp
 
-        val punctBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = FrameLayout.LayoutParams(MP, toolbarH)
-            setBackgroundColor(Color.WHITE)
-            visibility = View.GONE
+        val fromLoc = IntArray(2); etFrom.getLocationOnScreen(fromLoc)
+        val rootLoc = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
 
-            addView(TextView(this@MainActivity).apply {
-                text = "←"; textSize = 20f; gravity = Gravity.CENTER
-                setTextColor(getColor(R.color.text_dark))
-                layoutParams = LinearLayout.LayoutParams((54 * dp).roundToInt(), toolbarH)
-                setOnClickListener {
-                    punctBarRef?.visibility = View.GONE
-                    mainBarRef?.visibility = View.VISIBLE
-                }
-            })
-            addView(divider(toolbarH, dp))
-            addView(HorizontalScrollView(this@MainActivity).apply {
-                isHorizontalScrollBarEnabled = false
-                overScrollMode = View.OVER_SCROLL_NEVER
-                layoutParams = LinearLayout.LayoutParams(0, toolbarH, 1f)
-                addView(buildPunctRow(dp))
-            })
+        // 獲取選取格子的左邊界 (相對於 rootFrame)
+        val cellLeft = (fromLoc[0] - rootLoc[0]).toFloat()
+        val cellTop  = (fromLoc[1] - rootLoc[1]).toFloat()
+
+        // ── 關鍵修改：往左顯示 ──
+        // 原本是：popX = cellRight + gap
+        // 現在改為：將選單的右邊 (popX + popW) 對齊到格子的左邊界再減去間距
+        var popX = cellLeft - popW - gap
+
+        // ── 邊界檢查 ──
+        // 如果左邊沒位置了（超出螢幕左側），才反轉到右邊顯示
+        if (popX < gap) {
+            val etRight = cellLeft + etFrom.width
+            popX = etRight + gap
         }
-        punctBarRef = punctBar
 
-        return FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(MP, toolbarH)
-            setBackgroundColor(Color.WHITE)
-            addView(mainBar)
-            addView(punctBar)
-        }
+        // 限制在螢幕內
+        val rootW = rootFrame.width.toFloat()
+        popX = popX.coerceIn(gap, (rootW - popW - gap).coerceAtLeast(gap))
+
+        // Y 軸維持原樣或置中於選取範圍
+        val popY = cellTop.coerceIn(gap, (rootFrame.height - cachedPopupH - gap).coerceAtLeast(gap))
+
+        pop.x = popX
+        pop.y = popY
+        pop.visibility = View.VISIBLE
     }
 
-    private fun buildCategoryCell(label: String, toolbarH: Int, dp: Float, onClick: () -> Unit): LinearLayout =
-        LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(0, toolbarH, 1f)
-            addView(iconText(label, 14f))
-            setOnClickListener { onClick() }
-        }
-
-    private fun iconText(ch: String, size: Float) = TextView(this).apply {
-        text = ch
-        textSize = size
-        setTextColor(getColor(R.color.text_dark))
-        gravity = Gravity.CENTER
-        layoutParams = LinearLayout.LayoutParams(WC, WC)
-    }
-
-    private fun divider(toolbarH: Int, dp: Float) = View(this).apply {
-        layoutParams = LinearLayout.LayoutParams(
-            (0.8f * dp).roundToInt(), toolbarH
-        ).also {
-            it.topMargin    = (12 * dp).roundToInt()
-            it.bottomMargin = (12 * dp).roundToInt()
-        }
-        setBackgroundColor(getColor(R.color.divider))
-    }
-
-    private fun swatchDrawable(color: Int, dp: Float) = GradientDrawable().apply {
-        setColor(color)
-        setStroke((1.5f * dp).roundToInt(), getColor(R.color.text_hint))
-        cornerRadius = 5f * dp
-    }
-
-    // ── Font spinner ───────────────────────────────────────────────────
-    private fun buildFontSpinner(dp: Float): Spinner {
-        val adapter = object : ArrayAdapter<FontEntry>(
-            this, android.R.layout.simple_spinner_item, fontCatalogue
-        ) {
-            override fun getView(pos: Int, cv: View?, parent: ViewGroup): View =
-                spinnerItemView(pos, compact = true, dp = dp)
-            override fun getDropDownView(pos: Int, cv: View?, parent: ViewGroup): View =
-                spinnerItemView(pos, compact = false, dp = dp)
-        }
-
-        return Spinner(this).apply {
-            this.adapter = adapter
-            setSelection(fontIndex)
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            background = null
-            fontSpinnerRef = this
-
-            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                    if (pos == fontIndex && editTextFields.isNotEmpty()) return
-                    fontIndex = pos
-                    selectedTypeface = fontCatalogue[pos].typeface
-                    // Only rebuild if the new font changes the measured cell size.
-                    // Same-size font changes (e.g. style-only) update typefaces in-place
-                    // so the IME connection is never broken and the keyboard never flickers.
-                    val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
-                    val gapPx  = (wordGapDp * resources.displayMetrics.density).roundToInt()
-                    val newCellSize = (Paint().apply { textSize = fontPx; typeface = selectedTypeface }
-                        .measureText("測").roundToInt().coerceAtLeast(1) + gapPx).coerceAtLeast(1)
-                    if (newCellSize == currentCellSize && editTextFields.isNotEmpty()) {
-                        withRestoring { editTextFields.forEach { it.typeface = selectedTypeface } }
-                    } else {
-                        needsReflow = true; rebuildGrid()
-                    }
-                }
-                override fun onNothingSelected(p: AdapterView<*>?) {}
-            }
-        }
-    }
-
-    private fun spinnerItemView(pos: Int, compact: Boolean, dp: Float): TextView {
-        val entry = fontCatalogue[pos]
-        return TextView(this).apply {
-            text = entry.label
-            typeface = entry.typeface
-            textSize = if (compact) 14f else 16f
-            setTextColor(getColor(R.color.text_darker))
-            gravity = if (compact) Gravity.CENTER else Gravity.CENTER_VERTICAL
-            val hPad = ((if (compact) 4 else 16) * dp).roundToInt()
-            val vPad = ((if (compact) 2 else 12) * dp).roundToInt()
-            setPadding(hPad, vPad, hPad, vPad)
-            if (!compact) setBackgroundColor(Color.WHITE)
-        }
-    }
-
-    // ── Punctuation toolbar ────────────────────────────────────────────
-    private val PUNCT_LIST = listOf(
-        // 括號與引號
-        "﹁", "﹂", "﹃", "﹄", "︻", "︼","︵", "︶", 
-        "︽", "︾", "︿", "﹀", "︗", "︘", 
-        // 基礎標點
-        "。", "，", "、","？", "！", "：", "；", 
-        // 延伸
-        "︱", "︙", "·", "※"
-    )
-
-    private fun buildPunctToolbar(dp: Float): HorizontalScrollView {
-        return HorizontalScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            isHorizontalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            setBackgroundColor(getColor(R.color.panel_bg))
-            visibility = View.GONE
-            addView(buildPunctRow(dp))
-        }
-    }
-
-    private fun buildPunctRow(dp: Float): LinearLayout =
-        LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            val vPad = (6 * dp).roundToInt()
-            setPadding((8 * dp).roundToInt(), vPad, (8 * dp).roundToInt(), vPad)
-            PUNCT_LIST.forEach { punct -> addView(buildPunctButton(punct, dp)) }
-        }
-
-    private fun buildPunctButton(punct: String, dp: Float): TextView =
-        TextView(this).apply {
-            text = punct
-            textSize = 20f
-            typeface = selectedTypeface
-            gravity = Gravity.CENTER
-            setTextColor(getColor(R.color.text_dark))
-            background = GradientDrawable().apply {
-                setColor(Color.TRANSPARENT)
-                setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
-                cornerRadius = 8f * dp
-            }
-            val hPad = (10 * dp).roundToInt()
-            val vPad = (6 * dp).roundToInt()
-            setPadding(hPad, vPad, hPad, vPad)
-            layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                it.marginEnd = (6 * dp).roundToInt()
-            }
-            setOnClickListener { insertPunct(punct) }
-        }
 
     private fun insertPunct(punct: String) {
         val focused = currentFocus
@@ -660,7 +601,9 @@ class MainActivity : AppCompatActivity() {
         val cellCol = idx / numRows
         val cellRow = idx % numRows
         val originalChar = columnData.getOrNull(cellCol)?.getOrNull(cellRow) ?: ""
-        if (originalChar.isEmpty() || inputMode == InputMode.SCATTER) {
+        // Empty cell or SCATTER-mode space: place directly.
+        // Island (non-blank, any mode) or SEQUENTIAL occupied: insert-shift.
+        if (originalChar.isEmpty() || (inputMode == InputMode.SCATTER && originalChar.isBlank())) {
             setColumnChar(cellCol, cellRow, punct)
             withRestoring { editTextFields[idx].setText(punct) }
             advanceToNextCell(idx, editTextFields.size)
@@ -669,52 +612,6 @@ class MainActivity : AppCompatActivity() {
             postRefreshFocusColumn(focusTarget)
         }
     }
-
-    // Shared swatch-item factory used by both colour panels.
-    private fun buildSwatchItem(option: ColorOption, swatchSz: Int, dp: Float,
-                                onClick: () -> Unit): LinearLayout =
-        LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                it.marginEnd = (6 * dp).roundToInt()
-            }
-            addView(View(this@MainActivity).apply {
-                background = swatchDrawable(option.color, dp)
-                layoutParams = LinearLayout.LayoutParams(swatchSz, swatchSz)
-            })
-            addView(TextView(this@MainActivity).apply {
-                text = option.label; textSize = 9f
-                setTextColor(Color.DKGRAY); gravity = Gravity.CENTER
-                layoutParams = LinearLayout.LayoutParams(swatchSz, WC)
-            })
-            setOnClickListener { onClick() }
-        }
-
-    private fun buildColorSwatchRow(
-        dp: Float,
-        colors: List<ColorOption>,
-        extra: Pair<ColorOption, () -> Unit>? = null,
-        onClick: (ColorOption) -> Unit
-    ): LinearLayout {
-        val swatchSz = (38 * dp).roundToInt()
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            setPadding((8 * dp).roundToInt(), (10 * dp).roundToInt(),
-                       (8 * dp).roundToInt(), (10 * dp).roundToInt())
-            colors.forEach { option -> addView(buildSwatchItem(option, swatchSz, dp) { onClick(option) }) }
-            extra?.let { (opt, action) -> addView(buildSwatchItem(opt, swatchSz, dp, action)) }
-        }
-    }
-
-    private fun buildBgColorPanel(dp: Float) = buildColorSwatchRow(
-        dp, BG_COLORS,
-        extra = ColorOption(getColor(R.color.divider), "自訂") to { imagePickerLauncher.launch(arrayOf("image/*")) }
-    ) { applyBackground(it.color) }
-
-    private fun buildTextColorPanel(dp: Float) = buildColorSwatchRow(dp, TEXT_COLORS) { applyTextColor(it.color) }
 
     // Apply background colour.  gridTextColor is NOT touched — it is controlled
     // exclusively by the text-colour panel (applyTextColor).  No rebuild needed:
@@ -736,86 +633,9 @@ class MainActivity : AppCompatActivity() {
         withRestoring { editTextFields.forEach { it.setTextColor(color) } }
     }
 
-    private fun buildModePanel(dp: Float): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            setPadding((8 * dp).roundToInt(), (10 * dp).roundToInt(),
-                       (8 * dp).roundToInt(), (10 * dp).roundToInt())
-            modeChipContainer = this
-            listOf(InputMode.SCATTER to "灑花輸入", InputMode.SEQUENTIAL to "連續輸入")
-                .forEach { (mode, label) ->
-                    val container = this
-                    addView(TextView(this@MainActivity).apply {
-                        text = label
-                        textSize = 13f
-                        gravity = Gravity.CENTER
-                        tag = mode
-                        setTextColor(getColor(R.color.text_dark))
-                        background = GradientDrawable().apply {
-                            setColor(if (inputMode == mode) getColor(R.color.chip_active) else Color.TRANSPARENT)
-                            setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
-                            cornerRadius = 20f * dp
-                        }
-                        val hPad = (14 * dp).roundToInt(); val vPad = (6 * dp).roundToInt()
-                        setPadding(hPad, vPad, hPad, vPad)
-                        layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                            it.marginEnd = (6 * dp).roundToInt()
-                        }
-                        setOnClickListener {
-                            val previous = inputMode
-                            inputMode = mode
-                            refreshModeChips()
-                            // Fill gaps only when leaving SCATTER for SEQUENTIAL so the
-                            // auto-advance cursor never jumps over an unintended empty cell.
-                            if (mode == InputMode.SEQUENTIAL && previous == InputMode.SCATTER) {
-                                fillGapsForSequentialMode()
-                            }
-                        }
-                    })
-                }
-        }
-    }
-
-    // ── Mode switch helper ─────────────────────────────────────────────
-    // When switching from SCATTER → SEQUENTIAL, every empty cell between the
-    // first and last occupied cell (in column-major index order) is filled with
-    // a half-width space so SEQUENTIAL's auto-advance never skips over a gap.
-    // isRestoring guards the TextWatcher so setting spaces doesn't trigger the
-    // auto-jump logic or modify columnData through the normal input path.
-    private fun fillGapsForSequentialMode() {
-        if (numRows <= 0) return
-        val totalCells = numRows * numColumns
-
-        // Find the first and last occupied cell by column-major index.
-        var firstIdx = -1
-        var lastIdx  = -1
-        for (idx in 0 until totalCells) {
-            val c = idx / numRows; val r = idx % numRows
-            if ((columnData.getOrNull(c)?.getOrNull(r) ?: "").isNotEmpty()) {
-                if (firstIdx < 0) firstIdx = idx
-                lastIdx = idx
-            }
-        }
-        if (firstIdx < 0) return   // grid is empty — nothing to fill
-
-        // Fill every empty slot in [firstIdx, lastIdx] with a space.
-        withRestoring {          // suppress TextWatcher auto-advance
-            for (idx in firstIdx..lastIdx) {
-                val c = idx / numRows; val r = idx % numRows
-                if ((columnData.getOrNull(c)?.getOrNull(r) ?: "").isEmpty()) {
-                    setColumnChar(c, r, " ")
-                }
-            }
-        }
-
-        // Diff-update visible cells in place — no view destruction, no keyboard flicker.
-        refreshGrid()
-    }
-
     // ── Tools panel toggle ────────────────────────────────────────────
     private fun switchToTools() {
+        clearSelection()
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
         currentFocus?.clearFocus()
@@ -846,229 +666,233 @@ class MainActivity : AppCompatActivity() {
         imm.showSoftInput(et, InputMethodManager.SHOW_IMPLICIT)
     }
 
-    // ── All-tools panel ────────────────────────────────────────────────
-    // Single scrollable overlay that replaces the keyboard at the same height.
-    // Sections: 字型 (font+size+text color) | 排版 (gap+bg color) | 寫作 (mode+punct) | 檔案 (doc)
-    private fun buildAllToolsPanel(dp: Float): NestedScrollView {
-        val hscroll = { inner: LinearLayout ->
-            HorizontalScrollView(this).apply {
-                isHorizontalScrollBarEnabled = false
-                overScrollMode = View.OVER_SCROLL_NEVER
-                layoutParams = LinearLayout.LayoutParams(MP, WC)
-                addView(inner.also { it.layoutParams = LinearLayout.LayoutParams(WC, WC) })
-            }
-        }
-        fun sectionLabel(text: String) = TextView(this).apply {
-            this.text = text; textSize = 10f
-            setTextColor(getColor(R.color.text_lighter))
-            val hP = (12 * dp).roundToInt(); val vP = (6 * dp).roundToInt()
-            setPadding(hP, vP, hP, vP)
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-        }
+    // ── Selection ──────────────────────────────────────────────────────
 
-        val docListLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-        }
-        docListContainer = docListLayout
-
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-
-            addView(sectionLabel("字型"))
-            addView(buildFontRow(dp))
-            addView(subDivider(dp))
-            addView(hscroll(buildTextColorPanel(dp)))
-            addView(subDivider(dp))
-
-            addView(sectionLabel("排版"))
-            addView(hscroll(buildBgColorPanel(dp)))
-            addView(subDivider(dp))
-
-            addView(sectionLabel("寫作"))
-            addView(buildModePanel(dp))
-            addView(subDivider(dp))
-
-            addView(sectionLabel("檔案"))
-            addView(buildDocActionRow(dp))
-            addView(subDivider(dp))
-            addView(docListLayout)
-        }
-
-        return NestedScrollView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(MP, (280 * dp).roundToInt(), Gravity.BOTTOM)
-            setBackgroundColor(getColor(R.color.panel_bg))
-            visibility = View.GONE
-            addView(content)
-        }
+    private fun enterSelectionMode(index: Int) {
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
+        currentFocus?.clearFocus()
+        isSelecting = true
+        highlightFrom = -1  // force full repaint on first updateHighlightDiff call
+        selectionStart = index; selectionEnd = index
+        updateSelectionHighlight()
     }
 
-    private fun buildDocActionRow(dp: Float): LinearLayout =
-        LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            val hPad = (12 * dp).roundToInt(); val vPad = (8 * dp).roundToInt()
-            setPadding(hPad, vPad, hPad, vPad)
-            listOf(
-                "更名" to Runnable { showRenameDialog() },
-                "新增" to Runnable { newSession(); refreshDocPanel() },
-                "全部" to Runnable {
-                    sessionListLauncher.launch(Intent(this@MainActivity, SessionListActivity::class.java))
+    private fun clearSelection() {
+        isSelecting = false; selectionStart = -1; selectionEnd = -1
+        if (highlightFrom >= 0) {
+            val to = highlightTo.coerceAtMost(editTextFields.size - 1)
+            for (i in highlightFrom..to) editTextFields.getOrNull(i)?.setBackgroundColor(Color.TRANSPARENT)
+        }
+        highlightFrom = -1; highlightTo = -1
+        isFrameScheduled = false
+        cachedPopupW = -1; cachedPopupH = -1
+        startHandle?.visibility = View.GONE
+        endHandle?.visibility   = View.GONE
+        selectionOptionsView?.visibility = View.GONE
+        handlePasteView?.visibility = View.GONE
+        tappedHandleIsStart = null
+    }
+
+    private fun updateSelectionHighlight() {
+        if (!isSelecting) return
+        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
+        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost(editTextFields.size - 1)
+        updateHighlightDiff(from, to)
+        positionHandleAt(startHandle, from, atTop = true)
+        positionHandleAt(endHandle,   to,   atTop = false)
+        positionSelectionOptionsView()
+    }
+
+    // Diff-update: only repaint cells at the boundary between old and new selection ranges.
+    private fun updateHighlightDiff(newFrom: Int, newTo: Int) {
+        val sel = getColor(R.color.selection_highlight)
+        val prevFrom = highlightFrom; val prevTo = highlightTo
+        if (prevFrom < 0) {
+            for (i in newFrom..newTo) editTextFields.getOrNull(i)?.setBackgroundColor(sel)
+        } else {
+            val lo = minOf(prevFrom, newFrom); val hi = maxOf(prevTo, newTo)
+            for (i in lo..hi) {
+                val inNew = i in newFrom..newTo
+                val inOld = i in prevFrom..prevTo
+                if (inNew && !inOld) editTextFields.getOrNull(i)?.setBackgroundColor(sel)
+                else if (!inNew && inOld) editTextFields.getOrNull(i)?.setBackgroundColor(Color.TRANSPARENT)
+            }
+        }
+        highlightFrom = newFrom; highlightTo = newTo
+    }
+
+    private fun repositionHandles() {
+        if (!isSelecting) return
+        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
+        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost(editTextFields.size - 1)
+        positionHandleAt(startHandle, from, atTop = true)
+        positionHandleAt(endHandle,   to,   atTop = false)
+        positionSelectionOptionsView()
+    }
+
+    private fun positionHandleAt(handle: View?, index: Int, atTop: Boolean) {
+        handle ?: return
+        val et = editTextFields.getOrNull(index) ?: return
+        val rect = android.graphics.Rect()
+        if (!et.getGlobalVisibleRect(rect) || rect.width() == 0) return
+        val rootLoc = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
+        val sz = handle.layoutParams.width.toFloat()
+        val x  = rect.left - rootLoc[0] + rect.width() / 2f - sz / 2f
+        val y  = if (atTop) (rect.top  - rootLoc[1]).toFloat() - sz
+                 else        (rect.bottom - rootLoc[1]).toFloat()
+        if (x == 0f) return  // skip frame if position looks uninitialized
+        handle.x = x; handle.y = y.coerceAtLeast(0f)
+        handle.visibility = View.VISIBLE
+    }
+
+    private fun cellIndexAtScreenPoint(screenX: Float, screenY: Float): Int {
+        val cs = currentCellSize.takeIf { it > 0 } ?: return -1
+        val grid = (hScroll?.getChildAt(0) as? GridLayout) ?: return -1
+        val loc = IntArray(2); grid.getLocationOnScreen(loc)
+        val relX = screenX - loc[0]; val relY = screenY - loc[1]
+        val gridW = numColumns * cs
+        if (relX < 0 || relX >= gridW || relY < 0 || relY >= numRows * cs) return -1
+        val col = (gridW - relX.toInt() - 1) / cs        // RTL: col 0 is rightmost
+        val row = relY.toInt() / cs
+        return (col * numRows + row).coerceIn(0, editTextFields.size - 1)
+    }
+
+    // Uses col-0 cell's physical screen position as the anchor — no grid-width math required.
+    // Clamps col to last occupied column so handles don't jump into empty space.
+    private fun fastCellIndexAtPoint(rawX: Float, rawY: Float): Int {
+        val cs = cachedCellSize.takeIf { it > 0 } ?: return -1
+        val firstCell = editTextFields.getOrNull(0) ?: return -1
+        val loc = IntArray(2); firstCell.getLocationOnScreen(loc)
+        // Col 0 center in screen space; RTL: higher col index is further left.
+        val centerX = loc[0] + cs / 2f
+        val topY    = loc[1].toFloat()
+        val relX = centerX - rawX          // positive = left of col 0 center
+        val relY = rawY - topY             // positive = below row 0 top
+        val col = (relX / cs).toInt().coerceIn(0, numColumns - 1)
+        val row = (relY / cs).toInt().coerceIn(0, numRows - 1)
+        val maxActiveCol = columnData.indexOfLast { c -> c.any { it.isNotEmpty() } }.coerceAtLeast(0)
+        return (col.coerceIn(0, maxActiveCol) * numRows + row).coerceIn(0, editTextFields.size - 1)
+    }
+
+    // Uses col-0 cell's physical screen position as the anchor — immune to gridW / scrollX drift.
+    private fun fastPositionHandleByIndex(handle: View?, index: Int, atTop: Boolean) {
+        handle ?: return
+        if (index < 0 || index >= editTextFields.size) return
+        val cs = cachedCellSize.toFloat(); if (cs <= 0f) return
+        val firstCell = editTextFields.getOrNull(0) ?: return
+        val loc     = IntArray(2); firstCell.getLocationOnScreen(loc)
+        val rootLoc = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
+        val col = index / numRows; val row = index % numRows
+        val sz  = handle.layoutParams.width.toFloat()
+        // Center X of col 0 in rootFrame coordinates; each col steps left by cs.
+        val centerX = (loc[0] - rootLoc[0]) + cs / 2f
+        val x = centerX - col * cs - sz / 2f
+        if (x <= 0f && col == 0) return   // cell not laid out yet — skip frame
+        val rowTopY = (loc[1] - rootLoc[1]).toFloat()
+        val y = (rowTopY + row * cs + (if (atTop) -sz else cs)).coerceAtLeast(0f)
+        handle.x = x; handle.y = y
+        handle.visibility = View.VISIBLE
+    }
+
+    private fun selectedTextToString(): String {
+        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
+        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost(editTextFields.size - 1)
+        val sb = StringBuilder()
+        var prevCol = from / numRows
+        for (i in from..to) {
+            val c = i / numRows; val r = i % numRows
+            if (c != prevCol) { if (columnBreaks.contains(c)) sb.append('\n'); prevCol = c }
+            sb.append(columnData.getOrNull(c)?.getOrNull(r) ?: "")
+        }
+        return sb.toString()
+    }
+
+    private fun copySelectedText() {
+        val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clip.setPrimaryClip(ClipData.newPlainText("poemeditor", selectedTextToString()))
+        Toast.makeText(this, "已複製", Toast.LENGTH_SHORT).show()
+        clearSelection()
+    }
+
+    private fun cutSelectedText() {
+        val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clip.setPrimaryClip(ClipData.newPlainText("poemeditor", selectedTextToString()))
+        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
+        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost(editTextFields.size - 1)
+        for (i in from..to) { val c = i / numRows; val r = i % numRows; setColumnChar(c, r, "") }
+        val focusTarget = from.coerceAtMost(editTextFields.size - 1)
+        clearSelection()
+        reflowColumnData(numRows)
+        postRefreshFocusColumn(focusTarget)
+        Toast.makeText(this, "已剪下", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun pasteText() {
+        val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val raw  = clip.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+            ?.ifEmpty { null } ?: return
+        val insertIdx = if (isSelecting && selectionStart >= 0)
+            minOf(selectionStart, selectionEnd).coerceAtLeast(0)
+        else
+            focusedCellIndex.coerceAtLeast(0)
+        clearSelection()
+        val iCol  = insertIdx / numRows
+        val iRow  = insertIdx % numRows
+        val chars = raw.replace("\r\n", "\n").replace("\r", "\n").filter { it != '\n' }
+        if (chars.isEmpty()) return
+        insertCharsAt(iCol, iRow, chars)
+        val focusTarget = (iCol * numRows + iRow + chars.length).coerceAtMost(editTextFields.size - 1)
+        postRefreshFocusColumn(focusTarget)
+        Toast.makeText(this, "已貼上", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun pasteTextAt(insertIdx: Int) {
+        val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val raw  = clip.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+            ?.ifEmpty { null } ?: return
+        clearSelection()
+        val iCol  = insertIdx / numRows
+        val iRow  = insertIdx % numRows
+        val chars = raw.replace("\r\n", "\n").replace("\r", "\n").filter { it != '\n' }
+        if (chars.isEmpty()) return
+        insertCharsAt(iCol, iRow, chars)
+        val focusTarget = (iCol * numRows + iRow + chars.length).coerceAtMost(editTextFields.size - 1)
+        postRefreshFocusColumn(focusTarget)
+        Toast.makeText(this, "已貼上", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun selectEntireLine() {
+        if (selectionStart < 0) return
+        val col = minOf(selectionStart, selectionEnd).coerceAtLeast(0) / numRows
+        selectionStart = (col * numRows).coerceIn(0, editTextFields.size - 1)
+        selectionEnd   = ((col + 1) * numRows - 1).coerceIn(0, editTextFields.size - 1)
+        updateSelectionHighlight()
+    }
+
+    private fun selectEntireParagraph() {
+        if (selectionStart < 0) return
+        val curCol = minOf(selectionStart, selectionEnd).coerceAtLeast(0) / numRows
+        val breaks = columnBreaks.sorted()
+        // Paragraph start: rightmost break <= curCol (col 0 if none)
+        var paraStartCol = 0
+        for (brk in breaks) { if (brk <= curCol) paraStartCol = brk else break }
+        // Paragraph end: column before the next break after curCol, or last column
+        var paraEndCol = numColumns - 1
+        for (brk in breaks) { if (brk > curCol) { paraEndCol = brk - 1; break } }
+        var first = -1; var last = -1
+        for (col in paraStartCol..paraEndCol) {
+            val cells = columnData.getOrNull(col) ?: continue
+            for (row in cells.indices) {
+                if (cells[row].isNotEmpty()) {
+                    val idx = col * numRows + row
+                    if (first < 0) first = idx
+                    last = idx
                 }
-            ).forEach { (label, action) ->
-                addView(TextView(this@MainActivity).apply {
-                    text = label; textSize = 13f; gravity = Gravity.CENTER
-                    setTextColor(getColor(R.color.text_dark))
-                    background = GradientDrawable().apply {
-                        setColor(Color.TRANSPARENT)
-                        setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
-                        cornerRadius = 20f * dp
-                    }
-                    val hP = (14 * dp).roundToInt(); val vP = (5 * dp).roundToInt()
-                    setPadding(hP, vP, hP, vP)
-                    layoutParams = LinearLayout.LayoutParams(WC, WC).also { it.marginEnd = (8 * dp).roundToInt() }
-                    setOnClickListener { action.run() }
-                })
             }
         }
-
-    private fun buildFontRow(dp: Float): View = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        layoutParams = LinearLayout.LayoutParams(MP, WC)
-        val hPad = (8 * dp).roundToInt(); val vPad = (8 * dp).roundToInt()
-        setPadding(hPad, vPad, hPad, vPad)
-
-        fun rowDivider() = View(this@MainActivity).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                (1f * dp).roundToInt(), (28 * dp).roundToInt()
-            ).also { it.marginStart = (8 * dp).roundToInt(); it.marginEnd = (8 * dp).roundToInt() }
-            setBackgroundColor(getColor(R.color.divider))
-        }
-        fun label(t: String) = TextView(this@MainActivity).apply {
-            text = t; textSize = 11f
-            setTextColor(getColor(R.color.text_light))
-            layoutParams = LinearLayout.LayoutParams(WC, WC).also { it.marginEnd = (4 * dp).roundToInt() }
-        }
-        fun chip(initial: String) = TextView(this@MainActivity).apply {
-            text = initial; textSize = 13f; gravity = Gravity.CENTER
-            setTextColor(getColor(R.color.text_dark))
-            background = GradientDrawable().apply {
-                setColor(getColor(R.color.chip_active)); cornerRadius = 4f * dp
-            }
-            val hP = (8 * dp).roundToInt(); val vP = (2 * dp).roundToInt()
-            setPadding(hP, vP, hP, vP)
-            layoutParams = LinearLayout.LayoutParams(WC, WC)
-        }
-
-        // 字體
-        addView(label("字體"))
-        addView(buildFontSpinner(dp).also { it.layoutParams = LinearLayout.LayoutParams(0, WC, 1f) })
-
-        addView(rowDivider())
-
-        // 字號 — tappable chip → popup seekbar
-        addView(label("字號"))
-        val sizeChip = chip(fontSizeSp.toInt().toString())
-        fontSizeLabelRef = sizeChip
-        sizeChip.setOnClickListener {
-            showPopupSeekbar(
-                anchor = it,
-                max    = fontSizeList.size - 1,
-                initial = fontSizeList.indexOfFirst { e -> e.first == fontSizeSp }.coerceAtLeast(0),
-                format  = { i -> fontSizeList[i].second }
-            ) { p ->
-                val newSize = fontSizeList[p].first
-                if (newSize != fontSizeSp) {
-                    fontSizeSp = newSize
-                    fontSizeLabelRef?.text = newSize.toInt().toString()
-                    needsReflow = true; rebuildGrid()
-                }
-            }
-        }
-        addView(sizeChip)
-
-        addView(rowDivider())
-
-        // 字距 — tappable chip → popup seekbar
-        addView(label("字距"))
-        val gapChip = chip(wordGapDp.toInt().toString())
-        gapValueLabelRef = gapChip
-        gapChip.setOnClickListener {
-            showPopupSeekbar(
-                anchor  = it,
-                max     = 20,
-                initial = wordGapDp.toInt(),
-                format  = { i -> "$i" }
-            ) { p ->
-                wordGapDp = p.toFloat()
-                gapValueLabelRef?.text = "$p"
-                needsReflow = true; rebuildGrid()
-            }
-        }
-        addView(gapChip)
+        if (first >= 0) { selectionStart = first; selectionEnd = last; updateSelectionHighlight() }
     }
-
-    // Shows a floating seekbar popup anchored above `anchor`.
-    // `format` converts a progress value to a display string shown inside the popup.
-    // `onChange` is called on every drag step while `fromUser` is true.
-    private fun showPopupSeekbar(
-        anchor: View, max: Int, initial: Int,
-        format: (Int) -> String,
-        onChange: (Int) -> Unit
-    ) {
-        val dp = resources.displayMetrics.density
-        val popupWidth = (resources.displayMetrics.widthPixels * 0.82f).roundToInt()
-
-        val valueLabel = TextView(this).apply {
-            text = format(initial); textSize = 13f; gravity = Gravity.CENTER
-            setTextColor(getColor(R.color.text_dark))
-            layoutParams = LinearLayout.LayoutParams((40 * dp).roundToInt(), WC)
-        }
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = GradientDrawable().apply {
-                setColor(getColor(R.color.panel_bg))
-                setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
-                cornerRadius = 10f * dp
-            }
-            val pad = (12 * dp).roundToInt()
-            setPadding(pad, pad, pad, pad)
-            addView(SeekBar(this@MainActivity).apply {
-                this.max = max; progress = initial
-                layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
-                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                        if (fromUser) { valueLabel.text = format(p); onChange(p) }
-                    }
-                    override fun onStartTrackingTouch(sb: SeekBar?) {}
-                    override fun onStopTrackingTouch(sb: SeekBar?) {}
-                })
-            })
-            addView(valueLabel)
-        }
-        container.measure(
-            View.MeasureSpec.makeMeasureSpec(popupWidth, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        )
-        PopupWindow(container, popupWidth, container.measuredHeight, true).apply {
-            elevation = 8f * dp
-            isOutsideTouchable = true
-            val xOff = ((anchor.width - popupWidth) / 2)
-            val yOff = -(container.measuredHeight + anchor.height + (6 * dp).roundToInt())
-            showAsDropDown(anchor, xOff, yOff)
-        }
-    }
-
-    private fun subDivider(dp: Float): View = View(this).apply {
-        layoutParams = LinearLayout.LayoutParams(MP, (1f * dp).roundToInt())
-        setBackgroundColor(getColor(R.color.divider))
-    }
-
-
 
     // ── Reflow ─────────────────────────────────────────────────────────
     private fun reflowColumnData(newNumRows: Int) =
@@ -1081,8 +905,9 @@ class MainActivity : AppCompatActivity() {
     private fun refreshGrid() {
         clearComposingPreview()
         focusedCellIndex = -1
+        val builtColCount = if (numRows > 0) editTextFields.size / numRows else 0
         withRestoring {
-            for (col in 0 until numColumns) {
+            for (col in 0 until builtColCount) {
                 val colData = columnData.getOrNull(col)
                 for (row in 0 until numRows) {
                     val expected = colData?.getOrNull(row) ?: ""
@@ -1095,6 +920,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         ensureBufferColumn()
+        if (isSelecting) updateSelectionHighlight()
     }
 
     // ── Grid ───────────────────────────────────────────────────────────
@@ -1123,11 +949,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     // Enter key: column-break insertion.
-    // In SEQUENTIAL mode: characters below the cursor in the current column are extracted,
-    // the column is trimmed to the cursor row, and the extracted tail is prepended to
-    // the next column (displacing any existing content right) via insertCharsAt.
-    // In SCATTER mode: split into nextCol too, but overwrite nextCol instead of
-    // inserting a new column and shifting existing columns.
+    // Characters below the cursor in the current column are extracted, the column is
+    // trimmed to the cursor row, and the extracted tail is prepended to the next column
+    // (displacing any existing content right) via a structural column insert.
     private fun insertColumnBreak(cellCol: Int, cursorRow: Int) {
         val nextCol = (cellCol + 1).coerceAtMost(MAX_COLUMNS - 1)
         // With setSelection(0) the cursor sits before the character at cursorRow.
@@ -1149,11 +973,9 @@ class MainActivity : AppCompatActivity() {
             postRefreshFocusColumn(nextCol * numRows, nextCol)
             return
         }
-        // Always do a structural column insert: slide every columnData entry and every
-        // break index at or beyond nextCol right by 1, then place tail (possibly empty)
-        // as the new column at nextCol.
-        // Using insertCharsAt here instead would prepend tail into nextCol's existing
-        // content and merge the two columns — wrong when nextCol already has characters.
+        // Structural column insert: slide every columnData entry and every break index
+        // at or beyond nextCol right by 1, then place tail (possibly empty) as the new
+        // column at nextCol.  insertCharsAt would merge columns — wrong here.
         while (columnData.size < nextCol) columnData.add(mutableListOf())
         columnData.add(nextCol, tail)
         val shifted = columnBreaks.mapTo(mutableSetOf()) { if (it >= nextCol) it + 1 else it }
@@ -1218,46 +1040,88 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun expandGrid() {
-        val grid = (hScroll?.getChildAt(0) as? GridLayout) ?: return
-        val cellSize = currentCellSize.takeIf { it > 0 } ?: return
-        val newCol = numColumns
-        numColumns++
-        grid.columnCount = numColumns
-        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
-        repeat(numRows) { row ->
-            val index = newCol * numRows + row
-            val et = makeCell(row, newCol, index, cellSize, fontPx)
-            editTextFields.add(et); grid.addView(et)
-        }
+        // Grid is always MAX_COLUMNS wide; use ensureColumnBuilt for on-demand cell creation.
+        ensureBufferColumn()
     }
 
     private fun ensureBufferColumn() {
-        while (columnData.size + 1 > numColumns && numColumns < MAX_COLUMNS) expandGrid()
+        // Ensure there is at least one empty column beyond the last data column.
+        val neededCol = columnData.size.coerceIn(0, MAX_COLUMNS - 1)
+        ensureColumnBuilt(neededCol)
+    }
+
+    // Builds one column's EditText cells, fills data, appends to editTextFields/grid.
+    // Must be called in col order 0,1,2,… because editTextFields is a contiguous list.
+    private fun buildColumn(col: Int, grid: GridLayout, fontPx: Float, cellSize: Int) {
+        if (col in builtColumns || col >= MAX_COLUMNS || numRows <= 0) return
+        val colData = columnData.getOrNull(col)
+        isRestoring = true
+        try {
+            repeat(numRows) { row ->
+                val index = col * numRows + row
+                val et = makeCell(row, col, index, cellSize, fontPx)
+                val ch = colData?.getOrNull(row) ?: ""
+                if (ch.isNotEmpty()) et.setText(ch)
+                et.setTextColor(gridTextColor)
+                editTextFields.add(et)
+                grid.addView(et)
+            }
+        } finally {
+            isRestoring = false
+        }
+        builtColumns.add(col)
+    }
+
+    // Builds exactly the visible columns + all data columns. No async follow-on.
+    // New columns are created on demand: typing triggers ensureBufferColumn,
+    // scrolling triggers the onScrollChangeListener in rebuildGrid.
+    private fun buildInitialColumns(anchorCol: Int) {
+        val grid = (hScroll?.getChildAt(0) as? GridLayout) ?: return
+        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+        val cellSize = currentCellSize
+        val visibleCols = (mainScrollView.width / cellSize.coerceAtLeast(1)).coerceAtLeast(1) + 1
+        val lastDataCol = columnData.indexOfLast { it.any { ch -> ch.isNotEmpty() } }.coerceAtLeast(0)
+        val buildEnd = maxOf(visibleCols - 1, lastDataCol).coerceAtMost(MAX_COLUMNS - 1)
+        for (col in 0..buildEnd) buildColumn(col, grid, fontPx, cellSize)
+    }
+
+    // Synchronously builds all columns from the next unbuilt one up to col.
+    // Called before any access to a column not yet in editTextFields.
+    private fun ensureColumnBuilt(col: Int) {
+        if (col < 0 || col >= MAX_COLUMNS || col in builtColumns) return
+        val grid = (hScroll?.getChildAt(0) as? GridLayout) ?: return
+        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+        val nextUnbuilt = (builtColumns.maxOrNull()?.plus(1)) ?: 0
+        for (c in nextUnbuilt..col) buildColumn(c, grid, fontPx, currentCellSize)
     }
 
     private fun rebuildGrid(isInitialBoot: Boolean = false) {
         val availW = gridContainer.measuredWidth
         // adjustNothing: mainScrollView.height is stable when keyboard/tools panel opens/closes.
-        // Do NOT subtract paddingBottom here — that padding is keyboard avoidance headroom,
-        // not a real height reduction, and would cause numRows to shrink while typing.
+        // Do NOT subtract paddingBottom here — that padding is keyboard avoidance headroom.
         val currentH = mainScrollView.height - gridContainer.paddingTop
         if (availW <= 0 || currentH <= 0) return
         val imeVisible = ViewCompat.getRootWindowInsets(rootFrame)
             ?.isVisible(WindowInsetsCompat.Type.ime()) == true
-        // stableMaxHeight is locked once at startup (before any IME activity) and
-        // used as the authoritative height so numRows never changes with keyboard state.
+        // stableMaxHeight is locked once at startup (before any IME activity).
         val availH = if (stableMaxHeight > 0) stableMaxHeight else currentH
 
-        // Compute anchor: which column sits at the right edge of the viewport right now.
-        val oldCols = numColumns
+        // Anchor: leftmost column visible in the viewport (grid is always MAX_COLUMNS wide).
         val anchorCol: Int = run {
             val s = hScroll ?: return@run 0
             val cs = currentCellSize.takeIf { it > 0 } ?: return@run 0
             val viewport = s.width.takeIf { it > 0 } ?: return@run 0
-            val gw = maxOf(oldCols * cs, s.width)
+            val gw = maxOf(MAX_COLUMNS * cs, s.width)
             (gw - (s.scrollX + viewport)) / cs
-        }.coerceIn(0, maxOf(oldCols - 1, 0))
+        }.coerceIn(0, MAX_COLUMNS - 1)
 
+        // Cancel any ongoing async build before tearing down views.
+        incrementalBuildRunnable?.let { rootFrame.removeCallbacks(it) }
+        incrementalBuildRunnable = null
+        buildGeneration++
+        builtColumns.clear()
+
+        clearSelection()
         previewCells.clear(); isPreviewing = false
         focusedCellIndex = -1
 
@@ -1269,29 +1133,19 @@ class MainActivity : AppCompatActivity() {
 
         // Floor division guarantees numRows * cellSize <= availH (no vertical overflow).
         numRows = availH / cellSize
-        numColumns = (maxOf(columnData.size, columnBreaks.maxOrNull()?.plus(1) ?: 0) + 1)
-            .coerceIn(1, MAX_COLUMNS)
+        numColumns = MAX_COLUMNS   // grid is always MAX_COLUMNS wide for accurate scrollbar
         if (numRows <= 0) return
 
-        // Reflow columnData BEFORE tearing down the grid so the restore loop below
-        // always reads from already-redistributed data.
-        // SCATTER mode is skipped: absolute (col, row) tap positions must not move.
         if (needsReflow) {
             if (inputMode != InputMode.SCATTER) reflowColumnData(numRows)
             needsReflow = false
         }
 
-        // Explicit grid height — must never exceed availH.
         val gridHeight = numRows * cellSize
         check(gridHeight <= availH) { "gridHeight=$gridHeight > availH=$availH" }
-
         currentCellSize = cellSize
 
-        // Prevent ghost cursors: clear focus on every EditText before destroying views.
-        // Only hide the keyboard when it is already closed — if it was open, we will
-        // re-open it immediately via focusCell(showKeyboard=true) and hiding+re-showing
-        // would cause a visible bounce animation.  clearFocus() alone detaches the IME
-        // from the old views; imm.restartInput() in focusCell rebinds it to the new ones.
+        // Clear focus before destroying views; only hide IME when it's already closed.
         editTextFields.forEach { it.clearFocus() }
         currentFocus?.clearFocus()
         val imm0 = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
@@ -1299,25 +1153,14 @@ class MainActivity : AppCompatActivity() {
 
         gridContainer.removeAllViews(); editTextFields.clear()
 
+        // Skeleton grid: full MAX_COLUMNS width so scrollbar length is correct from frame 1.
+        // Cells are added lazily by buildInitialColumns / ensureColumnBuilt.
         val grid = GridLayout(this).apply {
-            rowCount = numRows; columnCount = numColumns
+            rowCount = numRows; columnCount = MAX_COLUMNS
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            layoutParams = ViewGroup.LayoutParams(numColumns * cellSize, gridHeight)
-        }
-        // Each index encodes (col = index/numRows, row = index%numRows).
-        // row is always in 0 until numRows, so (row+1)*cellSize <= gridHeight <= availH.
-        // Only numColumns cells are created now; expandGrid() adds more on demand.
-        repeat(numRows * numColumns) { index ->
-            val cellRow = index % numRows
-            val cellCol = index / numRows
-            check(cellRow < numRows && (cellRow + 1) * cellSize <= availH) {
-                "Cell row=$cellRow overflows availH=$availH with cellSize=$cellSize"
-            }
-            val et = makeCell(cellRow, cellCol, index, cellSize, fontPx)
-            editTextFields.add(et); grid.addView(et)
+            layoutParams = ViewGroup.LayoutParams(MAX_COLUMNS * cellSize, gridHeight)
         }
         hScroll = HorizontalScrollView(this).apply {
-            // Explicit gridHeight: gridContainer is WC so MATCH_PARENT would collapse to 0.
             isFillViewport = true
             layoutParams = LinearLayout.LayoutParams(MP, gridHeight)
             isHorizontalScrollBarEnabled = false
@@ -1325,36 +1168,39 @@ class MainActivity : AppCompatActivity() {
             layoutDirection = View.LAYOUT_DIRECTION_RTL
             addView(grid)
         }
+        hScroll?.setOnScrollChangeListener { _, scrollX, _, _, _ ->
+            if (isSelecting) repositionHandles()
+            // Build columns as the user scrolls into unbuilt territory.
+            val cs = currentCellSize.takeIf { it > 0 } ?: return@setOnScrollChangeListener
+            val gw = MAX_COLUMNS * cs
+            // Highest col index whose right edge is still inside or past the left viewport edge.
+            val highestVisible = ((gw - scrollX) / cs).coerceIn(0, MAX_COLUMNS - 1)
+            val lastBuilt = builtColumns.maxOrNull() ?: -1
+            if (highestVisible > lastBuilt) {
+                ensureColumnBuilt((highestVisible + 1).coerceAtMost(MAX_COLUMNS - 1))
+            }
+        }
         gridContainer.addView(hScroll)
 
-        // After layout, restore scroll so anchorCol stays at the right edge.
+        // Restore scroll so anchorCol stays at the right edge after layout.
         hScroll?.viewTreeObserver?.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
                 hScroll?.viewTreeObserver?.removeOnGlobalLayoutListener(this)
                 val s = hScroll ?: return
-                val gw = maxOf(numColumns * cellSize, s.width)
+                val gw = maxOf(MAX_COLUMNS * cellSize, s.width)
                 val targetScrollX = (gw - anchorCol * cellSize - s.width).coerceAtLeast(0)
                 s.post { s.scrollTo(targetScrollX, 0) }
             }
         })
 
-        withRestoring {
-            for (col in 0 until minOf(numColumns, columnData.size)) {
-                val colData = columnData[col]
-                for (row in 0 until minOf(numRows, colData.size)) {
-                    val ch = colData[row]
-                    if (ch.isNotEmpty()) editTextFields[col * numRows + row].setText(ch)
-                }
-            }
-        }
+        // Build exactly the visible columns + data columns; no background loop.
+        buildInitialColumns(anchorCol)
 
+        // All data columns are guaranteed built by the sync batch, so lastFilled is correct.
         val lastFilled = editTextFields.indexOfLast { it.text.isNotEmpty() }
         val focusIdx = if (lastFilled < 0) 0 else (lastFilled + 1).coerceAtMost(editTextFields.size - 1)
-        val focusEt  = editTextFields[focusIdx]
-        if (!isInitialBoot) {
-            // Restore keyboard state: if it was open before the rebuild, re-open it.
-            // If it was closed (user was browsing styles), keep it closed so we don't
-            // interrupt them with an unwanted keyboard popup.
+        val focusEt  = editTextFields.getOrNull(focusIdx)
+        if (!isInitialBoot && focusEt != null) {
             focusEt.postDelayed({ focusCell(focusIdx, showKeyboard = imeVisible) }, 50)
             focusEt.postDelayed({
                 val focused = currentFocus
@@ -1476,13 +1322,28 @@ class MainActivity : AppCompatActivity() {
         // SEQUENTIAL empty cells redirect to the first empty row in column-major order.
         et.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_UP) {
-                // If the tools panel is visible, the first tap dismisses it and brings up
-                // the keyboard — the cell still receives focus, but the panel closes first.
+                val now = System.currentTimeMillis()
+
+                // Double-tap → enter selection mode
+                if (!isSelecting && lastTapIndex == index && now - lastTapTime < 300L) {
+                    lastTapTime = 0L; lastTapIndex = -1
+                    enterSelectionMode(index)
+                    return@setOnTouchListener true
+                }
+
+                // Tap outside handles while selecting → dismiss selection, fall through to normal tap
+                if (isSelecting) {
+                    handlePasteView?.visibility = View.GONE
+                    clearSelection()
+                    // fall through: normal focus/keyboard logic runs below
+                }
+
+                lastTapTime = now; lastTapIndex = index
+
                 if (toolsVisible) {
                     allToolsPanel.visibility = View.GONE
                     toolsVisible = false
                     toolsCell?.setBackgroundColor(Color.TRANSPARENT)
-                    // Pre-set padding to keyboard height so the grid never jumps.
                     if (lastKeyboardHeight > 0) mainScrollView.setPadding(0, 0, 0, lastKeyboardHeight)
                 }
                 if (inputMode == InputMode.SEQUENTIAL && et.text.isEmpty()) {
@@ -1522,23 +1383,26 @@ class MainActivity : AppCompatActivity() {
                     KeyEvent.KEYCODE_DEL -> {
                         val cellCol = index / numRows
                         val cellRow = index % numRows
-                        // Row 0 of a break column → undo the column break (merge back).
+                        // Row 0 of a break column → undo the column break (SEQUENTIAL only).
                         if (cellRow == 0 && cellCol > 0 && inputMode != InputMode.SCATTER
                                 && columnBreaks.contains(cellCol)) {
                             removeColumnBreak(cellCol)
                             return@setOnKeyListener true
                         }
                         if (inputMode == InputMode.SCATTER) {
-                            val colList = columnData.getOrNull(cellCol)
-                            val focusTarget = (index - 1).coerceAtLeast(0)
-                            if (colList != null && cellRow < colList.size) {
-                                withRestoring {
-                                    colList.removeAt(cellRow)
-                                    colList.add("")
+                            val curChar = columnData.getOrNull(cellCol)?.getOrNull(cellRow) ?: ""
+                            if (curChar.isNotBlank()) {
+                                // Island: backspace-delete with reflow, same as SEQUENTIAL.
+                                deletePreviousSequentialCell(cellCol, cellRow, index)
+                            } else {
+                                val colList = columnData.getOrNull(cellCol)
+                                val focusTarget = (index - 1).coerceAtLeast(0)
+                                if (colList != null && cellRow < colList.size) {
+                                    withRestoring { colList.removeAt(cellRow); colList.add("") }
                                 }
+                                editTextFields.getOrNull(focusTarget)?.requestFocus()
+                                gridContainer.post { refreshGrid(); focusCell(focusTarget) }
                             }
-                            editTextFields.getOrNull(focusTarget)?.requestFocus()
-                            gridContainer.post { refreshGrid(); focusCell(focusTarget) }
                         } else {
                             deletePreviousSequentialCell(cellCol, cellRow, index)
                         }
@@ -1579,7 +1443,8 @@ class MainActivity : AppCompatActivity() {
                 val cellRow = index % numRows
                 if (raw.isEmpty()) {
                     val originalChar = columnData.getOrNull(cellCol)?.getOrNull(cellRow) ?: ""
-                    if (originalChar.isNotEmpty() && inputMode == InputMode.SEQUENTIAL) {
+                    // Island: non-blank cell backspace-deletes with reflow regardless of mode.
+                    if (originalChar.isNotEmpty() && (inputMode == InputMode.SEQUENTIAL || originalChar.isNotBlank())) {
                         deletePreviousSequentialCell(cellCol, cellRow, index)
                     } else {
                         setColumnChar(cellCol, cellRow, "")
@@ -1607,6 +1472,26 @@ class MainActivity : AppCompatActivity() {
 
                 if (inputMode == InputMode.SCATTER && originalChar.isNotEmpty()
                         && text.length > 1 && !text.contains('\n')) {
+                    if (originalChar.isNotBlank()) {
+                        // Island: multi-char commit on a non-blank cell → insert-shift.
+                        val newChars: String? = when {
+                            text.startsWith(originalChar) -> text.substring(1)
+                            text.endsWith(originalChar)   -> text.dropLast(1)
+                            else                          -> null
+                        }
+                        if (newChars != null && newChars.isNotEmpty()) {
+                            val before = focusedCellIndex == index && cursorBefore
+                            val focusTarget = performInsert(index, newChars) ?: run {
+                                suppress = true; editable.replace(0, editable.length, originalChar); return
+                            }
+                            suppress = true
+                            editable.replace(0, editable.length,
+                                if (before) newChars[0].toString() else originalChar)
+                            postRefreshFocusColumn(focusTarget)
+                            return
+                        }
+                    }
+                    // Space cell or fallback: SCATTER overwrite.
                     val replacement = when {
                         text.startsWith(originalChar) -> text.substring(1).firstOrNull()
                         text.endsWith(originalChar)   -> text.dropLast(1).lastOrNull()
@@ -1615,22 +1500,12 @@ class MainActivity : AppCompatActivity() {
                     setColumnChar(cellCol, cellRow, replacement)
                     suppress = true
                     editable.replace(0, editable.length, replacement)
-                    ensureBufferColumn()
-                    advanceToNextCell(index, editTextFields.size)
+                    advanceToNextCell(index, total)
                     return
                 }
 
                 if (text.length > 1 || text.contains('\n')) {
-                    // ── Insert-shift (cursor-position-aware, any number of new chars) ──
-                    // Triggered when the IME commits one or more chars into an occupied cell
-                    // in SEQUENTIAL mode.  The EditText content is a mix of the original char
-                    // and the newly committed chars.  We extract the new portion by stripping
-                    // the preserved original, then shift existing content right and insert.
-                    //
-                    // Left side (cursorBefore=true)  → insert at the current cell; original shifts down.
-                    // Right side (cursorBefore=false) → insert at the cell below; current cell unchanged.
-                    // If the original char is not found in the new text (IME fully replaced it),
-                    // fall through to the paste path — we cannot determine user intent safely.
+                    // ── Insert-shift (SEQUENTIAL only) ────────────────────────────────
                     if (text.length >= 2 && !text.contains('\n')
                             && originalChar.isNotEmpty() && inputMode == InputMode.SEQUENTIAL) {
                         val newChars: String? = when {
@@ -1708,9 +1583,21 @@ class MainActivity : AppCompatActivity() {
                         scrollToColumn(focusCol)
                     }
                 } else {
-                    setColumnChar(cellCol, cellRow, raw)
-                    ensureBufferColumn()
-                    advanceToNextCell(index, editTextFields.size)
+                    // Island: non-blank occupied cell in SCATTER → insert-shift.
+                    if (inputMode == InputMode.SCATTER && originalChar.isNotBlank()) {
+                        val before = focusedCellIndex == index && cursorBefore
+                        val focusTarget = performInsert(index, raw) ?: run {
+                            suppress = true; editable.replace(0, editable.length, originalChar); return
+                        }
+                        suppress = true
+                        editable.replace(0, editable.length,
+                            if (before) raw else originalChar)
+                        postRefreshFocusColumn(focusTarget)
+                    } else {
+                        setColumnChar(cellCol, cellRow, raw)
+                        ensureBufferColumn()
+                        advanceToNextCell(index, editTextFields.size)
+                    }
                 }
             }
         })
@@ -1723,14 +1610,12 @@ class MainActivity : AppCompatActivity() {
         fontIndex = prefs.getInt("font_index", 0).coerceIn(0, fontCatalogue.size - 1)
         selectedTypeface = fontCatalogue[fontIndex].typeface
         fontSizeSp  = prefs.getFloat("font_size_sp", 24f)
-        wordGapDp   = prefs.getFloat("word_gap_dp", 0f)
+        wordGapDp   = prefs.getFloat("word_gap_dp", 3f)
         gridTextColor = prefs.getInt("text_color", Color.BLACK)
         bgColor     = prefs.getInt("bg_color", Color.WHITE)
-        inputMode   = when (prefs.getString("input_mode", "SEQUENTIAL")) {
-            "SCATTER" -> InputMode.SCATTER
-            else      -> InputMode.SEQUENTIAL
-        }
         bgImageUri  = prefs.getString("bg_image_uri", null)
+        inputMode   = when (prefs.getString("input_mode", "SEQUENTIAL")) {
+            "SCATTER" -> InputMode.SCATTER; else -> InputMode.SEQUENTIAL }
         currentSessionId   = prefs.getString("current_session_id",  null) ?: java.util.UUID.randomUUID().toString()
         currentSessionName = prefs.getString("current_session_name", "文檔") ?: "文檔"
     }
@@ -1873,14 +1758,12 @@ class MainActivity : AppCompatActivity() {
         bgColor = bgCol
         inputMode = mode
 
-        // Sync UI widgets — guards in each listener prevent side-effect loops:
-        // font/size spinners early-return when pos == current index + grid non-empty;
-        // seekBar fromUser=false skips rebuildGrid.
         fontSpinnerRef?.setSelection(fontIndex)
         fontSizeLabelRef?.text = fontSizeSp.toInt().toString()
         gapValueLabelRef?.text = wordGapDp.toInt().toString()
 
         applyTextColor(gridTextColor)
+        refreshModeChips()
 
         if (!imgUri.isNullOrEmpty()) {
             loadBgImageFromUri(imgUri)
@@ -1889,8 +1772,6 @@ class MainActivity : AppCompatActivity() {
             bgImageView?.visibility = View.GONE
             rootFrame.setBackgroundColor(bgColor)
         }
-
-        refreshModeChips()
     }
 
     private fun saveSession(id: String, name: String) {
@@ -1929,11 +1810,10 @@ class MainActivity : AppCompatActivity() {
         clearDocumentContent()
         currentSessionId = java.util.UUID.randomUUID().toString()
         currentSessionName = nextNewSessionName()
-        // Reset all settings to defaults for a fresh session
         applySettings(
-            fontIdx = 0, sizeSp = 24f, gapDp = 0f,
-            textColor = Color.BLACK, bgCol = Color.WHITE,
-            imgUri = null, mode = InputMode.SEQUENTIAL
+            fontIdx = 0, sizeSp = 24f, gapDp = 3f,
+            textColor = Color.BLACK, bgCol = Color.WHITE, imgUri = null,
+            mode = InputMode.SEQUENTIAL
         )
         needsReflow = true; rebuildGrid()
     }
@@ -1944,5 +1824,114 @@ class MainActivity : AppCompatActivity() {
         SessionManager.ensureDefaultSession(filesDir, currentSessionId, currentSessionName,
             columnData, columnBreaks, fontIndex, fontSizeSp, wordGapDp,
             gridTextColor, bgColor, bgImageUri, inputMode.name)
+    }
+
+    private fun refreshModeChips() {
+        val container = modeChipContainer ?: return
+        for (i in 0 until container.childCount) {
+            val chip = container.getChildAt(i) as? TextView ?: continue
+            (chip.background as? GradientDrawable)?.setColor(
+                if (chip.tag == inputMode) getColor(R.color.chip_active) else Color.TRANSPARENT)
+        }
+    }
+
+    // When switching SCATTER → SEQUENTIAL, fill empty slots between first and last
+    // occupied cell with a half-width space so auto-advance never skips a gap.
+    private fun fillGapsForSequentialMode() {
+        if (numRows <= 0) return
+        var firstIdx = -1; var lastIdx = -1
+        for (idx in 0 until numRows * numColumns) {
+            val c = idx / numRows; val r = idx % numRows
+            if ((columnData.getOrNull(c)?.getOrNull(r) ?: "").isNotEmpty()) {
+                if (firstIdx < 0) firstIdx = idx; lastIdx = idx
+            }
+        }
+        if (firstIdx < 0) return
+        withRestoring {
+            for (idx in firstIdx..lastIdx) {
+                val c = idx / numRows; val r = idx % numRows
+                if ((columnData.getOrNull(c)?.getOrNull(r) ?: "").isEmpty()) setColumnChar(c, r, " ")
+            }
+        }
+        refreshGrid()
+    }
+
+    // ── ViewFactory.Callbacks ──────────────────────────────────────────
+    override fun provideFontCatalogue(): List<FontEntry> = fontCatalogue
+    override fun getFontIndex(): Int = fontIndex
+    override fun getFontSizeSp(): Float = fontSizeSp
+    override fun getWordGapDp(): Float = wordGapDp
+    override fun getSelectedTypeface(): Typeface = selectedTypeface
+    override fun getInputMode(): InputMode = inputMode
+
+    override fun onModeSelected(mode: InputMode) {
+        val previous = inputMode
+        inputMode = mode
+        refreshModeChips()
+        if (mode == InputMode.SEQUENTIAL && previous == InputMode.SCATTER) fillGapsForSequentialMode()
+    }
+
+    override fun onToolsToggle() { if (toolsVisible) switchToKeyboard() else switchToTools() }
+    override fun onCollapsePanel() { switchToKeyboard() }
+
+    override fun onPunctInsert(punct: String) { insertPunct(punct) }
+
+    override fun onFontSelected(pos: Int) {
+        if (pos == fontIndex && editTextFields.isNotEmpty()) return
+        fontIndex = pos
+        selectedTypeface = fontCatalogue[pos].typeface
+        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+        val gapPx = (wordGapDp * resources.displayMetrics.density).roundToInt()
+        val newCellSize = (Paint().apply { textSize = fontPx; typeface = selectedTypeface }
+            .measureText("測").roundToInt().coerceAtLeast(1) + gapPx).coerceAtLeast(1)
+        if (newCellSize == currentCellSize && editTextFields.isNotEmpty()) {
+            withRestoring { editTextFields.forEach { it.typeface = selectedTypeface } }
+        } else {
+            needsReflow = true; rebuildGrid()
+        }
+    }
+
+    override fun onFontSizeChanged(newSize: Float) {
+        fontSizeSp = newSize
+        needsReflow = true; rebuildGrid()
+    }
+
+    override fun onWordGapChanged(newGap: Int) {
+        wordGapDp = newGap.toFloat()
+        needsReflow = true; rebuildGrid()
+    }
+
+    override fun onBgColorSelected(color: Int) { applyBackground(color) }
+    override fun onImagePickerRequested() { imagePickerLauncher.launch(arrayOf("image/*")) }
+    override fun onTextColorSelected(color: Int) { applyTextColor(color) }
+
+    override fun onCopySelection() { copySelectedText() }
+    override fun onCutSelection() { cutSelectedText() }
+    override fun onPasteAtSelection() { pasteText() }
+    override fun onSelectEntireLine() { selectEntireLine() }
+    override fun onSelectEntireParagraph() { selectEntireParagraph() }
+    override fun onSelectAll() {
+        var first = -1; var last = -1
+        for (i in editTextFields.indices) {
+            val c = i / numRows; val r = i % numRows
+            if ((columnData.getOrNull(c)?.getOrNull(r) ?: "").isNotEmpty()) {
+                if (first < 0) first = i; last = i
+            }
+        }
+        if (first >= 0) { selectionStart = first; selectionEnd = last; updateSelectionHighlight() }
+    }
+
+    override fun onHandlePasteClicked() {
+        val isStart = tappedHandleIsStart ?: return
+        val targetIndex = if (isStart) selectionStart else selectionEnd
+        pasteTextAt(targetIndex)
+        handlePasteView?.visibility = View.GONE
+        tappedHandleIsStart = null
+    }
+
+    override fun onRenameSession() { showRenameDialog() }
+    override fun onNewSession() { newSession(); refreshDocPanel() }
+    override fun onShowAllSessions() {
+        sessionListLauncher.launch(Intent(this, SessionListActivity::class.java))
     }
 }
