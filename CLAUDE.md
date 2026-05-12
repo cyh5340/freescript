@@ -11,6 +11,8 @@ app/src/main/
 |-- assets/fonts/LXGWWenKai-Regular.ttf
 |-- java/com/poemeditor/
 |   |-- MainActivity.kt          # primary app: editor, toolbar, sessions
+|   |-- GridLogicHelper.kt       # pure data logic: setColumnChar, reflowColumnData, insertCharsAt
+|   |-- SessionManager.kt        # file I/O + JSON helpers for session persistence
 |   |-- SessionListActivity.kt   # full session list with search/date filters
 |   `-- PoemFragment.kt          # unused legacy
 `-- res/
@@ -34,21 +36,36 @@ FrameLayout rootFrame
 |   |               `-- EditText cells
 |   `-- LinearLayout bottomPanel
 |       |-- divider
-|       |-- LinearLayout selectionBar
-|       |   `-- visible only while isSelecting; contains 複製 + ✕ buttons
-|       |-- HorizontalScrollView punctToolbar
-|       |   `-- visible only while IME is visible
-|       `-- LinearLayout toolbar, 54dp, white
-`-- LinearLayout expandHost
-    |-- styleCategoryPanel
-    |-- layoutCategoryPanel
-    |-- writingCategoryPanel
-    `-- docCategoryPanel
+|       |-- HorizontalScrollView punctToolbar    ← visible only while IME is open
+|       `-- FrameLayout toolbar, 54dp, white
+|           |-- LinearLayout mainBar             ← default visible: 工具 | divider | 標點
+|           `-- LinearLayout punctBar            ← shown when 標點 tapped: ← | divider | HScrollView(punct)
+`-- NestedScrollView allToolsPanel               ← Gravity.BOTTOM overlay, height = lastKeyboardHeight
+    `-- LinearLayout content (vertical)
+        |-- 字型: buildFontRow (font spinner + 字號 chip + 字距 chip, all inline)
+        |-- text color swatch row
+        |-- 排版: bg color swatch row
+        |-- 寫作: mode chips only (連續輸入 / 灑花輸入)
+        `-- 檔案: doc actions + recent session list
 ```
 
-`expandHost` is a direct child of `rootFrame`, overlaid above `bottomPanel`. It must not resize or rebuild the grid. `expandPanelPadding` gives `mainScrollView` enough bottom padding to scroll clear of the overlay.
+**Keyboard / tools mutual exclusion:**
+- `toolsVisible` flag tracks which is active.
+- `switchToTools()`: hides IME, shows `allToolsPanel` at `lastKeyboardHeight`.
+- `switchToKeyboard()`: hides `allToolsPanel`, shows IME.
+- Cell touch while `toolsVisible`: dismisses panel before restoring keyboard.
+- Insets listener: force-hides `allToolsPanel` if keyboard appears.
+- Both paths pre-set `mainScrollView.paddingBottom` before showing so the grid never jumps.
 
-Keyboard mode is intended to behave like `adjustNothing`: grid size is stable when the IME opens. Keyboard avoidance is manual through `translateForKeyboard(...)` and `applyScrollPadding()`.
+**Toolbar bar switching (標點):**
+- `mainBar` and `punctBar` are sibling children of the `FrameLayout toolbar`. Only one is `VISIBLE` at a time.
+- Tapping 標點 hides `mainBar`, shows `punctBar`.
+- Tapping ← in `punctBar` reverses. No state flag needed — purely view visibility.
+
+**Grid height stability:**
+- `stableMaxHeight` is captured once in `OnGlobalLayoutListener` when the IME is absent, before `rebuildGrid` is ever called.
+- All `rebuildGrid` calls use `stableMaxHeight` as `availH`, so `numRows` never changes regardless of keyboard or panel state.
+- `rebuildGrid(isInitialBoot = true)` suppresses `focusCell`/`translateForKeyboard` on first build to prevent unwanted keyboard popup.
 
 ## Data Model
 
@@ -77,7 +94,7 @@ fontPx   = sp -> px(fontSizeSp)
 gapPx    = wordGapDp * density
 charSize = Paint.measureText(CJK sample char) using selectedTypeface
 cellSize = charSize + gapPx
-availH   = mainScrollView.height - gridContainer.paddingTop
+availH   = stableMaxHeight  (locked at startup; never varies with keyboard)
 numRows  = floor(availH / cellSize)
 gridHeight = numRows * cellSize
 numColumns = MAX_COLUMNS = 50
@@ -94,13 +111,16 @@ numColumns = MAX_COLUMNS = 50
 - `advanceToNextCell(index, total)`: moves focus to `index + 1`, sets `cursorBefore = true`, scrolls column into view.
 - `postRefreshFocusColumn(targetIndex, col)`: posts `refreshGrid()`, `focusCell(...)`, and `scrollToColumn(...)`.
 - `refreshModeChips()`: only place that recolors writing mode chips.
-- `columnDataToJson()`, `columnBreaksToJson()`, `loadColumnDataFromJson(...)`, `loadColumnBreaksFromJson(...)`: shared persistence helpers.
-- `buildPunctRow(...)` and `buildPunctButton(...)`: shared punctuation UI for IME toolbar and writing panel.
+- `columnDataToJson()`, `columnBreaksToJson()`, `loadColumnDataFromJson(...)`, `loadColumnBreaksFromJson(...)`: thin wrappers delegating to `SessionManager`.
+- `setColumnChar(col, row, ch)`, `reflowColumnData(newNumRows)`, `insertCharsAt(...)`: thin wrappers delegating to `GridLogicHelper`.
+- `buildPunctRow(...)` and `buildPunctButton(...)`: shared punctuation UI — used by both `punctToolbar` (IME bar) and `punctBar` (toolbar row).
+- `buildColorSwatchRow(dp, colors, extra, onClick)`: shared factory for bg and text color swatch panels.
 - `insertCharsAt(insertCol, insertRow, newChars)`: flat-slice insert-shift for SEQUENTIAL; captures content from `(insertCol, insertRow)` forward, writes `newChars`, re-appends displaced content. Never crosses a `columnBreaks` boundary.
 - `performInsert(index, newChars)`: shared insert core; computes the `(iCol, iRow)` insertion point from `cursorBefore`, calls `insertCharsAt`, returns the focus target index after the inserted chars.
 - `deletePreviousSequentialCell(cellCol, cellRow, index)`: SEQUENTIAL backspace — removes the char at `(cellCol, cellRow-1)` (or last occupied in prev column when `cellRow==0`), reflows, refocuses.
 - `removeColumnBreak(cellCol)`: reverse of `insertColumnBreak`; removes the break marker at `cellCol`, reflows the two columns back together, and lands the cursor at the last occupied position in the preceding column.
 - `fillGapsForSequentialMode()`: when switching SCATTER→SEQUENTIAL, fills every empty slot between first and last occupied cell with a half-width space so auto-advance never skips a gap.
+- `showPopupSeekbar(anchor, max, initial, format, onChange)`: floating `PopupWindow` seekbar anchored above a chip; used for font size (字號) and word gap (字距).
 
 ## Reflow
 
@@ -129,7 +149,7 @@ Touch listeners consume all touch events. Native cursor placement should not dec
 
 ### SEQUENTIAL
 
-Label in UI: Sequential writing mode.
+Label in UI: 連續輸入.
 
 - Empty tap redirects to first empty cell in column-major flow.
 - Occupied typing uses insert-shift.
@@ -140,7 +160,7 @@ Label in UI: Sequential writing mode.
 
 ### SCATTER
 
-Label in UI: Scatter writing mode.
+Label in UI: 灑花輸入.
 
 - Tap lands exactly where tapped.
 - Occupied typing overwrites current cell and advances one cell.
@@ -175,12 +195,11 @@ Cells keep selection at 0, so Enter splits before `cursorRow`. The focused cell 
 
 ## Punctuation
 
-Punctuation list is shared by the IME toolbar and writing panel.
+`buildPunctRow(dp)` is shared by `punctToolbar` (above keyboard when IME is open) and the `punctBar` inside the toolbar `FrameLayout` (shown when 標點 is tapped).
 
 `insertPunct(punct)` behavior:
 
-- empty cell: write punctuation directly, update view under `withRestoring`, advance one cell
-- occupied SCATTER: overwrite punctuation directly, update view under `withRestoring`, advance one cell
+- empty cell or SCATTER mode: write punctuation directly, update view under `withRestoring`, advance one cell
 - occupied SEQUENTIAL: call `performInsert(...)`, then `postRefreshFocusColumn(...)`
 
 ## Composing Preview
@@ -190,38 +209,6 @@ During CJK composition:
 - `showComposingPreview(text, startIndex)` renders chars after the first composing char into following empty cells in grey.
 - `clearComposingPreview()` clears preview cells and restores `gridTextColor`.
 - `isPreviewing` suppresses watcher side effects during preview updates.
-
-## Selection
-
-Multi-cell selection for clipboard copy.
-
-State variables:
-
-- `selectionStart`, `selectionEnd`: flat cell indices (-1 = inactive). `min/max` of the two determines the highlighted range.
-- `isSelecting`: true while selection is active.
-- `selectionBar`: LinearLayout in `bottomPanel`, shown only when `isSelecting`.
-
-Entry: long press on any cell triggers `enterSelectionMode(index)` via `Handler.postDelayed` (native `setOnLongClickListener` is blocked because `setOnTouchListener` returns `true` for `ACTION_DOWN`). `pendingLongPress` is cancelled on `ACTION_UP`/`ACTION_CANCEL`.
-
-Extension: while `isSelecting`, `ACTION_UP` on any cell sets `selectionEnd = index` and calls `updateSelectionHighlight()`. Normal tap + focus path is skipped.
-
-`enterSelectionMode(index)`:
-- Hides IME.
-- Sets `isSelecting = true`, `selectionStart = selectionEnd = index`.
-- Shows `selectionBar`.
-- Calls `updateSelectionHighlight()`.
-
-`updateSelectionHighlight()`: colors cells in `[min, max]` range with `R.color.selection_highlight` (#ADD8E6); all others get `Color.TRANSPARENT`.
-
-`clearSelection()`: resets all selection state, hides `selectionBar`, sets all cell backgrounds to `Color.TRANSPARENT`.
-
-`copySelectedText()`: iterates `columnData` from `from` to `to` by index. Appends `\n` when a column boundary that is also in `columnBreaks` is crossed. Puts result in `ClipboardManager` as plain text, shows "已複製" toast.
-
-`focusCell(...)` guards the background-clear of the previous cell with `if (!isSelecting)` so focus changes during selection do not wipe highlights.
-
-`refreshGrid()` calls `updateSelectionHighlight()` at the end if `isSelecting`.
-
-`rebuildGrid()` calls `clearSelection()` before tearing down views so stale highlight state never leaks into the new grid.
 
 ## Backgrounds
 
@@ -277,16 +264,30 @@ Important functions:
 - `refreshDocPanel()`: shows up to 3 recent sessions.
 - `SessionListActivity`: full searchable/filterable session list.
 
-## Toolbar Panels
+## Toolbar
 
-Toolbar categories:
+`toolbar` is a `FrameLayout` (54dp tall) with two alternating children:
 
-- style panel: font and text color
-- layout panel: gap and background
-- writing panel: mode chips and inline punctuation
-- document panel: rename, new, all sessions, recent sessions
+- `mainBar` (default VISIBLE): `buildCategoryCell("工具")` | `divider` | `buildCategoryCell("標點")`
+- `punctBar` (default GONE): `←` back button (54dp wide) | `divider` | `HScrollView(buildPunctRow(dp))`
 
-`toggleCategory(tag)` handles panel visibility and overlay padding. Do not make panels affect grid row count.
+Tapping 工具 calls `switchToTools()` / `switchToKeyboard()`. Tapping 標點 swaps bar visibility. No persistent state flag for the bar swap — purely view visibility toggling via captured `mainBarRef`/`punctBarRef` locals.
+
+`buildCategoryCell(label, toolbarH, dp, onClick)` creates a weight-1f `LinearLayout` with centered label text. `toolsCell` holds a reference to the 工具 cell for background highlight in `switchToTools/switchToKeyboard`.
+
+## Tools Panel
+
+`allToolsPanel` is a `NestedScrollView` overlaid on `rootFrame` at `Gravity.BOTTOM`. Height is set to `lastKeyboardHeight` when shown (fallback 280dp). It is GONE by default and toggled by `switchToTools/switchToKeyboard`.
+
+Sections (top to bottom):
+
+- **字型**: `buildFontRow(dp)` — font spinner + 字號 chip + 字距 chip, all in one horizontal row with `rowDivider`s
+- Text color swatch row (horizontal scroll)
+- **排版**: bg color swatch row (horizontal scroll, includes 自訂 image picker)
+- **寫作**: mode chips only (連續輸入 / 灑花輸入)
+- **檔案**: action buttons (更名 / 新增 / 全部) + recent session list (`docListContainer`)
+
+Font size and word gap use `showPopupSeekbar(anchor, max, initial, format, onChange)` — a `PopupWindow` with a `SeekBar` that floats above the tapped chip.
 
 ## Invariants
 
@@ -296,6 +297,8 @@ Toolbar categories:
 - Preserve mode differences. Most regressions come from accidentally sending SCATTER through SEQUENTIAL insert-shift paths.
 - Keep `EditText` ids/tags unique across rebuilds.
 - Keep custom background persistence app-owned, not dependent on external URI permission.
+- `stableMaxHeight` must never be derived while the IME is open. The `OnGlobalLayoutListener` guards this with an `!imeVisible` check.
+- The toolbar `FrameLayout` height and `allToolsPanel` height must match `lastKeyboardHeight` so the grid's paddingBottom transition is seamless.
 
 ## Build
 

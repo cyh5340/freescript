@@ -33,6 +33,8 @@ import kotlin.math.roundToInt
 
 enum class InputMode { SCATTER, SEQUENTIAL }
 
+private typealias SessionMeta = SessionManager.SessionMeta
+
 class MainActivity : AppCompatActivity() {
 
     // ── Color configuration ────────────────────────────────────────────
@@ -77,12 +79,10 @@ class MainActivity : AppCompatActivity() {
     private var selectedTypeface = Typeface.DEFAULT
     private var wordGapDp        = 0f
     private var inputMode        = InputMode.SEQUENTIAL
-    private var activePanelTag: String? = null
 
     // ── Widget refs for programmatic sync (session load / new) ─────────
     private var fontSpinnerRef: Spinner? = null
-    private var fontSizeSpinnerRef: Spinner? = null
-    private var gapSeekBarRef: SeekBar? = null
+    private var fontSizeLabelRef: TextView? = null
     private var gapValueLabelRef: TextView? = null
     private var modeChipContainer: LinearLayout? = null
 
@@ -93,30 +93,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sessionListLauncher: ActivityResultLauncher<Intent>
 
     // ── Document management ────────────────────────────────────────────
-    private data class SessionMeta(val id: String, val name: String, val lastAccessed: Long) {
-        fun formattedDate(): String {
-            val cal = java.util.Calendar.getInstance().also { it.timeInMillis = lastAccessed }
-            return "${cal.get(java.util.Calendar.MONTH) + 1}/${cal.get(java.util.Calendar.DAY_OF_MONTH)}"
-        }
-    }
-    private val sessionsDir get() = java.io.File(filesDir, "poems").also { it.mkdirs() }
     private var currentSessionId: String = java.util.UUID.randomUUID().toString()
     private var currentSessionName: String = "文檔"
-    private lateinit var docCategoryPanel: LinearLayout
-    private lateinit var docCategoryCell: LinearLayout
     private var docListContainer: LinearLayout? = null
 
     // ── UI refs ────────────────────────────────────────────────────────
     private lateinit var rootFrame:             FrameLayout
     private lateinit var gridContainer:         LinearLayout
-    private lateinit var expandHost:            LinearLayout
-    private lateinit var toolbar:               LinearLayout
-    private lateinit var styleCategoryPanel:    LinearLayout
-    private lateinit var layoutCategoryPanel:   LinearLayout
-    private lateinit var writingCategoryPanel:  LinearLayout
-    private lateinit var styleCategoryCell:     LinearLayout
-    private lateinit var layoutCategoryCell:    LinearLayout
-    private lateinit var writingCategoryCell:   LinearLayout
+    private lateinit var allToolsPanel:         NestedScrollView
+    private lateinit var toolbar:               FrameLayout
+    private var toolsCell:                      LinearLayout? = null
+    private var punctCellRef:                   LinearLayout? = null
     private lateinit var bottomPanel:           LinearLayout
     private lateinit var mainLayout:            LinearLayout
     private lateinit var mainScrollView:        NestedScrollView
@@ -143,48 +130,30 @@ class MainActivity : AppCompatActivity() {
     // Preserved across reflow so stanza structure survives gap/font changes.
     private val columnBreaks = mutableSetOf<Int>()
     private var needsReflow = false
-    private var maxAvailableHeight = 0  // last gridContainer content-height measured WITHOUT keyboard
-    private var expandPanelPadding = 0  // paddingBottom held by the open expand panel (keyboard-safe overlay)
+    private var stableMaxHeight = 0       // locked once at startup (IME hidden); used for all numRows calculations
+    private var lastKeyboardHeight = 0   // last measured IME height; allToolsPanel matches this height
+    private var toolsVisible = false     // true when allToolsPanel is showing instead of keyboard
     private val translateHandler by lazy { Handler(Looper.getMainLooper()) }
     private var translateRunnable: Runnable? = null
 
-    private fun setColumnChar(col: Int, row: Int, ch: String) {
-        while (columnData.size <= col) columnData.add(mutableListOf())
-        while (columnData[col].size <= row) columnData[col].add("")
-        columnData[col][row] = ch
-    }
+    private fun setColumnChar(col: Int, row: Int, ch: String) =
+        GridLogicHelper.setColumnChar(columnData, col, row, ch)
 
     private fun clearDocumentContent() {
         columnData.clear()
         columnBreaks.clear()
     }
 
-    private fun columnDataToJson(): org.json.JSONArray {
-        val cols = org.json.JSONArray()
-        for (col in columnData) {
-            val rows = org.json.JSONArray()
-            for (ch in col) rows.put(ch)
-            cols.put(rows)
-        }
-        return cols
-    }
+    private fun columnDataToJson() = SessionManager.columnDataToJson(columnData)
 
-    private fun columnBreaksToJson(): org.json.JSONArray =
-        org.json.JSONArray().also { breaks ->
-            for (b in columnBreaks) breaks.put(b)
-        }
+    private fun columnBreaksToJson() = SessionManager.columnBreaksToJson(columnBreaks)
 
     private fun loadColumnDataFromJson(cols: org.json.JSONArray) {
-        columnData.clear()
-        for (i in 0 until cols.length()) {
-            val rows = cols.getJSONArray(i)
-            columnData.add((0 until rows.length()).mapTo(mutableListOf()) { rows.getString(it) })
-        }
+        columnData.clear(); columnData.addAll(SessionManager.loadColumnDataFromJson(cols))
     }
 
     private fun loadColumnBreaksFromJson(breaks: org.json.JSONArray) {
-        columnBreaks.clear()
-        for (i in 0 until breaks.length()) columnBreaks.add(breaks.getInt(i))
+        columnBreaks.clear(); columnBreaks.addAll(SessionManager.loadColumnBreaksFromJson(breaks))
     }
 
     private inline fun withRestoring(block: () -> Unit) {
@@ -198,9 +167,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun scrollToColumn(col: Int) {
         val s = hScroll ?: return
-        if (currentCellSize <= 0 || s.width <= 0) return
-        val physLeft  = (MAX_COLUMNS - 1 - col) * currentCellSize
-        val physRight = (MAX_COLUMNS - col) * currentCellSize
+        if (currentCellSize <= 0 || s.width <= 0 || numColumns <= 0) return
+        val gw = maxOf(numColumns * currentCellSize, s.width)
+        val physLeft  = gw - (col + 1) * currentCellSize
+        val physRight = gw - col * currentCellSize
         val sx = s.scrollX; val vp = s.width
         when {
             physLeft  < sx       -> s.smoothScrollTo(physLeft, 0)
@@ -279,12 +249,11 @@ class MainActivity : AppCompatActivity() {
         val kbdHeight = screenHeight - rect.bottom
 
         if (kbdHeight <= 0) {
-            mainScrollView.setPadding(0, 0, 0, expandPanelPadding)
+            mainScrollView.setPadding(0, 0, 0, 0)
             return
         }
 
-        // paddingBottom = keyboard height + any open panel height so both are scrollable past.
-        mainScrollView.setPadding(0, 0, 0, kbdHeight + expandPanelPadding)
+        mainScrollView.setPadding(0, 0, 0, kbdHeight)
 
         et.post {
             val loc = IntArray(2)
@@ -294,8 +263,8 @@ class MainActivity : AppCompatActivity() {
 
             // 2. 計算格子的底部是否被鍵盤擋住
             if (etBottom > keyboardTop) {
-                val delta = etBottom - keyboardTop + 150 // 150px 安全緩衝
-                mainScrollView.smoothScrollBy(0, delta)
+                val delta = etBottom - keyboardTop + rect.height() * 0.3f
+                mainScrollView.smoothScrollBy(0, delta.toInt())
             }
         }
     }
@@ -389,7 +358,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         gridContainer = LinearLayout(this).apply {
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            gravity = Gravity.TOP or Gravity.END
             layoutParams = LinearLayout.LayoutParams(MP, WC)   // WC: sized by content
             setPadding(0, (16 * dp).roundToInt(), 0, 0)
         }
@@ -409,30 +378,28 @@ class MainActivity : AppCompatActivity() {
         mainLayout.addView(mainScrollView)
         mainLayout.addView(bottomPanel)
         rootFrame.addView(mainLayout)
-        // expandHost is a push-up overlay; add after mainLayout so it renders on top.
-        rootFrame.addView(expandHost)
+        rootFrame.addView(allToolsPanel)
         setContentView(rootFrame)
         loadBgImageFromUri(bgImageUri)
 
-        // Show/hide punctuation toolbar and manage scroll state in sync with keyboard.
+        // Track keyboard height and manage scroll padding in sync with IME state.
         ViewCompat.setOnApplyWindowInsetsListener(rootFrame) { _, insets ->
             val imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+            val imeHeight = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+            if (imeVisible && imeHeight > 0) lastKeyboardHeight = imeHeight
             punctToolbar.visibility = if (imeVisible) View.VISIBLE else View.GONE
             if (imeVisible) {
-                // Keyboard opened — compute padding + scroll after animation settles.
-                scheduleTranslateForKeyboard()
-            } else {
-                // Keyboard gone — restore only the panel padding, reset scroll to top.
-                mainScrollView.setPadding(0, 0, 0, expandPanelPadding)
-                mainScrollView.smoothScrollTo(0, 0)
-            }
-            // If the panel is open, re-anchor expandHost above the (now-changed) bottomPanel.
-            if (activePanelTag != null) {
-                bottomPanel.post {
-                    val lp = expandHost.layoutParams as FrameLayout.LayoutParams
-                    lp.bottomMargin = bottomPanel.height
-                    expandHost.layoutParams = lp
+                // Keyboard opened — if tools panel was showing, dismiss it now.
+                if (toolsVisible) {
+                    allToolsPanel.visibility = View.GONE
+                    toolsVisible = false
+                    toolsCell?.setBackgroundColor(Color.TRANSPARENT)
                 }
+                scheduleTranslateForKeyboard()
+            } else if (!toolsVisible) {
+                // Keyboard closed and tools not shown — clear scroll padding.
+                mainScrollView.setPadding(0, 0, 0, 0)
+                mainScrollView.smoothScrollTo(0, 0)
             }
             insets
         }
@@ -447,10 +414,16 @@ class MainActivity : AppCompatActivity() {
         mainScrollView.viewTreeObserver.addOnGlobalLayoutListener(
             object : ViewTreeObserver.OnGlobalLayoutListener {
                 override fun onGlobalLayout() {
+                    val imeVisible = ViewCompat.getRootWindowInsets(rootFrame)
+                        ?.isVisible(WindowInsetsCompat.Type.ime()) == true
+                    if (stableMaxHeight == 0 && !imeVisible) {
+                        val h = mainScrollView.height - gridContainer.paddingTop
+                        if (h > 0) stableMaxHeight = h
+                    }
                     if (mainScrollView.width > 0 && mainScrollView.height > 0 && editTextFields.isEmpty()) {
                         // Defer one frame so the activity shell is drawn before we allocate
-                        // 400 EditText cells on the UI thread — reduces visible startup lag.
-                        mainScrollView.post { rebuildGrid() }
+                        // cells on the UI thread — reduces visible startup lag.
+                        mainScrollView.post { rebuildGrid(isInitialBoot = true) }
                     }
                 }
             }
@@ -459,24 +432,7 @@ class MainActivity : AppCompatActivity() {
 
     // ── Bottom panel ───────────────────────────────────────────────────
     private fun buildBottomPanel(dp: Float): LinearLayout {
-        buildStyleCategoryPanel(dp)
-        buildLayoutCategoryPanel(dp)
-        buildWritingCategoryPanel(dp)
-        buildDocCategoryPanel(dp)
-
-        // expandHost is a FrameLayout overlay — NOT part of the vertical flow.
-        // It is added directly to rootFrame in onCreate() so it never squeezes mainScrollView.
-        expandHost = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(getColor(R.color.panel_bg))
-            visibility = View.GONE
-            layoutParams = FrameLayout.LayoutParams(MP, (120 * dp).roundToInt(), Gravity.BOTTOM)
-            addView(styleCategoryPanel)
-            addView(layoutCategoryPanel)
-            addView(writingCategoryPanel)
-            addView(docCategoryPanel)
-        }
-
+        allToolsPanel = buildAllToolsPanel(dp)
         toolbar = buildToolbar(dp)
         punctToolbar = buildPunctToolbar(dp)
 
@@ -492,27 +448,67 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ── Toolbar (always visible, 54 dp, always WHITE) ─────────────────
-    // Three equal-weight category buttons: 樣式 | 排版 | 寫作.
-    // Each toggles its sub-panel in expandHost.
-    private fun buildToolbar(dp: Float): LinearLayout {
+    // ── Toolbar (always visible, 54 dp) ───────────────────────────────
+    // mainBar:  工具 | 標點   — default visible
+    // punctBar: ← | scrollable punct row — shown when 標點 is tapped
+    private fun buildToolbar(dp: Float): FrameLayout {
         val toolbarH = (54 * dp).roundToInt()
-        return LinearLayout(this).apply {
+
+        var mainBarRef: LinearLayout? = null
+        var punctBarRef: LinearLayout? = null
+
+        val mainBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            layoutParams = FrameLayout.LayoutParams(MP, toolbarH)
+            setBackgroundColor(Color.WHITE)
+
+            toolsCell = buildCategoryCell("工具", toolbarH, dp) {
+                if (toolsVisible) switchToKeyboard() else switchToTools()
+            }
+            addView(toolsCell)
+            addView(divider(toolbarH, dp))
+
+            val pCell = buildCategoryCell("標點", toolbarH, dp) {
+                mainBarRef?.visibility = View.GONE
+                punctBarRef?.visibility = View.VISIBLE
+            }
+            punctCellRef = pCell
+            addView(pCell)
+        }
+        mainBarRef = mainBar
+
+        val punctBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = FrameLayout.LayoutParams(MP, toolbarH)
+            setBackgroundColor(Color.WHITE)
+            visibility = View.GONE
+
+            addView(TextView(this@MainActivity).apply {
+                text = "←"; textSize = 20f; gravity = Gravity.CENTER
+                setTextColor(getColor(R.color.text_dark))
+                layoutParams = LinearLayout.LayoutParams((54 * dp).roundToInt(), toolbarH)
+                setOnClickListener {
+                    punctBarRef?.visibility = View.GONE
+                    mainBarRef?.visibility = View.VISIBLE
+                }
+            })
+            addView(divider(toolbarH, dp))
+            addView(HorizontalScrollView(this@MainActivity).apply {
+                isHorizontalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                layoutParams = LinearLayout.LayoutParams(0, toolbarH, 1f)
+                addView(buildPunctRow(dp))
+            })
+        }
+        punctBarRef = punctBar
+
+        return FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(MP, toolbarH)
             setBackgroundColor(Color.WHITE)
-            styleCategoryCell   = buildCategoryCell("樣式", toolbarH, dp) { toggleCategory("style") }
-            layoutCategoryCell  = buildCategoryCell("排版", toolbarH, dp) { toggleCategory("layout") }
-            writingCategoryCell = buildCategoryCell("寫作", toolbarH, dp) { toggleCategory("writing") }
-            docCategoryCell     = buildCategoryCell("檔案", toolbarH, dp) { toggleCategory("doc") }
-            addView(styleCategoryCell)
-            addView(divider(toolbarH, dp))
-            addView(layoutCategoryCell)
-            addView(divider(toolbarH, dp))
-            addView(writingCategoryCell)
-            addView(divider(toolbarH, dp))
-            addView(docCategoryCell)
+            addView(mainBar)
+            addView(punctBar)
         }
     }
 
@@ -525,24 +521,10 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { onClick() }
         }
 
-    private fun iconCell(toolbarH: Int) = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER
-        layoutParams = LinearLayout.LayoutParams(0, toolbarH, 1f)
-    }
-
     private fun iconText(ch: String, size: Float) = TextView(this).apply {
         text = ch
         textSize = size
         setTextColor(getColor(R.color.text_dark))
-        gravity = Gravity.CENTER
-        layoutParams = LinearLayout.LayoutParams(WC, WC)
-    }
-
-    private fun labelText(text: String) = TextView(this).apply {
-        this.text = text
-        textSize = 9f
-        setTextColor(getColor(R.color.text_lighter))
         gravity = Gravity.CENTER
         layoutParams = LinearLayout.LayoutParams(WC, WC)
     }
@@ -671,28 +653,22 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { insertPunct(punct) }
         }
 
-private fun insertPunct(punct: String) {
-    val focused = currentFocus
-    val idx = editTextFields.indexOf(focused as? EditText)
-    if (idx < 0) return
-
-    val cellCol = idx / numRows
-    val cellRow = idx % numRows
-    val originalChar = columnData.getOrNull(cellCol)?.getOrNull(cellRow) ?: ""
-
-    if (originalChar.isEmpty()) {
-        setColumnChar(cellCol, cellRow, punct)
-        withRestoring { editTextFields[idx].setText(punct) }
-        advanceToNextCell(idx, editTextFields.size)
-    } else if (inputMode == InputMode.SCATTER) {
-        setColumnChar(cellCol, cellRow, punct)
-        withRestoring { editTextFields[idx].setText(punct) }
-        advanceToNextCell(idx, editTextFields.size)
-    } else {
-        val focusTarget = performInsert(idx, punct) ?: return
-        postRefreshFocusColumn(focusTarget)
+    private fun insertPunct(punct: String) {
+        val focused = currentFocus
+        val idx = editTextFields.indexOf(focused as? EditText)
+        if (idx < 0) return
+        val cellCol = idx / numRows
+        val cellRow = idx % numRows
+        val originalChar = columnData.getOrNull(cellCol)?.getOrNull(cellRow) ?: ""
+        if (originalChar.isEmpty() || inputMode == InputMode.SCATTER) {
+            setColumnChar(cellCol, cellRow, punct)
+            withRestoring { editTextFields[idx].setText(punct) }
+            advanceToNextCell(idx, editTextFields.size)
+        } else {
+            val focusTarget = performInsert(idx, punct) ?: return
+            postRefreshFocusColumn(focusTarget)
+        }
     }
-}
 
     // Shared swatch-item factory used by both colour panels.
     private fun buildSwatchItem(option: ColorOption, swatchSz: Int, dp: Float,
@@ -715,8 +691,12 @@ private fun insertPunct(punct: String) {
             setOnClickListener { onClick() }
         }
 
-    // Background colour panel — generated dynamically from BG_COLORS.
-    private fun buildBgColorPanel(dp: Float): LinearLayout {
+    private fun buildColorSwatchRow(
+        dp: Float,
+        colors: List<ColorOption>,
+        extra: Pair<ColorOption, () -> Unit>? = null,
+        onClick: (ColorOption) -> Unit
+    ): LinearLayout {
         val swatchSz = (38 * dp).roundToInt()
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -724,29 +704,17 @@ private fun insertPunct(punct: String) {
             layoutParams = LinearLayout.LayoutParams(MP, WC)
             setPadding((8 * dp).roundToInt(), (10 * dp).roundToInt(),
                        (8 * dp).roundToInt(), (10 * dp).roundToInt())
-            BG_COLORS.forEach { option ->
-                addView(buildSwatchItem(option, swatchSz, dp) { applyBackground(option.color) })
-            }
-            addView(buildSwatchItem(ColorOption(getColor(R.color.divider), "自訂"), swatchSz, dp) {
-                imagePickerLauncher.launch(arrayOf("image/*"))
-            })
+            colors.forEach { option -> addView(buildSwatchItem(option, swatchSz, dp) { onClick(option) }) }
+            extra?.let { (opt, action) -> addView(buildSwatchItem(opt, swatchSz, dp, action)) }
         }
     }
 
-    // Text colour panel — generated dynamically from TEXT_COLORS.
-    private fun buildTextColorPanel(dp: Float): LinearLayout {
-        val swatchSz = (38 * dp).roundToInt()
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            setPadding((8 * dp).roundToInt(), (10 * dp).roundToInt(),
-                       (8 * dp).roundToInt(), (10 * dp).roundToInt())
-            TEXT_COLORS.forEach { option ->
-                addView(buildSwatchItem(option, swatchSz, dp) { applyTextColor(option.color) })
-            }
-        }
-    }
+    private fun buildBgColorPanel(dp: Float) = buildColorSwatchRow(
+        dp, BG_COLORS,
+        extra = ColorOption(getColor(R.color.divider), "自訂") to { imagePickerLauncher.launch(arrayOf("image/*")) }
+    ) { applyBackground(it.color) }
+
+    private fun buildTextColorPanel(dp: Float) = buildColorSwatchRow(dp, TEXT_COLORS) { applyTextColor(it.color) }
 
     // Apply background colour.  gridTextColor is NOT touched — it is controlled
     // exclusively by the text-colour panel (applyTextColor).  No rebuild needed:
@@ -766,38 +734,6 @@ private fun insertPunct(punct: String) {
     private fun applyTextColor(color: Int) {
         gridTextColor = color
         withRestoring { editTextFields.forEach { it.setTextColor(color) } }
-    }
-
-    private fun buildGapPanel(dp: Float): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            val h = (16 * dp).roundToInt(); val v = (10 * dp).roundToInt()
-            setPadding(h, v, h, v)
-            val valueLabel = TextView(this@MainActivity).apply {
-                text = "${wordGapDp.toInt()} dp"
-                textSize = 12f; setTextColor(getColor(R.color.text_medium))
-                gravity = Gravity.CENTER
-                layoutParams = LinearLayout.LayoutParams((48 * dp).roundToInt(), WC)
-            }
-            gapValueLabelRef = valueLabel
-            addView(SeekBar(this@MainActivity).apply {
-                max = 20; progress = wordGapDp.toInt()
-                layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
-                gapSeekBarRef = this
-                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                        wordGapDp = p.toFloat()
-                        valueLabel.text = "$p dp"
-                        if (fromUser) { needsReflow = true; rebuildGrid() }
-                    }
-                    override fun onStartTrackingTouch(sb: SeekBar?) {}
-                    override fun onStopTrackingTouch(sb: SeekBar?) {}
-                })
-            })
-            addView(valueLabel)
-        }
     }
 
     private fun buildModePanel(dp: Float): LinearLayout {
@@ -878,139 +814,125 @@ private fun insertPunct(punct: String) {
         refreshGrid()
     }
 
-    // ── Panel toggle ───────────────────────────────────────────────────
-    private fun rebuildAfterLayout() {
-        val heightBefore = mainScrollView.height
-        mainScrollView.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
-            override fun onGlobalLayout() {
-                mainScrollView.viewTreeObserver.removeOnGlobalLayoutListener(this)
-                // Only rebuild when the available height actually changed (expandHost opened/closed).
-                // With adjustNothing, keyboard events never change mainScrollView.height, so this
-                // check fires exactly when the panel is resizing the grid — not on keyboard events.
-                if (mainScrollView.height != heightBefore) rebuildGrid()
+    // ── Tools panel toggle ────────────────────────────────────────────
+    private fun switchToTools() {
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
+        currentFocus?.clearFocus()
+        refreshDocPanel()
+        val h = if (lastKeyboardHeight > 0) lastKeyboardHeight
+                else (280 * resources.displayMetrics.density).roundToInt()
+        val lp = allToolsPanel.layoutParams as FrameLayout.LayoutParams
+        lp.height = h
+        allToolsPanel.layoutParams = lp
+        allToolsPanel.visibility = View.VISIBLE
+        mainScrollView.setPadding(0, 0, 0, h)
+        toolsVisible = true
+        toolsCell?.setBackgroundColor(getColor(R.color.row_active))
+    }
+
+    private fun switchToKeyboard() {
+        allToolsPanel.visibility = View.GONE
+        // Pre-set padding to lastKeyboardHeight so the grid doesn't jump when
+        // the keyboard appears at exactly that height. The insets listener will
+        // confirm the exact value once the keyboard is fully shown.
+        mainScrollView.setPadding(0, 0, 0, lastKeyboardHeight.coerceAtLeast(0))
+        toolsVisible = false
+        toolsCell?.setBackgroundColor(Color.TRANSPARENT)
+        val et = editTextFields.getOrNull(focusedCellIndex.coerceAtLeast(0))
+            ?: editTextFields.firstOrNull() ?: return
+        et.requestFocus()
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.showSoftInput(et, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    // ── All-tools panel ────────────────────────────────────────────────
+    // Single scrollable overlay that replaces the keyboard at the same height.
+    // Sections: 字型 (font+size+text color) | 排版 (gap+bg color) | 寫作 (mode+punct) | 檔案 (doc)
+    private fun buildAllToolsPanel(dp: Float): NestedScrollView {
+        val hscroll = { inner: LinearLayout ->
+            HorizontalScrollView(this).apply {
+                isHorizontalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                layoutParams = LinearLayout.LayoutParams(MP, WC)
+                addView(inner.also { it.layoutParams = LinearLayout.LayoutParams(WC, WC) })
             }
-        })
-    }
-
-    private fun toggleCategory(tag: String) {
-        if (tag == "doc") refreshDocPanel()
-        val panel = when (tag) {
-            "style"   -> styleCategoryPanel
-            "layout"  -> layoutCategoryPanel
-            "writing" -> writingCategoryPanel
-            "doc"     -> docCategoryPanel
-            else -> return
         }
-        val cell = when (tag) {
-            "style"   -> styleCategoryCell
-            "layout"  -> layoutCategoryCell
-            "writing" -> writingCategoryCell
-            "doc"     -> docCategoryCell
-            else -> null
+        fun sectionLabel(text: String) = TextView(this).apply {
+            this.text = text; textSize = 10f
+            setTextColor(getColor(R.color.text_lighter))
+            val hP = (12 * dp).roundToInt(); val vP = (6 * dp).roundToInt()
+            setPadding(hP, vP, hP, vP)
+            layoutParams = LinearLayout.LayoutParams(MP, WC)
         }
-        val accentBg = getColor(R.color.row_active)
 
-        if (activePanelTag == tag) {
-            // Closing: fade out, then remove padding and hide.
-            expandHost.animate().alpha(0f).setDuration(150).withEndAction {
-                expandHost.visibility = View.GONE
-                expandHost.alpha = 1f
-                expandPanelPadding = 0
-                applyScrollPadding()
-            }.start()
-            panel.visibility = View.GONE
-            cell?.setBackgroundColor(Color.TRANSPARENT)
-            activePanelTag = null
-        } else {
-            // Show the new panel; hide any previously active one.
-            styleCategoryPanel.visibility   = View.GONE
-            layoutCategoryPanel.visibility  = View.GONE
-            writingCategoryPanel.visibility = View.GONE
-            docCategoryPanel.visibility     = View.GONE
-            styleCategoryCell.setBackgroundColor(Color.TRANSPARENT)
-            layoutCategoryCell.setBackgroundColor(Color.TRANSPARENT)
-            writingCategoryCell.setBackgroundColor(Color.TRANSPARENT)
-            docCategoryCell.setBackgroundColor(Color.TRANSPARENT)
-
-            panel.visibility = View.VISIBLE
-            cell?.setBackgroundColor(accentBg)
-            activePanelTag = tag
-
-            if (expandHost.visibility == View.GONE) {
-                // Position the overlay so its bottom edge sits at the top of bottomPanel,
-                // then fade it in.  No rebuildGrid — the grid row count never changes.
-                val lp = expandHost.layoutParams as FrameLayout.LayoutParams
-                lp.bottomMargin = bottomPanel.height
-                expandHost.layoutParams = lp
-                expandPanelPadding = (expandHost.layoutParams as FrameLayout.LayoutParams).height
-                applyScrollPadding()
-                expandHost.alpha = 0f
-                expandHost.visibility = View.VISIBLE
-                expandHost.animate().alpha(1f).setDuration(150).start()
-            }
-            // Switching between panels: expandHost height unchanged — no padding update needed.
-        }
-    }
-
-    // Set mainScrollView.paddingBottom to keyboard height + any open panel height.
-    // Both values are additive so the user can scroll past whichever overlaps the bottom.
-    private fun applyScrollPadding() {
-        val rect = Rect()
-        window.decorView.getWindowVisibleDisplayFrame(rect)
-        val screenH = resources.displayMetrics.heightPixels
-        val kbdH = (screenH - rect.bottom).coerceAtLeast(0)
-        mainScrollView.setPadding(0, 0, 0, kbdH + expandPanelPadding)
-    }
-
-    // ── Category panel builders ────────────────────────────────────────
-    // Each panel stacks its sub-panels vertically; sub-panels are always VISIBLE
-    // within their category (category panel itself is GONE until toggled).
-
-    private fun buildStyleCategoryPanel(dp: Float) {
-        styleCategoryPanel = LinearLayout(this).apply {
+        val docListLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, MP)
-            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(MP, WC)
+        }
+        docListContainer = docListLayout
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(MP, WC)
+
+            addView(sectionLabel("字型"))
             addView(buildFontRow(dp))
             addView(subDivider(dp))
-            addView(HorizontalScrollView(this@MainActivity).apply {
-                isHorizontalScrollBarEnabled = false
-                overScrollMode = View.OVER_SCROLL_NEVER
-                layoutParams = LinearLayout.LayoutParams(MP, WC)
-                addView(buildTextColorPanel(dp).also { it.layoutParams = LinearLayout.LayoutParams(WC, WC) })
-            })
-        }
-    }
-
-    private fun buildLayoutCategoryPanel(dp: Float) {
-        layoutCategoryPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, MP)
-            visibility = View.GONE
-            addView(buildGapPanel(dp))
+            addView(hscroll(buildTextColorPanel(dp)))
             addView(subDivider(dp))
-            addView(HorizontalScrollView(this@MainActivity).apply {
-                isHorizontalScrollBarEnabled = false
-                overScrollMode = View.OVER_SCROLL_NEVER
-                layoutParams = LinearLayout.LayoutParams(MP, WC)
-                addView(buildBgColorPanel(dp).also { it.layoutParams = LinearLayout.LayoutParams(WC, WC) })
-            })
-        }
-    }
 
-    private fun buildWritingCategoryPanel(dp: Float) {
-        writingCategoryPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, MP)
-            visibility = View.GONE
+            addView(sectionLabel("排版"))
+            addView(hscroll(buildBgColorPanel(dp)))
+            addView(subDivider(dp))
+
+            addView(sectionLabel("寫作"))
             addView(buildModePanel(dp))
             addView(subDivider(dp))
-            addView(buildInlinePunctRow(dp))
+
+            addView(sectionLabel("檔案"))
+            addView(buildDocActionRow(dp))
+            addView(subDivider(dp))
+            addView(docListLayout)
+        }
+
+        return NestedScrollView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(MP, (280 * dp).roundToInt(), Gravity.BOTTOM)
+            setBackgroundColor(getColor(R.color.panel_bg))
+            visibility = View.GONE
+            addView(content)
         }
     }
+
+    private fun buildDocActionRow(dp: Float): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(MP, WC)
+            val hPad = (12 * dp).roundToInt(); val vPad = (8 * dp).roundToInt()
+            setPadding(hPad, vPad, hPad, vPad)
+            listOf(
+                "更名" to Runnable { showRenameDialog() },
+                "新增" to Runnable { newSession(); refreshDocPanel() },
+                "全部" to Runnable {
+                    sessionListLauncher.launch(Intent(this@MainActivity, SessionListActivity::class.java))
+                }
+            ).forEach { (label, action) ->
+                addView(TextView(this@MainActivity).apply {
+                    text = label; textSize = 13f; gravity = Gravity.CENTER
+                    setTextColor(getColor(R.color.text_dark))
+                    background = GradientDrawable().apply {
+                        setColor(Color.TRANSPARENT)
+                        setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
+                        cornerRadius = 20f * dp
+                    }
+                    val hP = (14 * dp).roundToInt(); val vP = (5 * dp).roundToInt()
+                    setPadding(hP, vP, hP, vP)
+                    layoutParams = LinearLayout.LayoutParams(WC, WC).also { it.marginEnd = (8 * dp).roundToInt() }
+                    setOnClickListener { action.run() }
+                })
+            }
+        }
 
     private fun buildFontRow(dp: Float): View = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
@@ -1018,37 +940,127 @@ private fun insertPunct(punct: String) {
         layoutParams = LinearLayout.LayoutParams(MP, WC)
         val hPad = (8 * dp).roundToInt(); val vPad = (8 * dp).roundToInt()
         setPadding(hPad, vPad, hPad, vPad)
-        addView(TextView(this@MainActivity).apply {
-            text = "字體"
-            textSize = 11f
-            setTextColor(getColor(R.color.text_light))
-            layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                it.marginEnd = (6 * dp).roundToInt()
-            }
-        })
-        addView(buildFontSpinner(dp).also {
-            it.layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
-        })
-        addView(View(this@MainActivity).apply {
+
+        fun rowDivider() = View(this@MainActivity).apply {
             layoutParams = LinearLayout.LayoutParams(
                 (1f * dp).roundToInt(), (28 * dp).roundToInt()
-            ).also {
-                it.marginStart = (8 * dp).roundToInt()
-                it.marginEnd   = (8 * dp).roundToInt()
-            }
+            ).also { it.marginStart = (8 * dp).roundToInt(); it.marginEnd = (8 * dp).roundToInt() }
             setBackgroundColor(getColor(R.color.divider))
-        })
-        addView(TextView(this@MainActivity).apply {
-            text = "字號"
-            textSize = 11f
+        }
+        fun label(t: String) = TextView(this@MainActivity).apply {
+            text = t; textSize = 11f
             setTextColor(getColor(R.color.text_light))
-            layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                it.marginEnd = (6 * dp).roundToInt()
+            layoutParams = LinearLayout.LayoutParams(WC, WC).also { it.marginEnd = (4 * dp).roundToInt() }
+        }
+        fun chip(initial: String) = TextView(this@MainActivity).apply {
+            text = initial; textSize = 13f; gravity = Gravity.CENTER
+            setTextColor(getColor(R.color.text_dark))
+            background = GradientDrawable().apply {
+                setColor(getColor(R.color.chip_active)); cornerRadius = 4f * dp
             }
-        })
-        addView(buildFontSizeSpinner(dp).also {
-            it.layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
-        })
+            val hP = (8 * dp).roundToInt(); val vP = (2 * dp).roundToInt()
+            setPadding(hP, vP, hP, vP)
+            layoutParams = LinearLayout.LayoutParams(WC, WC)
+        }
+
+        // 字體
+        addView(label("字體"))
+        addView(buildFontSpinner(dp).also { it.layoutParams = LinearLayout.LayoutParams(0, WC, 1f) })
+
+        addView(rowDivider())
+
+        // 字號 — tappable chip → popup seekbar
+        addView(label("字號"))
+        val sizeChip = chip(fontSizeSp.toInt().toString())
+        fontSizeLabelRef = sizeChip
+        sizeChip.setOnClickListener {
+            showPopupSeekbar(
+                anchor = it,
+                max    = fontSizeList.size - 1,
+                initial = fontSizeList.indexOfFirst { e -> e.first == fontSizeSp }.coerceAtLeast(0),
+                format  = { i -> fontSizeList[i].second }
+            ) { p ->
+                val newSize = fontSizeList[p].first
+                if (newSize != fontSizeSp) {
+                    fontSizeSp = newSize
+                    fontSizeLabelRef?.text = newSize.toInt().toString()
+                    needsReflow = true; rebuildGrid()
+                }
+            }
+        }
+        addView(sizeChip)
+
+        addView(rowDivider())
+
+        // 字距 — tappable chip → popup seekbar
+        addView(label("字距"))
+        val gapChip = chip(wordGapDp.toInt().toString())
+        gapValueLabelRef = gapChip
+        gapChip.setOnClickListener {
+            showPopupSeekbar(
+                anchor  = it,
+                max     = 20,
+                initial = wordGapDp.toInt(),
+                format  = { i -> "$i" }
+            ) { p ->
+                wordGapDp = p.toFloat()
+                gapValueLabelRef?.text = "$p"
+                needsReflow = true; rebuildGrid()
+            }
+        }
+        addView(gapChip)
+    }
+
+    // Shows a floating seekbar popup anchored above `anchor`.
+    // `format` converts a progress value to a display string shown inside the popup.
+    // `onChange` is called on every drag step while `fromUser` is true.
+    private fun showPopupSeekbar(
+        anchor: View, max: Int, initial: Int,
+        format: (Int) -> String,
+        onChange: (Int) -> Unit
+    ) {
+        val dp = resources.displayMetrics.density
+        val popupWidth = (resources.displayMetrics.widthPixels * 0.82f).roundToInt()
+
+        val valueLabel = TextView(this).apply {
+            text = format(initial); textSize = 13f; gravity = Gravity.CENTER
+            setTextColor(getColor(R.color.text_dark))
+            layoutParams = LinearLayout.LayoutParams((40 * dp).roundToInt(), WC)
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable().apply {
+                setColor(getColor(R.color.panel_bg))
+                setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
+                cornerRadius = 10f * dp
+            }
+            val pad = (12 * dp).roundToInt()
+            setPadding(pad, pad, pad, pad)
+            addView(SeekBar(this@MainActivity).apply {
+                this.max = max; progress = initial
+                layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                        if (fromUser) { valueLabel.text = format(p); onChange(p) }
+                    }
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {}
+                })
+            })
+            addView(valueLabel)
+        }
+        container.measure(
+            View.MeasureSpec.makeMeasureSpec(popupWidth, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        PopupWindow(container, popupWidth, container.measuredHeight, true).apply {
+            elevation = 8f * dp
+            isOutsideTouchable = true
+            val xOff = ((anchor.width - popupWidth) / 2)
+            val yOff = -(container.measuredHeight + anchor.height + (6 * dp).roundToInt())
+            showAsDropDown(anchor, xOff, yOff)
+        }
     }
 
     private fun subDivider(dp: Float): View = View(this).apply {
@@ -1056,76 +1068,11 @@ private fun insertPunct(punct: String) {
         setBackgroundColor(getColor(R.color.divider))
     }
 
-    private fun buildFontSizeSpinner(dp: Float): Spinner {
-        val labels = fontSizeList.map { it.second }
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels).also {
-            it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        }
-        val initialPos = fontSizeList.indexOfFirst { it.first == fontSizeSp }.coerceAtLeast(0)
-        return Spinner(this).apply {
-            this.adapter = adapter
-            setSelection(initialPos)
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            background = null
-            fontSizeSpinnerRef = this
-            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                    val newSize = fontSizeList[pos].first
-                    if (newSize == fontSizeSp && editTextFields.isNotEmpty()) return
-                    fontSizeSp = newSize
-                    needsReflow = true
-                    rebuildGrid()
-                }
-                override fun onNothingSelected(p: AdapterView<*>?) {}
-            }
-        }
-    }
-
-    private fun buildInlinePunctRow(dp: Float): HorizontalScrollView {
-        return HorizontalScrollView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-            isHorizontalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
-            addView(buildPunctRow(dp))
-        }
-    }
 
 
     // ── Reflow ─────────────────────────────────────────────────────────
-    // Redistribute columnData into columns of newNumRows, keeping explicit '\n'
-    // column breaks in place while letting auto-wrapped chars move freely.
-    private fun reflowColumnData(newNumRows: Int) {
-        if (newNumRows <= 0) return
-        // Include break columns that have no content in columnData (e.g. consecutive Enter
-        // presses produce break markers in columnBreaks but never call setColumnChar, so
-        // those columns never appear in columnData). Without this, the loop would stop at
-        // columnData.size and the empty break columns would be silently discarded.
-        val maxCol = maxOf(columnData.size, columnBreaks.maxOrNull()?.plus(1) ?: 0)
-        val stream = mutableListOf<String?>()
-        for (col in 0 until maxCol) {
-            if (col > 0 && columnBreaks.contains(col)) stream.add(null)
-            val colData = columnData.getOrNull(col) ?: continue  // empty break col: null added, skip
-            val lastNonEmpty = colData.indexOfLast { it.isNotEmpty() }
-            if (lastNonEmpty < 0) continue
-            for (row in 0..lastNonEmpty) {
-                stream.add(colData[row])   // "" included as positional placeholder
-            }
-        }
-        clearDocumentContent()
-        var col = 0; var row = 0
-        for (item in stream) {
-            if (item == null) {
-                // Always advance to the next column and mark it as a break immediately.
-                // The old "only advance if row > 0" logic collapsed consecutive empty breaks
-                // into one because subsequent nulls at row=0 never triggered an advance.
-                col++; row = 0
-                columnBreaks.add(col)
-            } else {
-                if (row >= newNumRows) { col++; row = 0 }  // auto-wrap (no break marker)
-                setColumnChar(col, row, item); row++
-            }
-        }
-    }
+    private fun reflowColumnData(newNumRows: Int) =
+        GridLogicHelper.reflowColumnData(columnData, columnBreaks, newNumRows)
 
     // ── Lightweight content refresh (no view destruction) ─────────────
     // Used for backspace/delete so the keyboard never flickers.
@@ -1147,50 +1094,13 @@ private fun insertPunct(punct: String) {
                 }
             }
         }
+        ensureBufferColumn()
     }
 
     // ── Grid ───────────────────────────────────────────────────────────
 
-    // Single insertion function for all char/punctuation insertion paths.
-    // Captures the flat slice from (insertCol, insertRow) onward, writes all of newChars
-    // in place starting there, then re-appends the displaced content.  O(n) total.
-    // Respects columnBreaks: never captures or writes past a paragraph boundary
-    // (a column whose index is in columnBreaks is the start of a new paragraph;
-    //  content from a different paragraph is never disturbed).
-    private fun insertCharsAt(insertCol: Int, insertRow: Int, newChars: String) {
-        if (newChars.isEmpty()) return
-        val flat = mutableListOf<String>()
-        var c = insertCol; var rStart = insertRow
-        while (c < MAX_COLUMNS) {
-            if (c > insertCol && columnBreaks.contains(c)) break   // stop at paragraph boundary
-            val colData = columnData.getOrNull(c) ?: break
-            for (r in rStart until colData.size) flat.add(colData[r])
-            c++; rStart = 0
-        }
-        while (flat.isNotEmpty() && flat.last().isEmpty()) flat.removeLast()
-
-        c = insertCol; rStart = insertRow
-        while (c < MAX_COLUMNS) {
-            if (c > insertCol && columnBreaks.contains(c)) break
-            val colData = columnData.getOrNull(c) ?: break
-            for (r in rStart until colData.size) colData[r] = ""
-            c++; rStart = 0
-        }
-
-        var wc = insertCol; var wr = insertRow
-        for (ch in newChars) {
-            if (wc >= MAX_COLUMNS) break
-            if (wc > insertCol && columnBreaks.contains(wc)) break // stop at paragraph boundary
-            setColumnChar(wc, wr, ch.toString())
-            wr++; if (wr >= numRows) { wr = 0; wc++ }
-        }
-        for (ch in flat) {
-            if (wc >= MAX_COLUMNS) break
-            if (wc > insertCol && columnBreaks.contains(wc)) break // stop at paragraph boundary
-            setColumnChar(wc, wr, ch)
-            wr++; if (wr >= numRows) { wr = 0; wc++ }
-        }
-    }
+    private fun insertCharsAt(insertCol: Int, insertRow: Int, newChars: String) =
+        GridLogicHelper.insertCharsAt(columnData, columnBreaks, insertCol, insertRow, newChars, numRows, MAX_COLUMNS)
 
     // Shared insertion core: computes insert position from cursorBefore, calls insertCharsAt,
     // returns the focus target (one past the last inserted char), or null if blocked by a break.
@@ -1307,28 +1217,46 @@ private fun insertPunct(punct: String) {
         }
     }
 
-    private fun rebuildGrid() {
+    private fun expandGrid() {
+        val grid = (hScroll?.getChildAt(0) as? GridLayout) ?: return
+        val cellSize = currentCellSize.takeIf { it > 0 } ?: return
+        val newCol = numColumns
+        numColumns++
+        grid.columnCount = numColumns
+        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+        repeat(numRows) { row ->
+            val index = newCol * numRows + row
+            val et = makeCell(row, newCol, index, cellSize, fontPx)
+            editTextFields.add(et); grid.addView(et)
+        }
+    }
+
+    private fun ensureBufferColumn() {
+        while (columnData.size + 1 > numColumns && numColumns < MAX_COLUMNS) expandGrid()
+    }
+
+    private fun rebuildGrid(isInitialBoot: Boolean = false) {
         val availW = gridContainer.measuredWidth
-        // adjustNothing: mainScrollView.height is stable when keyboard opens/closes.
-        // It only changes when expandHost opens/closes (sibling in vertical LinearLayout).
+        // adjustNothing: mainScrollView.height is stable when keyboard/tools panel opens/closes.
         // Do NOT subtract paddingBottom here — that padding is keyboard avoidance headroom,
         // not a real height reduction, and would cause numRows to shrink while typing.
         val currentH = mainScrollView.height - gridContainer.paddingTop
         if (availW <= 0 || currentH <= 0) return
         val imeVisible = ViewCompat.getRootWindowInsets(rootFrame)
             ?.isVisible(WindowInsetsCompat.Type.ime()) == true
-        // Always update: with adjustNothing, keyboard never changes mainScrollView.height,
-        // so this correctly tracks the available space (which only changes via expandHost).
-        if (currentH > 0) maxAvailableHeight = currentH
-        val availH = if (maxAvailableHeight > 0) maxAvailableHeight else currentH
+        // stableMaxHeight is locked once at startup (before any IME activity) and
+        // used as the authoritative height so numRows never changes with keyboard state.
+        val availH = if (stableMaxHeight > 0) stableMaxHeight else currentH
 
         // Compute anchor: which column sits at the right edge of the viewport right now.
+        val oldCols = numColumns
         val anchorCol: Int = run {
             val s = hScroll ?: return@run 0
             val cs = currentCellSize.takeIf { it > 0 } ?: return@run 0
             val viewport = s.width.takeIf { it > 0 } ?: return@run 0
-            (MAX_COLUMNS - (s.scrollX + viewport) / cs).coerceIn(0, MAX_COLUMNS - 1)
-        }
+            val gw = maxOf(oldCols * cs, s.width)
+            (gw - (s.scrollX + viewport)) / cs
+        }.coerceIn(0, maxOf(oldCols - 1, 0))
 
         previewCells.clear(); isPreviewing = false
         focusedCellIndex = -1
@@ -1341,7 +1269,8 @@ private fun insertPunct(punct: String) {
 
         // Floor division guarantees numRows * cellSize <= availH (no vertical overflow).
         numRows = availH / cellSize
-        numColumns = MAX_COLUMNS
+        numColumns = (maxOf(columnData.size, columnBreaks.maxOrNull()?.plus(1) ?: 0) + 1)
+            .coerceIn(1, MAX_COLUMNS)
         if (numRows <= 0) return
 
         // Reflow columnData BEFORE tearing down the grid so the restore loop below
@@ -1377,6 +1306,7 @@ private fun insertPunct(punct: String) {
         }
         // Each index encodes (col = index/numRows, row = index%numRows).
         // row is always in 0 until numRows, so (row+1)*cellSize <= gridHeight <= availH.
+        // Only numColumns cells are created now; expandGrid() adds more on demand.
         repeat(numRows * numColumns) { index ->
             val cellRow = index % numRows
             val cellCol = index / numRows
@@ -1388,9 +1318,11 @@ private fun insertPunct(punct: String) {
         }
         hScroll = HorizontalScrollView(this).apply {
             // Explicit gridHeight: gridContainer is WC so MATCH_PARENT would collapse to 0.
+            isFillViewport = true
             layoutParams = LinearLayout.LayoutParams(MP, gridHeight)
             isHorizontalScrollBarEnabled = false
             overScrollMode = View.OVER_SCROLL_NEVER
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
             addView(grid)
         }
         gridContainer.addView(hScroll)
@@ -1400,8 +1332,9 @@ private fun insertPunct(punct: String) {
             override fun onGlobalLayout() {
                 hScroll?.viewTreeObserver?.removeOnGlobalLayoutListener(this)
                 val s = hScroll ?: return
-                val targetScrollX = ((MAX_COLUMNS - anchorCol) * cellSize - s.width).coerceAtLeast(0)
-                s.scrollTo(targetScrollX, 0)
+                val gw = maxOf(numColumns * cellSize, s.width)
+                val targetScrollX = (gw - anchorCol * cellSize - s.width).coerceAtLeast(0)
+                s.post { s.scrollTo(targetScrollX, 0) }
             }
         })
 
@@ -1418,14 +1351,16 @@ private fun insertPunct(punct: String) {
         val lastFilled = editTextFields.indexOfLast { it.text.isNotEmpty() }
         val focusIdx = if (lastFilled < 0) 0 else (lastFilled + 1).coerceAtMost(editTextFields.size - 1)
         val focusEt  = editTextFields[focusIdx]
-        // Restore keyboard state: if it was open before the rebuild, re-open it.
-        // If it was closed (user was browsing styles), keep it closed so we don't
-        // interrupt them with an unwanted keyboard popup.
-        focusEt.postDelayed({ focusCell(focusIdx, showKeyboard = imeVisible) }, 50)
-        focusEt.postDelayed({
-            val focused = currentFocus
-            if (focused is EditText && focused in editTextFields) translateForKeyboard(focused)
-        }, 200)
+        if (!isInitialBoot) {
+            // Restore keyboard state: if it was open before the rebuild, re-open it.
+            // If it was closed (user was browsing styles), keep it closed so we don't
+            // interrupt them with an unwanted keyboard popup.
+            focusEt.postDelayed({ focusCell(focusIdx, showKeyboard = imeVisible) }, 50)
+            focusEt.postDelayed({
+                val focused = currentFocus
+                if (focused is EditText && focused in editTextFields) translateForKeyboard(focused)
+            }, 200)
+        }
     }
 
     // ── Composing preview ──────────────────────────────────────────────
@@ -1541,6 +1476,15 @@ private fun insertPunct(punct: String) {
         // SEQUENTIAL empty cells redirect to the first empty row in column-major order.
         et.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_UP) {
+                // If the tools panel is visible, the first tap dismisses it and brings up
+                // the keyboard — the cell still receives focus, but the panel closes first.
+                if (toolsVisible) {
+                    allToolsPanel.visibility = View.GONE
+                    toolsVisible = false
+                    toolsCell?.setBackgroundColor(Color.TRANSPARENT)
+                    // Pre-set padding to keyboard height so the grid never jumps.
+                    if (lastKeyboardHeight > 0) mainScrollView.setPadding(0, 0, 0, lastKeyboardHeight)
+                }
                 if (inputMode == InputMode.SEQUENTIAL && et.text.isEmpty()) {
                     var searchCol = index / numRows
                     var target = -1
@@ -1671,7 +1615,8 @@ private fun insertPunct(punct: String) {
                     setColumnChar(cellCol, cellRow, replacement)
                     suppress = true
                     editable.replace(0, editable.length, replacement)
-                    advanceToNextCell(index, total)
+                    ensureBufferColumn()
+                    advanceToNextCell(index, editTextFields.size)
                     return
                 }
 
@@ -1727,7 +1672,7 @@ private fun insertPunct(punct: String) {
                     while (charIdx < text.length && text[charIdx] == '\n') {
                         pCol++; pRow = 0; charIdx++
                         columnBreaks.add(pCol)
-                        if (pCol >= numColumns) { charIdx = text.length; break }
+                        if (pCol >= MAX_COLUMNS) { charIdx = text.length; break }
                     }
 
                     if (charIdx < text.length) {
@@ -1738,17 +1683,12 @@ private fun insertPunct(punct: String) {
                         if (pRow >= numRows) { pRow = 0; pCol++ }
 
                         withRestoring {
-                            while (charIdx < text.length && pCol < numColumns) {
+                            while (charIdx < text.length && pCol < MAX_COLUMNS) {
                                 val ch = text[charIdx++]
                                 if (ch == '\n') { pCol++; pRow = 0; columnBreaks.add(pCol); continue }
                                 if (pRow >= numRows) { pRow = 0; pCol++ }
-                                if (pCol >= numColumns) break
+                                if (pCol >= MAX_COLUMNS) break
                                 setColumnChar(pCol, pRow, ch.toString())
-                                val cellIndex = pCol * numRows + pRow
-                                if (cellIndex < total) {
-                                    editTextFields[cellIndex].setText(ch.toString())
-                                    editTextFields[cellIndex].setTextColor(gridTextColor)
-                                }
                                 pRow++
                             }
                         }
@@ -1757,14 +1697,20 @@ private fun insertPunct(punct: String) {
                         editable.clear()
                     }
 
-                    val focusCol = if (pRow >= numRows) minOf(pCol + 1, numColumns - 1) else pCol
-                    val focusRow = if (pRow >= numRows) 0 else pRow
-                    val focusIdx = (focusCol * numRows + focusRow).coerceIn(0, total - 1)
-                    focusCell(focusIdx)
-                    scrollToColumn(focusCol)
+                    val finalPCol = pCol; val finalPRow = pRow
+                    gridContainer.post {
+                        ensureBufferColumn()
+                        refreshGrid()
+                        val focusCol = if (finalPRow >= numRows) minOf(finalPCol + 1, numColumns - 1) else finalPCol
+                        val focusRow = if (finalPRow >= numRows) 0 else finalPRow
+                        val focusIdx = (focusCol * numRows + focusRow).coerceIn(0, editTextFields.size - 1)
+                        focusCell(focusIdx)
+                        scrollToColumn(focusCol)
+                    }
                 } else {
                     setColumnChar(cellCol, cellRow, raw)
-                    advanceToNextCell(index, total)
+                    ensureBufferColumn()
+                    advanceToNextCell(index, editTextFields.size)
                 }
             }
         })
@@ -1837,56 +1783,6 @@ private fun insertPunct(punct: String) {
     }
 
     // ── Document management ────────────────────────────────────────────
-    private fun buildDocCategoryPanel(dp: Float) {
-        val listLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, WC)
-        }
-        docListContainer = listLayout
-
-        docCategoryPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(MP, MP)
-            visibility = View.GONE
-
-            // Header: 更名 + 新增 + 全部 buttons (no ScrollView — panel is a fixed 120dp overlay)
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                layoutParams = LinearLayout.LayoutParams(MP, WC)
-                val hPad = (12 * dp).roundToInt(); val vPad = (8 * dp).roundToInt()
-                setPadding(hPad, vPad, hPad, vPad)
-                listOf(
-                    "更名" to Runnable { showRenameDialog() },
-                    "新增" to Runnable { newSession(); refreshDocPanel() },
-                    "全部" to Runnable {
-                        sessionListLauncher.launch(
-                            Intent(this@MainActivity, SessionListActivity::class.java))
-                    }
-                ).forEach { (label, action) ->
-                    addView(TextView(this@MainActivity).apply {
-                        text = label; textSize = 13f; gravity = Gravity.CENTER
-                        setTextColor(getColor(R.color.text_dark))
-                        background = GradientDrawable().apply {
-                            setColor(Color.TRANSPARENT)
-                            setStroke((1f * dp).roundToInt(), getColor(R.color.stroke))
-                            cornerRadius = 20f * dp
-                        }
-                        val hP = (14 * dp).roundToInt(); val vP = (5 * dp).roundToInt()
-                        setPadding(hP, vP, hP, vP)
-                        layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                            it.marginEnd = (8 * dp).roundToInt()
-                        }
-                        setOnClickListener { action.run() }
-                    })
-                }
-            })
-
-            addView(subDivider(dp))
-            addView(listLayout)
-        }
-    }
-
     // Rebuilds the doc panel list showing the 3 most recent sessions.
     // No ScrollView — content is sized to fit the fixed 120dp overlay.
     private fun refreshDocPanel() {
@@ -1956,15 +1852,7 @@ private fun insertPunct(punct: String) {
             }
     }
 
-    private fun listSessions(): List<SessionMeta> =
-        (sessionsDir.listFiles { f -> f.extension == "json" } ?: emptyArray())
-            .mapNotNull { file ->
-                try {
-                    val j = org.json.JSONObject(file.readText())
-                    SessionMeta(j.getString("id"), j.getString("name"), j.getLong("lastAccessed"))
-                } catch (_: Exception) { null }
-            }
-            .sortedByDescending { it.lastAccessed }
+    private fun listSessions(): List<SessionMeta> = SessionManager.listSessions(filesDir)
 
     // Applies all per-session settings to data model + live UI controls.
     // Does NOT call rebuildGrid — caller is responsible.
@@ -1989,10 +1877,8 @@ private fun insertPunct(punct: String) {
         // font/size spinners early-return when pos == current index + grid non-empty;
         // seekBar fromUser=false skips rebuildGrid.
         fontSpinnerRef?.setSelection(fontIndex)
-        fontSizeSpinnerRef?.setSelection(
-            fontSizeList.indexOfFirst { it.first == fontSizeSp }.coerceAtLeast(0))
-        gapSeekBarRef?.progress = wordGapDp.toInt()
-        gapValueLabelRef?.text = "${wordGapDp.toInt()} dp"
+        fontSizeLabelRef?.text = fontSizeSp.toInt().toString()
+        gapValueLabelRef?.text = wordGapDp.toInt().toString()
 
         applyTextColor(gridTextColor)
 
@@ -2008,49 +1894,33 @@ private fun insertPunct(punct: String) {
     }
 
     private fun saveSession(id: String, name: String) {
-        val j = org.json.JSONObject().apply {
-            put("id", id); put("name", name)
-            put("lastAccessed", System.currentTimeMillis())
-            put("columnData", columnDataToJson()); put("columnBreaks", columnBreaksToJson())
-            // Per-session settings
-            put("fontIndex", fontIndex); put("fontSizeSp", fontSizeSp.toDouble())
-            put("wordGapDp", wordGapDp.toDouble()); put("gridTextColor", gridTextColor)
-            put("bgColor", bgColor); put("bgImageUri", bgImageUri ?: "")
-            put("inputMode", inputMode.name)
-        }
-        java.io.File(sessionsDir, "$id.json").writeText(j.toString())
+        SessionManager.saveSession(filesDir, id, name, columnData, columnBreaks,
+            fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri, inputMode.name)
         currentSessionId = id; currentSessionName = name
     }
 
     private fun loadSessionFile(id: String) {
         if (id == currentSessionId) return
-        saveSession(currentSessionId, currentSessionName)  // auto-save current before switching
-        val file = java.io.File(sessionsDir, "$id.json")
-        if (!file.exists()) return
-        try {
-            val j = org.json.JSONObject(file.readText())
-            loadColumnDataFromJson(j.getJSONArray("columnData"))
-            loadColumnBreaksFromJson(j.getJSONArray("columnBreaks"))
-            currentSessionId = id; currentSessionName = j.getString("name")
-            j.put("lastAccessed", System.currentTimeMillis())
-            file.writeText(j.toString())
-            // Restore per-session settings (fall back to current values for older files)
-            applySettings(
-                fontIdx   = j.optInt("fontIndex", fontIndex),
-                sizeSp    = j.optDouble("fontSizeSp", fontSizeSp.toDouble()).toFloat(),
-                gapDp     = j.optDouble("wordGapDp", wordGapDp.toDouble()).toFloat(),
-                textColor = j.optInt("gridTextColor", gridTextColor),
-                bgCol     = j.optInt("bgColor", bgColor),
-                imgUri    = j.optString("bgImageUri", "").ifEmpty { null },
-                mode      = when (j.optString("inputMode", inputMode.name)) {
-                    "SCATTER" -> InputMode.SCATTER; else -> InputMode.SEQUENTIAL }
-            )
-            needsReflow = true; rebuildGrid()
-        } catch (_: Exception) {}
+        saveSession(currentSessionId, currentSessionName)
+        val j = SessionManager.loadSession(filesDir, id) ?: return
+        loadColumnDataFromJson(j.getJSONArray("columnData"))
+        loadColumnBreaksFromJson(j.getJSONArray("columnBreaks"))
+        currentSessionId = id; currentSessionName = j.getString("name")
+        applySettings(
+            fontIdx   = j.optInt("fontIndex", fontIndex),
+            sizeSp    = j.optDouble("fontSizeSp", fontSizeSp.toDouble()).toFloat(),
+            gapDp     = j.optDouble("wordGapDp", wordGapDp.toDouble()).toFloat(),
+            textColor = j.optInt("gridTextColor", gridTextColor),
+            bgCol     = j.optInt("bgColor", bgColor),
+            imgUri    = j.optString("bgImageUri", "").ifEmpty { null },
+            mode      = when (j.optString("inputMode", inputMode.name)) {
+                "SCATTER" -> InputMode.SCATTER; else -> InputMode.SEQUENTIAL }
+        )
+        needsReflow = true; rebuildGrid()
     }
 
     private fun deleteSession(id: String) {
-        java.io.File(sessionsDir, "$id.json").delete()
+        SessionManager.deleteSession(filesDir, id)
         if (currentSessionId == id) { currentSessionId = java.util.UUID.randomUUID().toString() }
     }
 
@@ -2068,17 +1938,11 @@ private fun insertPunct(punct: String) {
         needsReflow = true; rebuildGrid()
     }
 
-    private fun nextNewSessionName(): String {
-        val names = listSessions().map { it.name }.toSet()
-        if (!names.contains("文檔")) return "文檔"
-        var i = 2
-        while (names.contains("文檔 $i")) i++
-        return "文檔 $i"
-    }
+    private fun nextNewSessionName(): String = SessionManager.nextNewSessionName(filesDir)
 
     private fun ensureDefaultSession() {
-        if (listSessions().isEmpty()) {
-            saveSession(currentSessionId, currentSessionName)
-        }
+        SessionManager.ensureDefaultSession(filesDir, currentSessionId, currentSessionName,
+            columnData, columnBreaks, fontIndex, fontSizeSp, wordGapDp,
+            gridTextColor, bgColor, bgImageUri, inputMode.name)
     }
 }
