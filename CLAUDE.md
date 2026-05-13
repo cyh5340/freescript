@@ -2,7 +2,7 @@
 
 Android app for composing text in vertical, right-to-left column order. Characters flow top-to-bottom inside a column; columns progress right-to-left.
 
-All active UI is programmatic in `MainActivity.kt`. XML layouts and `PoemFragment` are legacy.
+All active UI is programmatic in `MainActivity.kt`.
 
 ## Project Layout
 
@@ -10,16 +10,21 @@ All active UI is programmatic in `MainActivity.kt`. XML layouts and `PoemFragmen
 app/src/main/
 |-- assets/fonts/LXGWWenKai-Regular.ttf
 |-- java/com/poemeditor/
-|   |-- MainActivity.kt          # primary app: editor, toolbar, sessions; implements ViewFactory.Callbacks
-|   |-- ViewFactory.kt           # all view-building logic; Callbacks interface for MainActivity↔UI decoupling
-|   |-- AppConfig.kt             # user-selectable palette constants: BG_COLORS, TEXT_COLORS, FONT_SIZE_LIST, PUNCT_LIST
-|   |-- GridLogicHelper.kt       # pure data logic: setColumnChar, reflowColumnData, insertCharsAt
-|   |-- SessionManager.kt        # file I/O + JSON helpers for session persistence
-|   |-- SessionListActivity.kt   # full session list with search/date filters
-|   `-- PoemFragment.kt          # unused legacy
+|   |-- MainActivity.kt                  # activity coordinator: TextWatcher, selection overlay, image gestures, keyboard insets
+|   |-- ViewFactory.kt                   # programmatic UI factory; Callbacks bridge to MainActivity
+|   |-- CellInputController.kt           # extracted cell touch + hardware key listeners; owns lastTapIndex/lastTapTime
+|   |-- GridEditorController.kt          # extracted grid column/lazy build controller
+|   |-- GridLogicHelper.kt               # pure data logic: setColumnChar, reflowColumnData, insertCharsAt
+|   |-- EditorViewModel.kt               # undo/redo stacks + thin save/load/ensureDefault wrappers over SessionRepository
+|   |-- EditorStateModels.kt             # InsertedImageState + EditorHistoryState
+|   |-- SessionRepository.kt             # one-method-each delegate over SessionManager (save/load/ensureDefault)
+|   |-- SessionManager.kt                # JSON conversion + file I/O helpers; ScreenshotHelper companion
+|   |-- ScreenshotHelper.kt              # captureView + saveToGallery (MediaStore / legacy path)
+|   |-- SessionListActivity.kt           # full session list with search/date filters + inline rename
+|   `-- AppConfig.kt                     # user-selectable constants: palettes/font sizes/punctuation
 `-- res/
     |-- values/themes.xml
-    |-- values/colors.xml        # fixed UI chrome colors (panel_bg, chip_active, selection_highlight, etc.)
+    |-- values/colors.xml                # fixed UI chrome colors (panel_bg, chip_active, selection_highlight, etc.)
     `-- values-night/themes.xml
 ```
 
@@ -29,8 +34,8 @@ SDK: compile 33, min 24, Java 8, Kotlin 1.7.20.
 
 ```text
 FrameLayout rootFrame
-|-- ImageView bgImageView
-|   `-- Added lazily at child index 0, CENTER_CROP, behind all UI
+|-- ImageView bgImageViews[*]
+|   `-- One view per inserted image, all added at child index 0..n behind editor UI
 |-- LinearLayout mainLayout vertical
 |   |-- NestedScrollView mainScrollView
 |   |   `-- LinearLayout gridContainer
@@ -45,11 +50,12 @@ FrameLayout rootFrame
 |           `-- LinearLayout punctBar            ← shown when 標點 tapped: ← | divider | HScrollView(punct)
 |-- NestedScrollView allToolsPanel               ← Gravity.BOTTOM overlay, height = lastKeyboardHeight
 |   `-- LinearLayout content (vertical)
-|       |-- 字型: buildFontRow (font spinner + 字號 chip + 字距 chip, all inline)
-|       |-- text color swatch row
-|       |-- 排版: bg color swatch row
-|       |-- 寫作: mode chips only (連續輸入 / 灑花輸入)
-|       `-- 檔案: doc actions + recent session list
+|       |-- buildFontRow (no label): font spinner + 字號 chip + 字距 chip, all inline
+|       |-- text color swatch row (no label)
+|       |-- 底色 inline row: label + HScrollView(bg color swatches)
+|       |-- 插入 inline row: 選圖 chip + avatar list (tap avatar = select active, × = delete)
+|       |-- 輸入模式 inline row: 灑花輸入 / 連續輸入 chips
+|       `-- 檔案 inline row: filename + 所有文檔 chip
 |-- View startHandle                             ← blue oval, positioned by positionHandleAt()
 |-- View endHandle                               ← blue oval, positioned by positionHandleAt()
 |-- LinearLayout selectionOptionsView            ← 複製/剪下/貼上/選取整行/選取整段/全選, shown left of selection
@@ -69,6 +75,12 @@ FrameLayout rootFrame
 - Tapping 標點 hides `mainBar`, shows `punctBar`.
 - Tapping ← in `punctBar` reverses. No state flag needed — purely view visibility.
 
+**mainBar layout (left to right):**
+`[工具 w=1] | [↩ 44dp] [↪ 44dp] | [。，、 w=1] | [截 44dp]`
+- ↩/↪ are undo/redo icon buttons; dimmed via `text_hint` when stack is empty.
+- 截 triggers screenshot of content area (excludes toolbar).
+- Session name is shown in the tools panel 檔案 inline row (`docFileNameRef`), not in the toolbar.
+
 **Grid height stability:**
 - `stableMaxHeight` is captured once in `OnGlobalLayoutListener` when the IME is absent, before `rebuildGrid` is ever called.
 - All `rebuildGrid` calls use `stableMaxHeight` as `availH`, so `numRows` never changes regardless of keyboard or panel state.
@@ -79,9 +91,9 @@ FrameLayout rootFrame
 `ViewFactory(context, cb: Callbacks)` owns all view construction. `MainActivity` implements `ViewFactory.Callbacks`.
 
 - **No logic lives in ViewFactory** — it calls `cb.*` for all state reads and event responses.
-- `ViewFactory.Callbacks` interface methods: `provideFontCatalogue()`, `getFontIndex()`, `getFontSizeSp()`, `getWordGapDp()`, `getSelectedTypeface()`, `getInputMode()`, `onToolsToggle()`, `onPunctInsert()`, `onFontSelected()`, `onFontSizeChanged()`, `onWordGapChanged()`, `onBgColorSelected()`, `onImagePickerRequested()`, `onTextColorSelected()`, `onModeSelected()`, `onCopySelection()`, `onCutSelection()`, `onPasteAtSelection()`, `onSelectEntireLine()`, `onSelectEntireParagraph()`, `onSelectAll()`, `onHandlePasteClicked()`, `onRenameSession()`, `onNewSession()`, `onShowAllSessions()`, `onCollapsePanel()`.
-- After `viewFactory.buildBottomPanel(dp)`, `MainActivity` copies back all refs: `allToolsPanel`, `punctToolbar`, `toolsCell`, `docListContainer`, `fontSpinnerRef`, `fontSizeLabelRef`, `gapValueLabelRef`, `modeChipContainer`.
-- Selection views are also built via ViewFactory: `buildSelectionHandle(isStart, dp)`, `buildSelectionOptionsView(dp)`, `buildHandlePasteView(dp)`.
+- `ViewFactory.Callbacks` interface methods: `provideFontCatalogue()`, `getFontIndex()`, `getFontSizeSp()`, `getWordGapDp()`, `getSelectedTypeface()`, `getInputMode()`, `getCurrentSessionName()`, `onToolsToggle()`, `onPunctInsert()`, `onFontSelected()`, `onFontSizeChanged()`, `onWordGapChanged()`, `onBgColorSelected()`, `onInsertImageRequested()`, `onRemoveInsertedImage()`, `onTextColorSelected()`, `onModeSelected()`, `onCopySelection()`, `onCutSelection()`, `onPasteAtSelection()`, `onSelectEntireLine()`, `onSelectEntireParagraph()`, `onSelectAll()`, `onHandlePasteClicked()`, `onShowAllSessions()`, `onCollapsePanel()`, `onUndoAction()`, `onRedoAction()`, `onScreenshot()`, `canUndo()`, `canRedo()`.
+- After `viewFactory.buildBottomPanel(dp)`, `MainActivity` copies back refs: `allToolsPanel`, `punctToolbar`, `toolsCell`, `docFileNameRef`, `fontSpinnerRef`, `fontSizeLabelRef`, `gapValueLabelRef`, `modeChipContainer`, `undoButton`, `redoButton`, `insertImageContainer`.
+- Selection views are also built via ViewFactory: `buildSelectionHandle(dp)`, `buildSelectionOptionsView(dp)`, `buildHandlePasteView(dp)`.
 - **JVM clash rule**: interface method names must not match Kotlin property getter names. `provideFontCatalogue()` (not `getFontCatalogue()`) avoids clash with the `fontCatalogue` property's auto-generated getter.
 
 ## Data Model
@@ -117,7 +129,7 @@ gridHeight = numRows * cellSize
 numColumns = MAX_COLUMNS = 50  (always; grid skeleton is always full width for accurate scrollbar)
 ```
 
-`rebuildGrid()` computes this and rebuilds all cells. It is for settings/session changes, not keyboard open/close.
+`rebuildGrid()` computes this and rebuilds all cells. It is for settings/session changes, not keyboard open/close. Style changes (font, size, gap, color) only fire while the tools panel is open, where IME is closed by design — so the rebuild's IME interruption is not a concern.
 
 `refreshGrid()` diffs current `EditText` views against `columnData` and updates in place. It only iterates built columns (`editTextFields.size / numRows`). Prefer it for content changes so the IME does not flicker.
 
@@ -146,8 +158,7 @@ New columns are created only when actually needed:
 ### Key fields
 
 - `builtColumns: HashSet<Int>` — which column indices have cells in the grid.
-- `buildGeneration: Int` — incremented on every `rebuildGrid`; used to invalidate stale closures.
-- `incrementalBuildRunnable` — kept for cancellation safety on rebuild; unused in normal operation (no async loop).
+- Grid lazy-build routines are now hosted in `GridEditorController`; `MainActivity` delegates `buildInitialColumns()` / `ensureColumnBuilt(...)` to the controller.
 
 ### `buildColumn(col, grid, fontPx, cellSize)`
 
@@ -170,7 +181,7 @@ Calls `buildColumn` for every unbuilt column from `builtColumns.max + 1` up to `
 - `performInsert(index, newChars)`: shared insert core; computes the `(iCol, iRow)` insertion point from `cursorBefore`, calls `insertCharsAt`, returns the focus target index after the inserted chars.
 - `deletePreviousSequentialCell(cellCol, cellRow, index)`: SEQUENTIAL backspace — removes the char at `(cellCol, cellRow-1)` (or last occupied in prev column when `cellRow==0`), reflows, refocuses.
 - `removeColumnBreak(cellCol)`: reverse of `insertColumnBreak`; removes the break marker at `cellCol`, reflows the two columns back together, and lands the cursor at the last occupied position in the preceding column.
-- `fillGapsForSequentialMode()`: when switching SCATTER→SEQUENTIAL, fills every empty slot between first and last occupied cell with a half-width space so auto-advance never skips a gap.
+- `fillGapsForSequentialMode()`: when switching SCATTER→SEQUENTIAL, fills empty slots with a half-width space so auto-advance never skips a gap. Processes each paragraph independently (respects `columnBreaks`) so spaces never cross paragraph boundaries.
 - `showPopupSeekbar(anchor, max, initial, format, onChange)`: floating `PopupWindow` seekbar anchored above a chip; used for font size (字號) and word gap (字距).
 
 ## Reflow
@@ -202,7 +213,8 @@ Touch listeners consume all touch events. Native cursor placement should not dec
 
 Label in UI: 連續輸入.
 
-- Empty tap redirects to first empty cell in column-major flow.
+- **Writing-frontier marker**: a half-width space sits in the cell immediately after the last char of each paragraph. The marker keeps that cell non-empty so the user can tap it directly (the empty-tap redirect at `CellInputController.kt:57` is skipped). Typing onto the marker goes through the existing insert-shift / SCATTER-overwrite path — the space gets pushed forward, and the new char takes its place. `placeFrontierMarker()` is called from `rebuildGrid` (end-of), `advanceToNextCell`, `restoreHistoryState`, and `fillGapsForSequentialMode` so the marker stays at the correct trailing position through writes, undo/redo, mode switches, and session loads.
+- Empty tap (other than the marker cell) redirects to first empty cell in column-major flow.
 - Occupied typing uses insert-shift.
 - Occupied punctuation uses insert-shift.
 - DEL removes previous content and calls `reflowColumnData(numRows)`.
@@ -298,23 +310,23 @@ During CJK composition:
 
 ## Backgrounds
 
-Solid swatches call `applyBackground(color)`:
+Solid color (底色 section) calls `applyBackground(color)`:
+- sets `bgColor`; calls `rootFrame.setBackgroundColor(color)`; persists.
+- Does **not** remove inserted images.
 
-- set `bgColor`
-- clear `bgImageUri`
-- hide `bgImageView`
-- persist immediately
+Inserted image (插入 section) via `applyInsertedImage(uri)`:
+- supports up to `MAX_INSERTED_IMAGES = 5`.
+- copies each image to app-owned storage (`filesDir/backgrounds/{sessionId}_{timestamp}.bg`).
+- appends to `insertedImages: MutableList<InsertedImageState>`, then marks the new entry active.
+- `syncActiveImageFromList()` re-renders all inserted images as overlay layers (not replacement).
+- `refreshInsertedImagePanel()` renders small avatars; tap avatar selects active image, tap small `×` deletes that image.
+- persists via session JSON + SharedPreferences.
 
-Custom image flow:
+Image transforms:
+- `InsertedImageState` stores per-image matrix values (`FloatArray(9)`).
+- active image matrix is mirrored through `bgImageMatrix`/`bgImageUri` for gesture + backward compatibility.
+- matrix values are restored on session load and cold start.
 
-- picker is `ActivityResultContracts.OpenDocument()`
-- try `takePersistableUriPermission`
-- copy selected image bytes to `filesDir/backgrounds/{currentSessionId}.bg`
-- store app-owned `file://` URI in `bgImageUri`
-- call `loadBgImageFromUri(...)`
-- persist immediately with `persistCurrentState()`
-
-`loadBgImageFromUri(...)` supports `file://` and provider URIs. It hides the image on load failure but does not clear `bgImageUri`, so a transient failure cannot erase the saved path.
 
 ## Sessions
 
@@ -337,43 +349,101 @@ Session JSON includes:
   "gridTextColor": -16777216,
   "bgColor": -1,
   "bgImageUri": "",
+  "bgImageMatrix": [1, 0, 0, 0, 1, 0, 0, 0, 1],
+  "insertedImages": [
+    { "uri": "file://...", "matrix": [1, 0, 0, 0, 1, 0, 0, 0, 1] }
+  ],
+  "activeImageIndex": 0,
   "inputMode": "SEQUENTIAL"
 }
 ```
 
+Compatibility:
+- `bgImageUri`/`bgImageMatrix` are retained as legacy-compatible fields.
+- New sessions primarily use `insertedImages` + `activeImageIndex`.
+- Load path migrates legacy single-image sessions into the new list model when needed.
+
+
 Important functions:
 
-- `saveSession(id, name)`: writes content and settings.
+- `saveSession()`: writes current session content + settings to JSON via `editorViewModel.saveSession(...)`.
 - `loadSessionFile(id)`: saves current, loads target, applies settings, rebuilds.
-- `newSession()`: saves current, clears model, applies defaults, rebuilds.
-- `ensureDefaultSession()`: creates initial session if needed.
-- `refreshDocPanel()`: shows up to 3 recent sessions.
-- `SessionListActivity`: full searchable/filterable session list.
+- `ensureDefaultSession()`: creates initial session if none exist (cold start).
+- `updateToolbarSessionName()`: syncs `docFileNameRef` text to `currentSessionName`.
+- `SessionListActivity`: full searchable/filterable session list; 新增 button (creates session with name dialog), inline rename (✏) and delete (🗑); returns `renamed_current_name` extra when the active session is renamed. Calls `SessionManager` directly — does not route through `EditorViewModel`/`SessionRepository`.
 
 ## Toolbar
 
 `toolbar` is a `FrameLayout` (54dp tall) with two alternating children:
 
-- `mainBar` (default VISIBLE): `buildCategoryCell("工具")` | `divider` | `buildCategoryCell("標點")`
+- `mainBar` (default VISIBLE): `buildCategoryCell("工具")` | `divider` | `↩` | `↪` | `divider` | `buildCategoryCell("。，、")` | `divider` | `截`
 - `punctBar` (default GONE): `←` back button (54dp wide) | `divider` | `HScrollView(buildPunctRow(dp))`
 
 Tapping 工具 calls `switchToTools()` / `switchToKeyboard()`. Tapping 標點 swaps bar visibility. No persistent state flag for the bar swap — purely view visibility toggling via captured `mainBarRef`/`punctBarRef` locals.
 
-`buildCategoryCell(label, toolbarH, dp, onClick)` creates a weight-1f `LinearLayout` with centered label text. `toolsCell` holds a reference to the 工具 cell for background highlight in `switchToTools/switchToKeyboard`.
+`buildCategoryCell(label, toolbarH, onClick)` creates a weight-1f `LinearLayout` with centered label text. `toolsCell` holds a reference to the 工具 cell for background highlight in `switchToTools/switchToKeyboard`.
 
 ## Tools Panel
 
 `allToolsPanel` is a `NestedScrollView` overlaid on `rootFrame` at `Gravity.BOTTOM`. Height is set to `lastKeyboardHeight` when shown (fallback 280dp). It is GONE by default and toggled by `switchToTools/switchToKeyboard`.
 
-Sections (top to bottom):
+Sections (top to bottom), each separated by a `subDivider`:
 
-- **字型**: `buildFontRow(dp)` — font spinner + 字號 chip + 字距 chip, all in one horizontal row with `rowDivider`s
-- Text color swatch row (horizontal scroll)
-- **排版**: bg color swatch row (horizontal scroll, includes 自訂 image picker)
-- **寫作**: mode chips only (連續輸入 / 灑花輸入)
-- **檔案**: action buttons (更名 / 新增 / 全部) + recent session list (`docListContainer`)
+- **字型** (no label): `buildFontRow(dp)` — font spinner + 字號 chip + 字距 chip, all inline with `rowDivider`s
+- Text color swatch row (horizontal scroll, no label)
+- **底色** inline row: `[底色 label] [HScrollView(color swatches)]` — `buildBgColorHeaderRow(dp)`
+- **插入** inline row: `[插入 label] [spacer] [選圖 chip] [insertImageContainer]` — `buildInsertPanel(dp)`
+- **輸入模式** inline row: `[輸入模式 label] [spacer] [灑花輸入 chip] [連續輸入 chip]` — `buildModeHeaderRow(dp)`; `modeChipContainer` points to the chips LinearLayout
+- **檔案** inline row: `[檔案 label] [current filename flex] [所有文檔 chip]` — `buildFileHeaderRow(dp)`; `docFileNameRef` points to the filename TextView
 
-Font size and word gap use `showPopupSeekbar(anchor, max, initial, format, onChange)` — a `PopupWindow` with a `SeekBar` that floats above the tapped chip.
+Font size and word gap use `showPopupSeekbar(anchor, max, initial, format, onChange)` — a `PopupWindow` with a `SeekBar` that floats above the tapped chip. Both seekbars map seekbar position → discrete value via `AppConfig.FONT_SIZE_LIST` / `AppConfig.WORD_GAP_LIST`. The display label (chip text) is a curated string from the list, not the raw value — e.g. `WORD_GAP_LIST = [(3f,"0"), (5f,"2"), ...]` keeps the user-visible label tidy while the underlying dp value drives layout math.
+
+## Undo / Redo
+
+`EditorHistoryState` snapshots text + full session config:
+- `columnData`, `columnBreaks`
+- `fontIndex`, `fontSizeSp`, `wordGapDp`
+- `gridTextColor`, `bgColor`, `inputMode`
+- `insertedImages`, `activeImageIndex`
+
+- `undoStack / redoStack`: `ArrayDeque<EditorHistoryState>`, max 50 entries.
+- `pushHistory()`: called at direct user-action mutation points (text edit paths, punctuation, paste/cut, font/font-size/gap/text-color/bg-color/mode changes, image add/remove/select).
+- `performUndo/performRedo`: swap snapshots, restore with `restoreHistoryState(...)`, then refresh and update button enabled state.
+- `restoreHistoryState(...)`: restores both content and settings via `applySettings(...)`, including images and active index.
+- Session load / new session clears both stacks.
+- `updateUndoRedoButtons()`: sets ↩/↪ text color to `text_dark` (enabled) or `text_hint` (disabled).
+
+
+## Screenshot
+
+`takeScreenshot()`:
+1. Hides handles, selection overlay, paste bubble; hides `allToolsPanel` temporarily; sets `isCursorVisible = false` on the focused cell.
+2. Creates `Bitmap(rootFrame.width, mainScrollView.height)` — the canvas height naturally clips the toolbar off the bottom.
+3. Calls `rootFrame.draw(canvas)`.
+4. Restores visibility; saves via `saveBitmapToGallery`.
+- API 29+: `MediaStore.Images` with `RELATIVE_PATH = Pictures/PoemEditor` (no permission needed).
+- API 24–28: writes to `Environment.DIRECTORY_PICTURES`, uses `MediaScannerConnection`. Requires `WRITE_EXTERNAL_STORAGE` (declared in manifest with `maxSdkVersion="28"`).
+
+## Inserted Image (Overlay)
+
+Background color (`bgColor`) and inserted images are **independent layers**:
+- `rootFrame.setBackgroundColor(bgColor)` is always the solid base.
+- Inserted images are rendered as multiple `ImageView` overlays (`bgImageViews`) behind the editor UI.
+- `applyBackground(color)` only changes `bgColor`; it does not remove inserted images.
+
+Image lifecycle:
+- `onInsertImageRequested()` → `imagePickerLauncher` → `applyInsertedImage(uri)` (max 5 images/session).
+- Each image is copied to app-owned storage (`filesDir/backgrounds/{sessionId}_{timestamp}.bg`) and added to `insertedImages`.
+- `syncActiveImageFromList()` re-renders all inserted images so previously inserted images remain visible.
+- `refreshInsertedImagePanel()` populates `insertImageContainer` with small avatars + a small `×` delete control beside each avatar.
+  - Tap avatar: select active image (used for gesture transform target).
+  - Tap `×`: remove only that image.
+
+Image transform:
+- `InsertedImageState.matrix` stores per-image transform values (9 floats).
+- Active image transform is mirrored via `bgImageMatrix`/`bgImageUri` for gesture handling and backward compatibility.
+- Two-finger pinch/pan in `dispatchTouchEvent` now hit-tests the touch midpoint and retargets to the touched image (topmost hit) before applying transform.
+- Matrix values persist in both session JSON and SharedPreferences.
 
 ## Invariants
 
@@ -390,6 +460,10 @@ Font size and word gap use `showPopupSeekbar(anchor, max, initial, format, onCha
 - `ensureColumnBuilt(col)` must be called before accessing `editTextFields[col * numRows + row]` for any column not guaranteed to be in the sync build batch.
 - `insertCharsAt` trims trailing **blank** cells (`isBlank()`, not just `isEmpty()`) so island overflow never pushes trailing spaces forward.
 - ViewFactory interface method names must not clash with MainActivity property getter names (use `provide*` prefix for catalogue-style accessors).
+- `applyBackground(color)` sets only `bgColor` and `rootFrame` background — it never removes inserted images.
+- `pushHistory()` should be called at direct user-action mutation entry points to avoid duplicate history frames.
+- Keep `insertedImages` as the primary model; `bgImageUri`/`bgImageMatrix` are now mainly the runtime cache for the currently active image (gesture target + quick persistence path), not the main multi-image storage model.
+- Style/setting changes (font, size, word-gap, colors) happen only while the tools panel is open and IME is hidden, so `rebuildGrid()` is acceptable there. Reserve `refreshGrid()` (no view destruction) for content edits made with the IME open.
 
 ## Build
 

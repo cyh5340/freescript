@@ -5,8 +5,10 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
@@ -31,6 +33,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.widget.NestedScrollView
+import androidx.lifecycle.ViewModelProvider
 import kotlin.math.roundToInt
 
 enum class InputMode { SCATTER, SEQUENTIAL }
@@ -58,13 +61,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     // ── Background image ───────────────────────────────────────────────
     private var bgImageView: ImageView? = null
     private var bgImageUri: String? = null
+    private val insertedImages = mutableListOf<InsertedImageState>()
+    private var activeImageIndex = -1
+    private val MAX_INSERTED_IMAGES get() = SessionManager.MAX_INSERTED_IMAGES
     private lateinit var imagePickerLauncher: ActivityResultLauncher<Array<String>>
     private lateinit var sessionListLauncher: ActivityResultLauncher<Intent>
 
     // ── Document management ────────────────────────────────────────────
     private var currentSessionId: String = java.util.UUID.randomUUID().toString()
     private var currentSessionName: String = "文檔"
-    private var docListContainer: LinearLayout? = null
+    private var docFileNameRef: TextView? = null
 
     // ── UI refs ────────────────────────────────────────────────────────
     private lateinit var rootFrame:             FrameLayout
@@ -79,6 +85,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
 
     // ── Persistence ────────────────────────────────────────────────────
     private lateinit var prefs: android.content.SharedPreferences
+    private lateinit var editorViewModel: EditorViewModel
 
     // ── Grid state ─────────────────────────────────────────────────────
     private val editTextFields = mutableListOf<EditText>()
@@ -111,8 +118,6 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private var selectionOptionsView: LinearLayout? = null
     private var startHandle:     View? = null
     private var endHandle:       View? = null
-    private var lastTapIndex     = -1
-    private var lastTapTime      = 0L
     private var activeDragHandle: Boolean? = null  // true=start handle, false=end handle
     private var handleDragged    = false           // true once finger moves ≥1 cell while on a handle
     private var handlePasteView: TextView? = null  // mini bubble shown on handle tap (no drag)
@@ -134,8 +139,23 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
 
     // ── Lazy grid build ────────────────────────────────────────────────
     private val builtColumns = HashSet<Int>()
-    private var incrementalBuildRunnable: Runnable? = null
-    private var buildGeneration = 0
+    private lateinit var gridEditorController: GridEditorController
+    private lateinit var cellInputController: CellInputController
+
+    // ── Undo / Redo ────────────────────────────────────────────────────
+    private var undoButton: TextView? = null
+    private var redoButton: TextView? = null
+
+    // ── Inserted image overlay ─────────────────────────────────────────
+    private val bgImageMatrix = Matrix()
+    private val bgImageViews = mutableListOf<ImageView>()
+    private var imageGestureActive = false
+    private var imageGestureStartDist = 0f
+    private var imageGestureStartMidX = 0f
+    private var imageGestureStartMidY = 0f
+    private val imageGestureMatrix = Matrix()
+    private var pendingBgImageMatrix: FloatArray? = null
+    private var insertImageContainer: LinearLayout? = null
 
     private fun setColumnChar(col: Int, row: Int, ch: String) =
         GridLogicHelper.setColumnChar(columnData, col, row, ch)
@@ -155,6 +175,141 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
 
     private fun loadColumnBreaksFromJson(breaks: org.json.JSONArray) {
         columnBreaks.clear(); columnBreaks.addAll(SessionManager.loadColumnBreaksFromJson(breaks))
+    }
+
+    private fun cloneMatrix(values: FloatArray?): FloatArray? = values?.copyOf()
+
+    private fun copyInsertedImagesState(): List<InsertedImageState> =
+        insertedImages.map { InsertedImageState(it.uri, cloneMatrix(it.matrix)) }
+
+    private fun parseInsertedImages(json: org.json.JSONArray?) =
+        SessionManager.parseInsertedImages(json)
+
+    private fun insertedImagesToJsonString(images: List<InsertedImageState>) =
+        SessionManager.insertedImagesToJsonString(images)
+
+    private fun updateActiveImageRuntimeState() {
+        if (activeImageIndex !in insertedImages.indices) return
+        val currentUri = bgImageUri ?: return
+        if (insertedImages[activeImageIndex].uri != currentUri) return
+        insertedImages[activeImageIndex] = InsertedImageState(currentUri, getBgImageMatrixValues())
+    }
+
+    private fun loadImageBitmap(uriStr: String): Bitmap? {
+        val uri = try { Uri.parse(uriStr) } catch (_: Exception) { return null }
+        return try {
+            val stream = when (uri.scheme) {
+                "file" -> java.io.FileInputStream(java.io.File(uri.path ?: return null))
+                else   -> contentResolver.openInputStream(uri)
+            } ?: return null
+            stream.use { BitmapFactory.decodeStream(it) }
+        } catch (_: Exception) { null }
+    }
+
+    private fun defaultImageMatrixValues(imgW: Int, imgH: Int, index: Int): FloatArray {
+        val metrics = resources.displayMetrics
+        val viewW = rootFrame.width.toFloat().takeIf { it > 0f } ?: metrics.widthPixels.toFloat()
+        val viewH = mainScrollView.height.toFloat().takeIf { it > 0f } ?: (metrics.heightPixels * 0.7f)
+
+        val pad = 14f * metrics.density
+        val gap = 10f * metrics.density
+        val columns = 3
+        val col = index % columns
+        val row = index / columns
+
+        val slotW = ((viewW - pad * 2f - gap * (columns - 1)) / columns).coerceAtLeast(1f)
+        val slotH = (viewH * 0.32f).coerceAtLeast(1f)
+        val scale = minOf(slotW / imgW, slotH / imgH).coerceAtLeast(0.05f)
+
+        val matrix = Matrix().apply {
+            setScale(scale, scale)
+            postTranslate(pad + col * (slotW + gap), pad + row * (slotH + gap))
+        }
+        return FloatArray(9).also { matrix.getValues(it) }
+    }
+
+    private fun renderInsertedImages() {
+        bgImageViews.forEach { rootFrame.removeView(it) }
+        bgImageViews.clear()
+        bgImageView = null
+        bgImageUri = null
+        bgImageMatrix.reset()
+
+        if (insertedImages.isEmpty()) {
+            activeImageIndex = -1
+            return
+        }
+
+        activeImageIndex = activeImageIndex.coerceIn(0, insertedImages.lastIndex)
+        insertedImages.forEachIndexed { idx, state ->
+            val bmp = loadImageBitmap(state.uri) ?: return@forEachIndexed
+            val view = ImageView(this).apply {
+                layoutParams = FrameLayout.LayoutParams(MP, MP)
+                scaleType = ImageView.ScaleType.MATRIX
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                setImageBitmap(bmp)
+            }
+
+            val matrixValues = cloneMatrix(state.matrix) ?: defaultImageMatrixValues(bmp.width, bmp.height, idx)
+            val matrix = Matrix().apply { setValues(matrixValues) }
+            view.imageMatrix = matrix
+
+            rootFrame.addView(view, 0)
+            bgImageViews.add(view)
+
+            if (state.matrix == null && idx in insertedImages.indices) {
+                insertedImages[idx] = InsertedImageState(state.uri, cloneMatrix(matrixValues))
+            }
+
+            if (idx == activeImageIndex) {
+                bgImageView = view
+                bgImageUri = state.uri
+                bgImageMatrix.setValues(matrixValues)
+            }
+        }
+
+        if (bgImageView == null) {
+            bgImageUri = null
+            bgImageMatrix.reset()
+        }
+    }
+
+    private fun findTouchedImageIndex(rootX: Float, rootY: Float): Int {
+        if (insertedImages.isEmpty() || bgImageViews.isEmpty()) return -1
+        val ordered = bgImageViews.indices.sortedByDescending { idx ->
+            rootFrame.indexOfChild(bgImageViews[idx])
+        }
+        for (idx in ordered) {
+            val view = bgImageViews.getOrNull(idx) ?: continue
+            if (view.visibility != View.VISIBLE) continue
+            val drawable = view.drawable ?: continue
+            val dw = drawable.intrinsicWidth.toFloat().takeIf { it > 0f } ?: continue
+            val dh = drawable.intrinsicHeight.toFloat().takeIf { it > 0f } ?: continue
+            val inverse = Matrix()
+            if (!view.imageMatrix.invert(inverse)) continue
+            val p = floatArrayOf(rootX, rootY)
+            inverse.mapPoints(p)
+            if (p[0] >= 0f && p[0] <= dw && p[1] >= 0f && p[1] <= dh) return idx
+        }
+        return -1
+    }
+
+    private fun activateImageAt(index: Int) {
+        if (index !in insertedImages.indices) return
+        val view = bgImageViews.getOrNull(index) ?: return
+        updateActiveImageRuntimeState()
+        activeImageIndex = index
+        bgImageView = view
+        bgImageUri = insertedImages[index].uri
+        bgImageMatrix.set(view.imageMatrix)
+    }
+
+    private fun syncActiveImageFromList() {
+        renderInsertedImages()
+    }
+
+    private fun updateToolbarSessionName() {
+        docFileNameRef?.text = currentSessionName
     }
 
     private inline fun withRestoring(block: () -> Unit) {
@@ -180,7 +335,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun persistCurrentState() {
-        saveSession(currentSessionId, currentSessionName)
+        saveSession()
         saveState()
     }
 
@@ -190,6 +345,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         cursorBefore = true
         editTextFields.getOrNull(nextIdx)?.requestFocus()
         scrollToColumn(nextIdx / numRows)
+        placeFrontierMarker()
     }
 
     private fun postRefreshFocusColumn(targetIndex: Int, col: Int = targetIndex / numRows) {
@@ -206,7 +362,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     // showKeyboard: true  = open IME and re-bind it; false = keep IME closed (style rebuilds).
     // No Paint or Canvas work — purely a data + focus update.
     private fun focusCell(index: Int, cursorBefore: Boolean = true, showKeyboard: Boolean = true) {
-        ensureColumnBuilt(index / numRows.coerceAtLeast(1))
+        gridEditorController.ensureColumnBuilt(index / numRows.coerceAtLeast(1))
         val et = editTextFields.getOrNull(index) ?: return
         this.cursorBefore = cursorBefore
         if (!isSelecting) editTextFields.getOrNull(focusedCellIndex)?.setBackgroundColor(Color.TRANSPARENT)
@@ -313,6 +469,64 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
 
     // ── onCreate ───────────────────────────────────────────────────────
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        // ── Inserted image pan/zoom (2-finger) ────────────────────────────
+        if (bgImageViews.isNotEmpty()) {
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    if (ev.pointerCount == 2) {
+                        val rootLoc = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
+                        val midX = (ev.getX(0) + ev.getX(1)) / 2f - rootLoc[0]
+                        val midY = (ev.getY(0) + ev.getY(1)) / 2f - rootLoc[1]
+                        val touchedIndex = findTouchedImageIndex(midX, midY)
+                        if (touchedIndex < 0) {
+                            imageGestureActive = false
+                            return super.dispatchTouchEvent(ev)
+                        }
+
+                        activateImageAt(touchedIndex)
+                        imageGestureStartMidX = midX
+                        imageGestureStartMidY = midY
+                        imageGestureStartDist = Math.hypot(
+                            (ev.getX(1) - ev.getX(0)).toDouble(),
+                            (ev.getY(1) - ev.getY(0)).toDouble()).toFloat()
+                        imageGestureMatrix.set(bgImageMatrix)
+                        imageGestureActive = true
+                        return true
+                    }
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (imageGestureActive && ev.pointerCount >= 2) {
+                        val rootLoc = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
+                        val newMidX = (ev.getX(0) + ev.getX(1)) / 2f - rootLoc[0]
+                        val newMidY = (ev.getY(0) + ev.getY(1)) / 2f - rootLoc[1]
+                        val newDist = Math.hypot(
+                            (ev.getX(1) - ev.getX(0)).toDouble(),
+                            (ev.getY(1) - ev.getY(0)).toDouble()).toFloat()
+                        val scaleFactor = if (imageGestureStartDist > 0f) newDist / imageGestureStartDist else 1f
+                        val m = Matrix(imageGestureMatrix)
+                        m.postScale(scaleFactor, scaleFactor, imageGestureStartMidX, imageGestureStartMidY)
+                        m.postTranslate(newMidX - imageGestureStartMidX, newMidY - imageGestureStartMidY)
+                        bgImageMatrix.set(m)
+                        bgImageView?.imageMatrix = bgImageMatrix
+                        return true
+                    }
+                }
+                MotionEvent.ACTION_POINTER_UP -> {
+                    if (imageGestureActive) {
+                        imageGestureActive = false
+                        persistCurrentState()
+                        return true
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (imageGestureActive) {
+                        imageGestureActive = false
+                        persistCurrentState()
+                    }
+                }
+            }
+        }
+
         if (isSelecting && ev.pointerCount == 1) {
             val sh = startHandle; val eh = endHandle
             if (sh != null && eh != null && sh.visibility == View.VISIBLE) {
@@ -404,13 +618,24 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         val dp = resources.displayMetrics.density
 
         prefs = getSharedPreferences("poem_editor_state", Context.MODE_PRIVATE)
+        editorViewModel = ViewModelProvider(
+            this,
+            EditorViewModel.Factory(SessionRepository(filesDir))
+        )[EditorViewModel::class.java]
         loadSettings()
         imagePickerLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            if (uri != null) applyBackgroundImage(uri)
+            if (uri != null) applyInsertedImage(uri)
         }
         sessionListLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode == RESULT_OK) {
-                val id = result.data?.getStringExtra("session_id") ?: return@registerForActivityResult
+                val data = result.data ?: return@registerForActivityResult
+                val renamedName = data.getStringExtra("renamed_current_name")
+                if (renamedName != null) {
+                    currentSessionName = renamedName
+                    updateToolbarSessionName()
+                    prefs.edit().putString("current_session_name", renamedName).apply()
+                }
+                val id = data.getStringExtra("session_id") ?: return@registerForActivityResult
                 loadSessionFile(id)
             }
         }
@@ -451,27 +676,51 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             addView(gridContainer)
         }
 
+        cellInputController = CellInputController()
+
+        gridEditorController = GridEditorController(
+            context = this,
+            maxColumns = MAX_COLUMNS,
+            builtColumns = builtColumns,
+            editTextFields = editTextFields,
+            columnData = columnData,
+            withRestoring = { block -> withRestoring(block) },
+            getNumRows = { numRows },
+            getCurrentCellSize = { currentCellSize },
+            getFontSizeSp = { fontSizeSp },
+            getGridTextColor = { gridTextColor },
+            getMainScrollWidth = { mainScrollView.width },
+            getHScroll = { hScroll },
+            makeCell = { row, col, index, cellSize, fontPx ->
+                makeCell(row, col, index, cellSize, fontPx)
+            }
+        )
+
         viewFactory      = ViewFactory(this, this)
         bottomPanel      = viewFactory.buildBottomPanel(dp)
         allToolsPanel    = viewFactory.allToolsPanel!!
         punctToolbar     = viewFactory.punctToolbar!!
         toolsCell        = viewFactory.toolsCell
-        docListContainer = viewFactory.docListContainer
+        docFileNameRef    = viewFactory.docFileNameRef
         fontSpinnerRef    = viewFactory.fontSpinnerRef
         fontSizeLabelRef  = viewFactory.fontSizeLabelRef
         gapValueLabelRef  = viewFactory.gapValueLabelRef
         modeChipContainer = viewFactory.modeChipContainer
+        undoButton        = viewFactory.undoButton
+        redoButton        = viewFactory.redoButton
+        insertImageContainer = viewFactory.insertImageContainer
+        updateToolbarSessionName()
         mainLayout.addView(mainScrollView)
         mainLayout.addView(bottomPanel)
         rootFrame.addView(mainLayout)
         rootFrame.addView(allToolsPanel)
         setContentView(rootFrame)
         val dp0 = resources.displayMetrics.density
-        startHandle = viewFactory.buildSelectionHandle(isStart = true,  dp0).also { rootFrame.addView(it) }
-        endHandle   = viewFactory.buildSelectionHandle(isStart = false, dp0).also { rootFrame.addView(it) }
+        startHandle = viewFactory.buildSelectionHandle(dp0).also { rootFrame.addView(it) }
+        endHandle   = viewFactory.buildSelectionHandle(dp0).also { rootFrame.addView(it) }
         selectionOptionsView = viewFactory.buildSelectionOptionsView(dp0).also { rootFrame.addView(it) }
         handlePasteView = viewFactory.buildHandlePasteView(dp0).also { rootFrame.addView(it) }
-        loadBgImageFromUri(bgImageUri)
+        syncActiveImageFromList()
 
         // Track keyboard height and manage scroll padding in sync with IME state.
         ViewCompat.setOnApplyWindowInsetsListener(rootFrame) { _, insets ->
@@ -548,9 +797,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         val pop = selectionOptionsView ?: return
         if (!isSelecting) return
         val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
-        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost(editTextFields.size - 1)
         val etFrom = editTextFields.getOrNull(from) ?: return
-        val etTo   = editTextFields.getOrNull(to)   ?: return
         if (cachedPopupW < 0) {
             pop.measure(
                 View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
@@ -595,6 +842,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
 
 
     private fun insertPunct(punct: String) {
+        pushHistory()
         val focused = currentFocus
         val idx = editTextFields.indexOf(focused as? EditText)
         if (idx < 0) return
@@ -619,8 +867,6 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     // Clears any active background image so the solid colour is visible.
     private fun applyBackground(color: Int) {
         bgColor = color
-        bgImageUri = null
-        bgImageView?.visibility = View.GONE
         rootFrame.setBackgroundColor(color)
         persistCurrentState()
     }
@@ -639,7 +885,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
         currentFocus?.clearFocus()
-        refreshDocPanel()
+        refreshInsertedImagePanel()
         val h = if (lastKeyboardHeight > 0) lastKeyboardHeight
                 else (280 * resources.displayMetrics.density).roundToInt()
         val lp = allToolsPanel.layoutParams as FrameLayout.LayoutParams
@@ -816,6 +1062,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun cutSelectedText() {
+        pushHistory()
         val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clip.setPrimaryClip(ClipData.newPlainText("poemeditor", selectedTextToString()))
         val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
@@ -829,6 +1076,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun pasteText() {
+        pushHistory()
         val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val raw  = clip.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
             ?.ifEmpty { null } ?: return
@@ -848,6 +1096,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun pasteTextAt(insertIdx: Int) {
+        pushHistory()
         val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val raw  = clip.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
             ?.ifEmpty { null } ?: return
@@ -901,7 +1150,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         for (col in paraStartCol..paraEndCol) {
             val cells = columnData.getOrNull(col) ?: continue
             for (row in cells.indices) {
-                if (cells[row].isNotEmpty()) {
+                if (cells[row].isNotBlank()) {
                     val idx = col * numRows + row
                     if (first < 0) first = idx
                     last = idx
@@ -1056,60 +1305,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         }
     }
 
-    private fun expandGrid() {
-        // Grid is always MAX_COLUMNS wide; use ensureColumnBuilt for on-demand cell creation.
-        ensureBufferColumn()
-    }
-
     private fun ensureBufferColumn() {
         // Ensure there is at least one empty column beyond the last data column.
         val neededCol = columnData.size.coerceIn(0, MAX_COLUMNS - 1)
-        ensureColumnBuilt(neededCol)
-    }
-
-    // Builds one column's EditText cells, fills data, appends to editTextFields/grid.
-    // Must be called in col order 0,1,2,… because editTextFields is a contiguous list.
-    private fun buildColumn(col: Int, grid: GridLayout, fontPx: Float, cellSize: Int) {
-        if (col in builtColumns || col >= MAX_COLUMNS || numRows <= 0) return
-        val colData = columnData.getOrNull(col)
-        isRestoring = true
-        try {
-            repeat(numRows) { row ->
-                val index = col * numRows + row
-                val et = makeCell(row, col, index, cellSize, fontPx)
-                val ch = colData?.getOrNull(row) ?: ""
-                if (ch.isNotEmpty()) et.setText(ch)
-                et.setTextColor(gridTextColor)
-                editTextFields.add(et)
-                grid.addView(et)
-            }
-        } finally {
-            isRestoring = false
-        }
-        builtColumns.add(col)
-    }
-
-    // Builds exactly the visible columns + all data columns. No async follow-on.
-    // New columns are created on demand: typing triggers ensureBufferColumn,
-    // scrolling triggers the onScrollChangeListener in rebuildGrid.
-    private fun buildInitialColumns(anchorCol: Int) {
-        val grid = (hScroll?.getChildAt(0) as? GridLayout) ?: return
-        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
-        val cellSize = currentCellSize
-        val visibleCols = (mainScrollView.width / cellSize.coerceAtLeast(1)).coerceAtLeast(1) + 1
-        val lastDataCol = columnData.indexOfLast { it.any { ch -> ch.isNotEmpty() } }.coerceAtLeast(0)
-        val buildEnd = maxOf(visibleCols - 1, lastDataCol).coerceAtMost(MAX_COLUMNS - 1)
-        for (col in 0..buildEnd) buildColumn(col, grid, fontPx, cellSize)
-    }
-
-    // Synchronously builds all columns from the next unbuilt one up to col.
-    // Called before any access to a column not yet in editTextFields.
-    private fun ensureColumnBuilt(col: Int) {
-        if (col < 0 || col >= MAX_COLUMNS || col in builtColumns) return
-        val grid = (hScroll?.getChildAt(0) as? GridLayout) ?: return
-        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
-        val nextUnbuilt = (builtColumns.maxOrNull()?.plus(1)) ?: 0
-        for (c in nextUnbuilt..col) buildColumn(c, grid, fontPx, currentCellSize)
+        gridEditorController.ensureColumnBuilt(neededCol)
     }
 
     private fun rebuildGrid(isInitialBoot: Boolean = false) {
@@ -1132,10 +1331,6 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             (gw - (s.scrollX + viewport)) / cs
         }.coerceIn(0, MAX_COLUMNS - 1)
 
-        // Cancel any ongoing async build before tearing down views.
-        incrementalBuildRunnable?.let { rootFrame.removeCallbacks(it) }
-        incrementalBuildRunnable = null
-        buildGeneration++
         builtColumns.clear()
 
         clearSelection()
@@ -1194,7 +1389,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             val highestVisible = ((gw - scrollX) / cs).coerceIn(0, MAX_COLUMNS - 1)
             val lastBuilt = builtColumns.maxOrNull() ?: -1
             if (highestVisible > lastBuilt) {
-                ensureColumnBuilt((highestVisible + 1).coerceAtMost(MAX_COLUMNS - 1))
+                gridEditorController.ensureColumnBuilt((highestVisible + 1).coerceAtMost(MAX_COLUMNS - 1))
             }
         }
         gridContainer.addView(hScroll)
@@ -1211,7 +1406,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         })
 
         // Build exactly the visible columns + data columns; no background loop.
-        buildInitialColumns(anchorCol)
+        gridEditorController.buildInitialColumns()
+
+        // Drop the SEQUENTIAL writing-frontier marker into the cell right after the last
+        // char so the user can tap into it and append.
+        placeFrontierMarker()
 
         // All data columns are guaranteed built by the sync batch, so lastFilled is correct.
         val lastFilled = editTextFields.indexOfLast { it.text.isNotEmpty() }
@@ -1261,6 +1460,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun saveState() {
+        updateActiveImageRuntimeState()
+        val matVals = getBgImageMatrixValues()
+        val matStr = if (matVals != null) {
+            org.json.JSONArray().also { arr -> matVals.forEach { arr.put(it.toDouble()) } }.toString()
+        } else ""
         prefs.edit()
             .putString("column_data", columnDataToJson().toString())
             .putString("column_breaks", columnBreaksToJson().toString())
@@ -1271,6 +1475,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             .putInt("bg_color", bgColor)
             .putString("input_mode", inputMode.name)
             .putString("bg_image_uri", bgImageUri)
+            .putString("bg_image_matrix", matStr)
+            .putString("inserted_images", insertedImagesToJsonString(copyInsertedImagesState()))
+            .putInt("active_image_index", activeImageIndex)
             .putString("current_session_id", currentSessionId)
             .putString("current_session_name", currentSessionName)
             .apply()
@@ -1337,101 +1544,59 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         // Touch handler: event is always consumed (return true) so the native EditText
         // cursor-placement logic never runs and the cursor cannot land on the left side.
         // SEQUENTIAL empty cells redirect to the first empty row in column-major order.
-        et.setOnTouchListener { _, event ->
-            if (event.action == MotionEvent.ACTION_UP) {
-                val now = System.currentTimeMillis()
-
-                // Double-tap → enter selection mode
-                if (!isSelecting && lastTapIndex == index && now - lastTapTime < 300L) {
-                    lastTapTime = 0L; lastTapIndex = -1
-                    enterSelectionMode(index)
-                    return@setOnTouchListener true
-                }
-
-                // Tap outside handles while selecting → dismiss selection, fall through to normal tap
-                if (isSelecting) {
-                    handlePasteView?.visibility = View.GONE
-                    clearSelection()
-                    // fall through: normal focus/keyboard logic runs below
-                }
-
-                lastTapTime = now; lastTapIndex = index
-
-                if (toolsVisible) {
-                    allToolsPanel.visibility = View.GONE
-                    toolsVisible = false
-                    toolsCell?.setBackgroundColor(Color.TRANSPARENT)
-                    if (lastKeyboardHeight > 0) mainScrollView.setPadding(0, 0, 0, lastKeyboardHeight)
-                }
-                if (inputMode == InputMode.SEQUENTIAL && et.text.isEmpty()) {
-                    var searchCol = index / numRows
-                    var target = -1
-                    while (searchCol < numColumns) {
-                        val emptyRow = (0 until numRows).firstOrNull { r ->
-                            editTextFields.getOrNull(searchCol * numRows + r)?.text?.isEmpty() == true
-                        }
-                        if (emptyRow != null) { target = searchCol * numRows + emptyRow; break }
-                        searchCol++
-                    }
-                    if (target >= 0 && target != index) {
-                        focusCell(target)
-                        scrollToColumn(target / numRows)
-                        return@setOnTouchListener true
-                    }
-                }
-                et.requestFocus()
-                et.setSelection(et.text.length)
-                focusCell(index, showKeyboard = true)
-            }
-            true
-        }
+        cellInputController.attachTouchListener(
+            et = et,
+            index = index,
+            getInputMode = { inputMode },
+            getIsSelecting = { isSelecting },
+            clearSelection = { clearSelection() },
+            hideHandlePasteMenu = { handlePasteView?.visibility = View.GONE },
+            enterSelectionMode = { enterSelectionMode(it) },
+            isToolsVisible = { toolsVisible },
+            dismissToolsPanel = {
+                allToolsPanel.visibility = View.GONE
+                toolsVisible = false
+                toolsCell?.setBackgroundColor(Color.TRANSPARENT)
+            },
+            getLastKeyboardHeight = { lastKeyboardHeight },
+            setMainScrollPaddingBottom = { mainScrollView.setPadding(0, 0, 0, it) },
+            getNumColumns = { numColumns },
+            getNumRows = { numRows },
+            getEditFieldAt = { editTextFields.getOrNull(it) },
+            focusCell = { focusCell(it, showKeyboard = true) },
+            scrollToColumn = { scrollToColumn(it) }
+        )
 
         // Key handler for Enter and DEL (hardware keyboard + many soft keyboards).
         // Enter = insert a blank row at the current position, pushing content down.
         // DEL   = remove the current row's element, shift content up, move to index-1.
-        et.setOnKeyListener { _, keyCode, event ->
-            if (isRestoring) return@setOnKeyListener false
-            if (keyCode != KeyEvent.KEYCODE_DEL && keyCode != KeyEvent.KEYCODE_ENTER) return@setOnKeyListener false
-            if (event.action == KeyEvent.ACTION_DOWN) {
-                when (keyCode) {
-                    KeyEvent.KEYCODE_ENTER -> {
-                        insertColumnBreak(index / numRows, index % numRows)
-                    }
-                    KeyEvent.KEYCODE_DEL -> {
-                        val cellCol = index / numRows
-                        val cellRow = index % numRows
-                        // Row 0 of a break column → undo the column break (SEQUENTIAL only).
-                        if (cellRow == 0 && cellCol > 0 && inputMode != InputMode.SCATTER
-                                && columnBreaks.contains(cellCol)) {
-                            removeColumnBreak(cellCol)
-                            return@setOnKeyListener true
-                        }
-                        if (inputMode == InputMode.SCATTER) {
-                            val curChar = columnData.getOrNull(cellCol)?.getOrNull(cellRow) ?: ""
-                            if (curChar.isNotBlank()) {
-                                // Island: backspace-delete with reflow, same as SEQUENTIAL.
-                                deletePreviousSequentialCell(cellCol, cellRow, index)
-                            } else {
-                                val colList = columnData.getOrNull(cellCol)
-                                val focusTarget = (index - 1).coerceAtLeast(0)
-                                if (colList != null && cellRow < colList.size) {
-                                    withRestoring { colList.removeAt(cellRow); colList.add("") }
-                                }
-                                editTextFields.getOrNull(focusTarget)?.requestFocus()
-                                gridContainer.post { refreshGrid(); focusCell(focusTarget) }
-                            }
-                        } else {
-                            deletePreviousSequentialCell(cellCol, cellRow, index)
-                        }
-                    }
+        cellInputController.attachKeyListener(
+            et = et,
+            index = index,
+            isRestoring = { isRestoring },
+            pushHistory = { pushHistory() },
+            insertColumnBreak = { c, r -> insertColumnBreak(c, r) },
+            getNumRows = { numRows },
+            getInputMode = { inputMode },
+            hasColumnBreak = { columnBreaks.contains(it) },
+            removeColumnBreak = { removeColumnBreak(it) },
+            getColumnChar = { c, r -> columnData.getOrNull(c)?.getOrNull(r) ?: "" },
+            deletePreviousSequentialCell = { c, r, i -> deletePreviousSequentialCell(c, r, i) },
+            handleScatterEmptyBackspace = { cellCol, cellRow, i ->
+                val colList = columnData.getOrNull(cellCol)
+                val focusTarget = (i - 1).coerceAtLeast(0)
+                if (colList != null && cellRow < colList.size) {
+                    withRestoring { colList.removeAt(cellRow); colList.add("") }
                 }
+                editTextFields.getOrNull(focusTarget)?.requestFocus()
+                gridContainer.post { refreshGrid(); focusCell(focusTarget) }
             }
-            true
-        }
+        )
 
         // Soft IME Enter: same column-break behaviour as hardware KEYCODE_ENTER.
         // Returning true keeps the keyboard open.
         et.setOnEditorActionListener { _, _, _ ->
+            pushHistory()
             insertColumnBreak(index / numRows, index % numRows)
             true
         }
@@ -1456,6 +1621,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                 if (stillComposing) return
                 clearComposingPreview()
                 val raw = editable?.toString() ?: return
+                pushHistory()
                 val cellCol = index / numRows
                 val cellRow = index % numRows
                 if (raw.isEmpty()) {
@@ -1525,31 +1691,39 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                     // ── Insert-shift (SEQUENTIAL only) ────────────────────────────────
                     if (text.length >= 2 && !text.contains('\n')
                             && originalChar.isNotEmpty() && inputMode == InputMode.SEQUENTIAL) {
-                        val newChars: String? = when {
+                        val before = focusedCellIndex == index && cursorBefore
+                        val newChars: String = when {
                             text.startsWith(originalChar) -> text.substring(1)
                             text.endsWith(originalChar)   -> text.dropLast(1)
-                            else                          -> null  // IME replaced entirely — paste path
+                            else -> {
+                                val pivot = if (before) text.lastIndexOf(originalChar) else text.indexOf(originalChar)
+                                if (pivot >= 0) {
+                                    text.removeRange(pivot, pivot + originalChar.length)
+                                } else {
+                                    // IME variant: original char not present in committed buffer.
+                                    // Keep insertion semantics by treating one edge char as the anchor.
+                                    if (before) text.dropLast(originalChar.length) else text.drop(originalChar.length)
+                                }
+                            }
                         }
-                        if (newChars != null && newChars.isNotEmpty()) {
-                            val before = focusedCellIndex == index && cursorBefore
-                            val focusTarget = performInsert(index, newChars) ?: run {
-                                suppress = true
-                                editable.replace(0, editable.length, originalChar)
-                                return
-                            }
-                            // Fix this cell's EditText immediately to prevent a flicker frame.
-                            // before=true  → cell now holds newChars[0] (original shifted down)
-                            // before=false → cell still holds originalChar (new chars went below)
+                        if (newChars.isEmpty()) return
+                        val focusTarget = performInsert(index, newChars) ?: run {
                             suppress = true
-                            editable.replace(0, editable.length,
-                                if (before) newChars[0].toString() else originalChar)
-                            gridContainer.post {
-                                refreshGrid()
-                                editTextFields.getOrNull(focusTarget)
-                                    ?.postDelayed({ focusCell(focusTarget) }, 50)
-                            }
+                            editable.replace(0, editable.length, originalChar)
                             return
                         }
+                        // Fix this cell's EditText immediately to prevent a flicker frame.
+                        // before=true  → cell now holds newChars[0] (original shifted down)
+                        // before=false → cell still holds originalChar (new chars went below)
+                        suppress = true
+                        editable.replace(0, editable.length,
+                            if (before) newChars[0].toString() else originalChar)
+                        gridContainer.post {
+                            refreshGrid()
+                            editTextFields.getOrNull(focusTarget)
+                                ?.postDelayed({ focusCell(focusTarget) }, 50)
+                        }
+                        return
                     }
                     // ── End insert-shift ─────────────────────────────────────────────
 
@@ -1635,21 +1809,52 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             "SCATTER" -> InputMode.SCATTER; else -> InputMode.SEQUENTIAL }
         currentSessionId   = prefs.getString("current_session_id",  null) ?: java.util.UUID.randomUUID().toString()
         currentSessionName = prefs.getString("current_session_name", "文檔") ?: "文檔"
+
+        val loadedInsertedImages = try {
+            parseInsertedImages(org.json.JSONArray(prefs.getString("inserted_images", "[]") ?: "[]"))
+        } catch (_: Exception) { mutableListOf() }
+
+        insertedImages.clear()
+        insertedImages.addAll(loadedInsertedImages.take(MAX_INSERTED_IMAGES))
+        activeImageIndex = prefs.getInt("active_image_index", if (insertedImages.isNotEmpty()) 0 else -1)
+            .coerceIn(-1, insertedImages.lastIndex)
+
+        val matStr = prefs.getString("bg_image_matrix", null)
+        if (!matStr.isNullOrEmpty()) {
+            try {
+                val arr = org.json.JSONArray(matStr)
+                if (arr.length() == 9) pendingBgImageMatrix = FloatArray(9) { i -> arr.getDouble(i).toFloat() }
+            } catch (_: Exception) {}
+        }
+
+        // Backward compatibility: migrate legacy single-image prefs when list is absent.
+        if (insertedImages.isEmpty() && !bgImageUri.isNullOrEmpty()) {
+            insertedImages.add(InsertedImageState(bgImageUri!!, cloneMatrix(pendingBgImageMatrix)))
+            activeImageIndex = 0
+        }
     }
 
     // ── Background image ───────────────────────────────────────────────
-    private fun applyBackgroundImage(uri: Uri) {
+    private fun applyInsertedImage(uri: Uri) {
+        if (insertedImages.size >= MAX_INSERTED_IMAGES) {
+            Toast.makeText(this, "最多可插入 5 張圖片", Toast.LENGTH_SHORT).show()
+            return
+        }
+        pushHistory()
         try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
         catch (_: Exception) {}
-        val storedUri = storeBackgroundImage(uri) ?: uri.toString()
-        loadBgImageFromUri(storedUri)
+        val storedUri = storeInsertedImage(uri) ?: uri.toString()
+        insertedImages.add(InsertedImageState(storedUri, null))
+        activeImageIndex = insertedImages.lastIndex
+        syncActiveImageFromList()
+        refreshInsertedImagePanel()
         persistCurrentState()
     }
 
-    private fun storeBackgroundImage(uri: Uri): String? {
+    private fun storeInsertedImage(uri: Uri): String? {
         return try {
             val dir = java.io.File(filesDir, "backgrounds").also { it.mkdirs() }
-            val file = java.io.File(dir, "$currentSessionId.bg")
+            val file = java.io.File(dir, "${currentSessionId}_${System.currentTimeMillis()}.bg")
             contentResolver.openInputStream(uri)?.use { input ->
                 file.outputStream().use { output -> input.copyTo(output) }
             } ?: return null
@@ -1659,16 +1864,28 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         }
     }
 
-    private fun loadBgImageFromUri(uriStr: String?) {
+    private fun selectInsertedImage(index: Int) {
+        if (index !in insertedImages.indices || index == activeImageIndex) return
+        pushHistory()
+        updateActiveImageRuntimeState()
+        activeImageIndex = index
+        syncActiveImageFromList()
+        refreshInsertedImagePanel()
+        persistCurrentState()
+    }
+
+    private fun loadBgImageFromUri(uriStr: String?, matrixValues: FloatArray? = null) {
         if (uriStr == null) { bgImageView?.visibility = View.GONE; bgImageUri = null; return }
         val uri = try { Uri.parse(uriStr) } catch (_: Exception) { return }
         if (bgImageView == null) {
             bgImageView = ImageView(this).apply {
                 layoutParams = FrameLayout.LayoutParams(MP, MP)
-                scaleType = ImageView.ScaleType.CENTER_CROP
+                scaleType = ImageView.ScaleType.MATRIX
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }
-            rootFrame.addView(bgImageView, 0)  // behind all other views
+            rootFrame.addView(bgImageView, 0)
+        } else {
+            bgImageView!!.scaleType = ImageView.ScaleType.MATRIX
         }
         try {
             val stream = when (uri.scheme) {
@@ -1679,82 +1896,183 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             bgImageView!!.setImageBitmap(bmp)
             bgImageView!!.visibility = View.VISIBLE
             bgImageUri = uriStr
+            val storedMatrix = matrixValues ?: run { val p = pendingBgImageMatrix; pendingBgImageMatrix = null; p }
+            if (storedMatrix != null) {
+                bgImageMatrix.setValues(storedMatrix)
+                bgImageView!!.imageMatrix = bgImageMatrix
+            } else {
+                bgImageView!!.post { initBgImageMatrix(bmp.width, bmp.height) }
+            }
+            updateActiveImageRuntimeState()
         } catch (_: Exception) {
             bgImageView?.visibility = View.GONE
         }
     }
 
-    // ── Document management ────────────────────────────────────────────
-    // Rebuilds the doc panel list showing the 3 most recent sessions.
-    // No ScrollView — content is sized to fit the fixed 120dp overlay.
-    private fun refreshDocPanel() {
-        val container = docListContainer ?: return
-        val dp = resources.displayMetrics.density
+    private fun initBgImageMatrix(imgW: Int, imgH: Int) {
+        val viewW = rootFrame.width.toFloat()
+        val viewH = mainScrollView.height.toFloat()
+        if (viewW <= 0 || viewH <= 0 || imgW <= 0 || imgH <= 0) return
+        val scale = minOf(viewW / imgW, viewH / imgH)
+        bgImageMatrix.reset()
+        bgImageMatrix.setScale(scale, scale)
+        bgImageMatrix.postTranslate((viewW - imgW * scale) / 2f, (viewH - imgH * scale) / 2f)
+        bgImageView?.imageMatrix = bgImageMatrix
+    }
+
+    private fun getBgImageMatrixValues(): FloatArray? {
+        if (bgImageUri == null) return null
+        return FloatArray(9).also { bgImageMatrix.getValues(it) }
+    }
+
+    private fun removeInsertedImage(index: Int = activeImageIndex) {
+        if (index !in insertedImages.indices) return
+        pushHistory()
+        insertedImages.removeAt(index)
+        activeImageIndex = if (insertedImages.isEmpty()) -1 else minOf(index, insertedImages.lastIndex)
+        syncActiveImageFromList()
+        refreshInsertedImagePanel()
+        persistCurrentState()
+    }
+
+    private fun refreshInsertedImagePanel() {
+        val container = insertImageContainer ?: return
         container.removeAllViews()
-        val sessions = listSessions().take(3)
-        if (sessions.isEmpty()) {
-            container.addView(TextView(this).apply {
-                text = "尚無文檔"
-                textSize = 12f; setTextColor(getColor(R.color.text_hint))
-                gravity = Gravity.CENTER
-                layoutParams = LinearLayout.LayoutParams(MP, WC)
-                setPadding(0, (10 * dp).roundToInt(), 0, 0)
-            })
-            return
-        }
-        sessions.forEach { meta ->
-            val isActive = meta.id == currentSessionId
-            val row = LinearLayout(this).apply {
+        val dp = resources.displayMetrics.density
+        insertedImages.forEachIndexed { idx, img ->
+            container.addView(LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                layoutParams = LinearLayout.LayoutParams(MP, (26 * dp).roundToInt())
-                setPadding((14 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0)
-                if (isActive) setBackgroundColor(getColor(R.color.row_active))
-            }
-            row.addView(TextView(this).apply {
-                text = meta.name; textSize = 12f
-                setTextColor(if (isActive) getColor(R.color.text_darkest) else getColor(R.color.text_dark))
-                layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
-                setOnClickListener { loadSessionFile(meta.id); refreshDocPanel() }
+                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                    it.marginEnd = (6 * dp).roundToInt()
+                }
+
+                addView(ImageView(this@MainActivity).apply {
+                    val avatarSize = (22 * dp).roundToInt()
+                    layoutParams = LinearLayout.LayoutParams(avatarSize, avatarSize)
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    setImageURI(Uri.parse(img.uri))
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL
+                        setColor(Color.TRANSPARENT)
+                        setStroke(
+                            (if (idx == activeImageIndex) 2f else 1f * dp).roundToInt(),
+                            getColor(if (idx == activeImageIndex) R.color.text_dark else R.color.stroke)
+                        )
+                    }
+                    clipToOutline = true
+                    contentDescription = "已插入圖片 ${idx + 1}"
+                    setOnClickListener { selectInsertedImage(idx) }
+                })
+
+                addView(TextView(this@MainActivity).apply {
+                    text = "×"
+                    textSize = 10f
+                    setTextColor(getColor(R.color.text_dark))
+                    gravity = Gravity.CENTER
+                    layoutParams = LinearLayout.LayoutParams((12 * dp).roundToInt(), (12 * dp).roundToInt())
+                        .also { it.marginStart = (2 * dp).roundToInt() }
+                    setOnClickListener { removeInsertedImage(idx) }
+                })
             })
-            row.addView(TextView(this).apply {
-                text = meta.formattedDate(); textSize = 10f
-                setTextColor(getColor(R.color.text_hint))
-                layoutParams = LinearLayout.LayoutParams(WC, WC).also { it.marginEnd = (6 * dp).roundToInt() }
-            })
-            row.addView(TextView(this).apply {
-                text = "×"; textSize = 14f; gravity = Gravity.CENTER
-                setTextColor(getColor(R.color.stroke))
-                layoutParams = LinearLayout.LayoutParams((28 * dp).roundToInt(), (28 * dp).roundToInt())
-                setOnClickListener { deleteSession(meta.id); refreshDocPanel() }
-            })
-            container.addView(row)
+        }
+        container.addView(TextView(this).apply {
+            text = "${insertedImages.size}/$MAX_INSERTED_IMAGES"
+            textSize = 11f
+            setTextColor(getColor(R.color.text_light))
+        })
+    }
+
+    // ── Screenshot ─────────────────────────────────────────────────────
+    private fun takeScreenshot() {
+        val wasToolsVisible = toolsVisible
+        if (toolsVisible) allToolsPanel.visibility = View.GONE
+        startHandle?.visibility = View.GONE
+        endHandle?.visibility = View.GONE
+        selectionOptionsView?.visibility = View.GONE
+        handlePasteView?.visibility = View.GONE
+        val focusedEt = editTextFields.getOrNull(focusedCellIndex)
+        focusedEt?.isCursorVisible = false
+
+        val bmp = ScreenshotHelper.captureView(rootFrame, mainScrollView.height)
+        if (bmp != null) ScreenshotHelper.saveToGallery(this, bmp)
+
+        focusedEt?.isCursorVisible = true
+        if (wasToolsVisible) allToolsPanel.visibility = View.VISIBLE
+        if (isSelecting) {
+            startHandle?.visibility = View.VISIBLE
+            endHandle?.visibility = View.VISIBLE
+            positionSelectionOptionsView()
         }
     }
 
-    private fun showRenameDialog() {
-        val dp = resources.displayMetrics.density
-        val editText = EditText(this).apply {
-            setText(currentSessionName); setSingleLine(); selectAll()
-            setPadding((16 * dp).roundToInt(), (12 * dp).roundToInt(),
-                       (16 * dp).roundToInt(), (12 * dp).roundToInt())
-        }
-        AlertDialog.Builder(this)
-            .setTitle("重新命名")
-            .setView(editText)
-            .setPositiveButton("確定") { _, _ ->
-                val name = editText.text.toString().trim().ifEmpty { currentSessionName }
-                saveSession(currentSessionId, name)
-                refreshDocPanel()
-            }
-            .setNegativeButton("取消", null)
-            .show().also { dialog ->
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(Color.BLACK)
-                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(Color.BLACK)
-            }
+    // ── Undo / Redo ────────────────────────────────────────────────────
+    private fun snapshotState(): EditorHistoryState {
+        updateActiveImageRuntimeState()
+        return EditorHistoryState(
+            data = columnData.map { it.toList() },
+            breaks = columnBreaks.toSet(),
+            fontIndex = fontIndex,
+            fontSizeSp = fontSizeSp,
+            wordGapDp = wordGapDp,
+            gridTextColor = gridTextColor,
+            bgColor = bgColor,
+            inputMode = inputMode,
+            insertedImages = copyInsertedImagesState(),
+            activeImageIndex = activeImageIndex
+        )
     }
 
-    private fun listSessions(): List<SessionMeta> = SessionManager.listSessions(filesDir)
+    private fun pushHistory() {
+        editorViewModel.snapshotForUndo(snapshotState())
+        updateUndoRedoButtons()
+    }
+
+    private fun performUndo() {
+        val state = editorViewModel.undo(snapshotState()) ?: return
+        restoreHistoryState(state)
+    }
+
+    private fun performRedo() {
+        val state = editorViewModel.redo(snapshotState()) ?: return
+        restoreHistoryState(state)
+    }
+
+    private fun restoreHistoryState(state: EditorHistoryState) {
+        columnData.clear()
+        state.data.forEach { columnData.add(it.toMutableList()) }
+        columnBreaks.clear()
+        columnBreaks.addAll(state.breaks)
+
+        insertedImages.clear()
+        insertedImages.addAll(state.insertedImages.take(MAX_INSERTED_IMAGES).map {
+            InsertedImageState(it.uri, cloneMatrix(it.matrix))
+        })
+        activeImageIndex = state.activeImageIndex.coerceIn(-1, insertedImages.lastIndex)
+
+        applySettings(
+            fontIdx = state.fontIndex,
+            sizeSp = state.fontSizeSp,
+            gapDp = state.wordGapDp,
+            textColor = state.gridTextColor,
+            bgCol = state.bgColor,
+            mode = state.inputMode,
+            images = copyInsertedImagesState(),
+            selectedImageIndex = activeImageIndex
+        )
+
+        if (inputMode != InputMode.SCATTER) reflowColumnData(numRows)
+        placeFrontierMarker()
+        refreshGrid()
+        updateUndoRedoButtons()
+    }
+
+    private fun updateUndoRedoButtons() {
+        undoButton?.setTextColor(getColor(
+            if (editorViewModel.canUndo()) R.color.text_dark else R.color.text_hint))
+        redoButton?.setTextColor(getColor(
+            if (editorViewModel.canRedo()) R.color.text_dark else R.color.text_hint))
+    }
 
     // Applies all per-session settings to data model + live UI controls.
     // Does NOT call rebuildGrid — caller is responsible.
@@ -1765,7 +2083,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         textColor: Int = gridTextColor,
         bgCol: Int = bgColor,
         imgUri: String? = bgImageUri,
-        mode: InputMode = inputMode
+        imgMatrixValues: FloatArray? = null,
+        mode: InputMode = inputMode,
+        images: List<InsertedImageState> = copyInsertedImagesState(),
+        selectedImageIndex: Int = activeImageIndex
     ) {
         fontIndex = fontIdx.coerceIn(0, fontCatalogue.size - 1)
         selectedTypeface = fontCatalogue[fontIndex].typeface
@@ -1775,72 +2096,77 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         bgColor = bgCol
         inputMode = mode
 
+        insertedImages.clear()
+        insertedImages.addAll(images.take(MAX_INSERTED_IMAGES).map {
+            InsertedImageState(it.uri, cloneMatrix(it.matrix))
+        })
+
+        if (insertedImages.isEmpty() && !imgUri.isNullOrEmpty()) {
+            insertedImages.add(InsertedImageState(imgUri, cloneMatrix(imgMatrixValues)))
+        }
+        activeImageIndex = selectedImageIndex.coerceIn(-1, insertedImages.lastIndex)
+        if (activeImageIndex < 0 && insertedImages.isNotEmpty()) activeImageIndex = 0
+
         fontSpinnerRef?.setSelection(fontIndex)
         fontSizeLabelRef?.text = fontSizeSp.toInt().toString()
         gapValueLabelRef?.text = wordGapDp.toInt().toString()
 
         applyTextColor(gridTextColor)
         refreshModeChips()
-
-        if (!imgUri.isNullOrEmpty()) {
-            loadBgImageFromUri(imgUri)
-        } else {
-            bgImageUri = null
-            bgImageView?.visibility = View.GONE
-            rootFrame.setBackgroundColor(bgColor)
-        }
+        rootFrame.setBackgroundColor(bgColor)
+        syncActiveImageFromList()
+        refreshInsertedImagePanel()
     }
 
-    private fun saveSession(id: String, name: String) {
-        SessionManager.saveSession(filesDir, id, name, columnData, columnBreaks,
-            fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri, inputMode.name)
-        currentSessionId = id; currentSessionName = name
+    private fun saveSession() {
+        updateActiveImageRuntimeState()
+        editorViewModel.saveSession(currentSessionId, currentSessionName, columnData, columnBreaks,
+            fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
+            getBgImageMatrixValues(), inputMode.name, copyInsertedImagesState(), activeImageIndex)
     }
 
     private fun loadSessionFile(id: String) {
         if (id == currentSessionId) return
-        saveSession(currentSessionId, currentSessionName)
-        val j = SessionManager.loadSession(filesDir, id) ?: return
+        saveSession()
+        val j = editorViewModel.loadSessionJson(id) ?: return
         loadColumnDataFromJson(j.getJSONArray("columnData"))
         loadColumnBreaksFromJson(j.getJSONArray("columnBreaks"))
         currentSessionId = id; currentSessionName = j.getString("name")
+        updateToolbarSessionName()
+
+        val matArr = j.optJSONArray("bgImageMatrix")
+        val matValues = if (matArr != null && matArr.length() == 9)
+            FloatArray(9) { i -> matArr.getDouble(i).toFloat() } else null
+
+        val loadedImages = parseInsertedImages(j.optJSONArray("insertedImages"))
+        val legacyUri = j.optString("bgImageUri", "").ifEmpty { null }
+        if (loadedImages.isEmpty() && !legacyUri.isNullOrEmpty()) {
+            loadedImages.add(InsertedImageState(legacyUri, cloneMatrix(matValues)))
+        }
+        val loadedActiveIndex = j.optInt("activeImageIndex", if (loadedImages.isNotEmpty()) 0 else -1)
+
         applySettings(
-            fontIdx   = j.optInt("fontIndex", fontIndex),
-            sizeSp    = j.optDouble("fontSizeSp", fontSizeSp.toDouble()).toFloat(),
-            gapDp     = j.optDouble("wordGapDp", wordGapDp.toDouble()).toFloat(),
-            textColor = j.optInt("gridTextColor", gridTextColor),
-            bgCol     = j.optInt("bgColor", bgColor),
-            imgUri    = j.optString("bgImageUri", "").ifEmpty { null },
-            mode      = when (j.optString("inputMode", inputMode.name)) {
-                "SCATTER" -> InputMode.SCATTER; else -> InputMode.SEQUENTIAL }
+            fontIdx        = j.optInt("fontIndex", fontIndex),
+            sizeSp         = j.optDouble("fontSizeSp", fontSizeSp.toDouble()).toFloat(),
+            gapDp          = j.optDouble("wordGapDp", wordGapDp.toDouble()).toFloat(),
+            textColor      = j.optInt("gridTextColor", gridTextColor),
+            bgCol          = j.optInt("bgColor", bgColor),
+            imgUri         = legacyUri,
+            imgMatrixValues = matValues,
+            mode           = when (j.optString("inputMode", inputMode.name)) {
+                "SCATTER" -> InputMode.SCATTER; else -> InputMode.SEQUENTIAL },
+            images = loadedImages,
+            selectedImageIndex = loadedActiveIndex
         )
+        editorViewModel.clearHistory(); updateUndoRedoButtons()
         needsReflow = true; rebuildGrid()
     }
-
-    private fun deleteSession(id: String) {
-        SessionManager.deleteSession(filesDir, id)
-        if (currentSessionId == id) { currentSessionId = java.util.UUID.randomUUID().toString() }
-    }
-
-    private fun newSession() {
-        saveSession(currentSessionId, currentSessionName)  // auto-save current before creating new
-        clearDocumentContent()
-        currentSessionId = java.util.UUID.randomUUID().toString()
-        currentSessionName = nextNewSessionName()
-        applySettings(
-            fontIdx = 0, sizeSp = 24f, gapDp = 3f,
-            textColor = Color.BLACK, bgCol = Color.WHITE, imgUri = null,
-            mode = InputMode.SEQUENTIAL
-        )
-        needsReflow = true; rebuildGrid()
-    }
-
-    private fun nextNewSessionName(): String = SessionManager.nextNewSessionName(filesDir)
 
     private fun ensureDefaultSession() {
-        SessionManager.ensureDefaultSession(filesDir, currentSessionId, currentSessionName,
+        editorViewModel.ensureDefaultSession(currentSessionId, currentSessionName,
             columnData, columnBreaks, fontIndex, fontSizeSp, wordGapDp,
-            gridTextColor, bgColor, bgImageUri, inputMode.name)
+            gridTextColor, bgColor, bgImageUri, getBgImageMatrixValues(), inputMode.name,
+            copyInsertedImagesState(), activeImageIndex)
     }
 
     private fun refreshModeChips() {
@@ -1856,21 +2182,65 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     // occupied cell with a half-width space so auto-advance never skips a gap.
     private fun fillGapsForSequentialMode() {
         if (numRows <= 0) return
-        var firstIdx = -1; var lastIdx = -1
-        for (idx in 0 until numRows * numColumns) {
-            val c = idx / numRows; val r = idx % numRows
-            if ((columnData.getOrNull(c)?.getOrNull(r) ?: "").isNotEmpty()) {
-                if (firstIdx < 0) firstIdx = idx; lastIdx = idx
-            }
-        }
-        if (firstIdx < 0) return
+        val paraStarts = mutableListOf(0).also { it.addAll(columnBreaks.sorted()) }
         withRestoring {
-            for (idx in firstIdx..lastIdx) {
-                val c = idx / numRows; val r = idx % numRows
-                if ((columnData.getOrNull(c)?.getOrNull(r) ?: "").isEmpty()) setColumnChar(c, r, " ")
+            for (i in paraStarts.indices) {
+                val paraStart = paraStarts[i]
+                val paraEnd = if (i + 1 < paraStarts.size) paraStarts[i + 1] - 1 else numColumns - 1
+                var firstIdx = -1; var lastIdx = -1
+                for (col in paraStart..paraEnd) {
+                    val colData = columnData.getOrNull(col) ?: continue
+                    for (row in colData.indices) {
+                        if (colData[row].isNotEmpty()) {
+                            val idx = col * numRows + row
+                            if (firstIdx < 0) firstIdx = idx
+                            lastIdx = idx
+                        }
+                    }
+                }
+                if (firstIdx < 0) continue
+                for (idx in firstIdx..lastIdx) {
+                    val c = idx / numRows; val r = idx % numRows
+                    if ((columnData.getOrNull(c)?.getOrNull(r) ?: "").isEmpty()) setColumnChar(c, r, " ")
+                }
             }
         }
+        placeFrontierMarker()
         refreshGrid()
+    }
+
+    // Places a half-width space at the cell immediately after the last char of each
+    // paragraph in SEQUENTIAL mode. The marker makes the writing-frontier cell tappable
+    // (it's no longer empty, so the tap-redirect in CellInputController skips it) and
+    // typing onto a space cell goes through the existing insert-shift path, pushing the
+    // marker one cell forward automatically.
+    private fun placeFrontierMarker() {
+        if (inputMode != InputMode.SEQUENTIAL || numRows <= 0) return
+        val paraStarts = mutableListOf(0).also { it.addAll(columnBreaks.sorted()) }
+        withRestoring {
+            for (i in paraStarts.indices) {
+                val paraStart = paraStarts[i]
+                val paraEnd = if (i + 1 < paraStarts.size) paraStarts[i + 1] - 1 else numColumns - 1
+                var lastIdx = -1
+                for (col in paraStart..paraEnd) {
+                    val colData = columnData.getOrNull(col) ?: continue
+                    for (row in colData.indices) {
+                        if (colData[row].isNotEmpty()) lastIdx = col * numRows + row
+                    }
+                }
+                if (lastIdx < 0) continue
+                val nextIdx = lastIdx + 1
+                val nextCol = nextIdx / numRows
+                val nextRow = nextIdx % numRows
+                if (nextCol > paraEnd) continue
+                if ((columnData.getOrNull(nextCol)?.getOrNull(nextRow) ?: "").isEmpty()) {
+                    setColumnChar(nextCol, nextRow, " ")
+                    editTextFields.getOrNull(nextIdx)?.let { et ->
+                        if (et.text.toString() != " ") et.setText(" ")
+                    }
+                }
+            }
+        }
     }
 
     // ── ViewFactory.Callbacks ──────────────────────────────────────────
@@ -1880,12 +2250,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     override fun getWordGapDp(): Float = wordGapDp
     override fun getSelectedTypeface(): Typeface = selectedTypeface
     override fun getInputMode(): InputMode = inputMode
+    override fun getCurrentSessionName(): String = currentSessionName
 
     override fun onModeSelected(mode: InputMode) {
+        if (mode == inputMode) return
+        pushHistory()
         val previous = inputMode
         inputMode = mode
         refreshModeChips()
         if (mode == InputMode.SEQUENTIAL && previous == InputMode.SCATTER) fillGapsForSequentialMode()
+        persistCurrentState()
     }
 
     override fun onToolsToggle() { if (toolsVisible) switchToKeyboard() else switchToTools() }
@@ -1895,6 +2269,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
 
     override fun onFontSelected(pos: Int) {
         if (pos == fontIndex && editTextFields.isNotEmpty()) return
+        pushHistory()
         fontIndex = pos
         selectedTypeface = fontCatalogue[pos].typeface
         val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
@@ -1903,24 +2278,40 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             .measureText("測").roundToInt().coerceAtLeast(1) + gapPx).coerceAtLeast(1)
         if (newCellSize == currentCellSize && editTextFields.isNotEmpty()) {
             withRestoring { editTextFields.forEach { it.typeface = selectedTypeface } }
+            persistCurrentState()
         } else {
             needsReflow = true; rebuildGrid()
         }
     }
 
     override fun onFontSizeChanged(newSize: Float) {
+        if (newSize == fontSizeSp) return
+        pushHistory()
         fontSizeSp = newSize
         needsReflow = true; rebuildGrid()
     }
 
     override fun onWordGapChanged(newGap: Int) {
-        wordGapDp = newGap.toFloat()
+        val gap = newGap.toFloat()
+        if (gap == wordGapDp) return
+        pushHistory()
+        wordGapDp = gap
         needsReflow = true; rebuildGrid()
     }
 
-    override fun onBgColorSelected(color: Int) { applyBackground(color) }
-    override fun onImagePickerRequested() { imagePickerLauncher.launch(arrayOf("image/*")) }
-    override fun onTextColorSelected(color: Int) { applyTextColor(color) }
+    override fun onBgColorSelected(color: Int) {
+        if (color == bgColor) return
+        pushHistory()
+        applyBackground(color)
+    }
+    override fun onInsertImageRequested() { imagePickerLauncher.launch(arrayOf("image/*")) }
+    override fun onRemoveInsertedImage() { removeInsertedImage() }
+    override fun onTextColorSelected(color: Int) {
+        if (color == gridTextColor) return
+        pushHistory()
+        applyTextColor(color)
+        persistCurrentState()
+    }
 
     override fun onCopySelection() { copySelectedText() }
     override fun onCutSelection() { cutSelectedText() }
@@ -1946,9 +2337,15 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         tappedHandleIsStart = null
     }
 
-    override fun onRenameSession() { showRenameDialog() }
-    override fun onNewSession() { newSession(); refreshDocPanel() }
     override fun onShowAllSessions() {
-        sessionListLauncher.launch(Intent(this, SessionListActivity::class.java))
+        val intent = Intent(this, SessionListActivity::class.java)
+            .putExtra("current_session_id", currentSessionId)
+        sessionListLauncher.launch(intent)
     }
+
+    override fun onUndoAction() { performUndo() }
+    override fun onRedoAction() { performRedo() }
+    override fun onScreenshot() { takeScreenshot() }
+    override fun canUndo(): Boolean = editorViewModel.canUndo()
+    override fun canRedo(): Boolean = editorViewModel.canRedo()
 }

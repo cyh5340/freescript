@@ -1,5 +1,6 @@
 package com.poemeditor
 
+import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
@@ -11,38 +12,23 @@ import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.widget.NestedScrollView
 import kotlin.math.roundToInt
-import android.app.AlertDialog
-import java.io.File
 
 class SessionListActivity : AppCompatActivity() {
 
-    private data class SessionMeta(val id: String, val name: String, val lastAccessed: Long) {
-        fun formattedDate(): String {
-            val cal = java.util.Calendar.getInstance().also { it.timeInMillis = lastAccessed }
-            val now = java.util.Calendar.getInstance()
-            val sameDay = cal.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR) &&
-                cal.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR)
-            val sameYear = cal.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR)
-            return when {
-                sameDay  -> "今天"
-                sameYear -> "${cal.get(java.util.Calendar.MONTH) + 1}/${cal.get(java.util.Calendar.DAY_OF_MONTH)}"
-                else     -> "${cal.get(java.util.Calendar.YEAR)}/${cal.get(java.util.Calendar.MONTH) + 1}/${cal.get(java.util.Calendar.DAY_OF_MONTH)}"
-            }
-        }
-    }
-
-    private val sessionsDir get() = java.io.File(filesDir, "poems").also { it.mkdirs() }
     private lateinit var listContainer: LinearLayout
-    private var allSessions = listOf<SessionMeta>()
+    private var allSessions = listOf<SessionManager.SessionMeta>()
     private var searchQuery = ""
     private var dateFilter = "all"
+    private var activeSessionId: String? = null
+    private var renamedCurrentSessionName: String? = null
 
     private val MP = ViewGroup.LayoutParams.MATCH_PARENT
     private val WC = ViewGroup.LayoutParams.WRAP_CONTENT
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        allSessions = loadAllSessions()
+        activeSessionId = intent.getStringExtra("current_session_id")
+        allSessions = SessionManager.listSessions(filesDir)
         val dp = resources.displayMetrics.density
 
         listContainer = LinearLayout(this).apply {
@@ -62,7 +48,7 @@ class SessionListActivity : AppCompatActivity() {
                 setTextColor(Color.parseColor("#333333"))
                 setPadding((12 * dp).roundToInt(), 0, (16 * dp).roundToInt(), 0)
                 layoutParams = LinearLayout.LayoutParams(WC, WC)
-                setOnClickListener { finish() }
+                setOnClickListener { finishWithResult() }
             })
             addView(TextView(this@SessionListActivity).apply {
                 text = "所有文檔"
@@ -71,10 +57,18 @@ class SessionListActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
             })
             addView(TextView(this@SessionListActivity).apply {
-                text = "${allSessions.size} 篇"
-                textSize = 12f
-                setTextColor(Color.parseColor("#AAAAAA"))
+                text = "新增"
+                textSize = 13f
+                setTextColor(Color.parseColor("#333333"))
+                background = GradientDrawable().apply {
+                    setColor(Color.TRANSPARENT)
+                    setStroke((1f * dp).roundToInt(), Color.parseColor("#CCCCCC"))
+                    cornerRadius = 20f * dp
+                }
+                val hP = (14 * dp).roundToInt(); val vP = (5 * dp).roundToInt()
+                setPadding(hP, vP, hP, vP)
                 layoutParams = LinearLayout.LayoutParams(WC, WC)
+                setOnClickListener { createNewSession() }
             })
         }
 
@@ -105,8 +99,6 @@ class SessionListActivity : AppCompatActivity() {
             })
         }
 
-        val filterRow = buildFilterRow(dp)
-
         val scrollView = NestedScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
             isFillViewport = true
@@ -125,7 +117,7 @@ class SessionListActivity : AppCompatActivity() {
                 setBackgroundColor(Color.parseColor("#E0E0E0"))
             })
             addView(searchEdit)
-            addView(filterRow)
+            addView(buildFilterRow(dp))
             addView(View(this@SessionListActivity).apply {
                 layoutParams = LinearLayout.LayoutParams(MP, (1f * dp).roundToInt())
                 setBackgroundColor(Color.parseColor("#E0E0E0"))
@@ -134,6 +126,21 @@ class SessionListActivity : AppCompatActivity() {
         })
 
         applyFilters()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() { finishWithResult() }
+
+    private fun finishWithResult(openSessionId: String? = null) {
+        val intent = Intent()
+        if (openSessionId != null) intent.putExtra("session_id", openSessionId)
+        val renamed = renamedCurrentSessionName
+        if (renamed != null) intent.putExtra("renamed_current_name", renamed)
+        setResult(
+            if (openSessionId != null || renamed != null) RESULT_OK else RESULT_CANCELED,
+            intent
+        )
+        finish()
     }
 
     private fun buildFilterRow(dp: Float): LinearLayout {
@@ -176,28 +183,6 @@ class SessionListActivity : AppCompatActivity() {
             }
         }
     }
-    
-    private fun showDeleteConfirmDialog(meta: SessionMeta) {
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("刪除文檔")
-            .setMessage("確定要刪除「${meta.name}」嗎？此操作無法復原。")
-            .setPositiveButton("確定") { _, _ ->
-                // 執行刪除
-                val file = File(sessionsDir, "${meta.id}.json")
-                if (file.exists()) file.delete()
-                
-                // 重新載入列表
-                allSessions = loadAllSessions()
-                applyFilters()
-                Toast.makeText(this, "已刪除", Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton("取消", null)
-            .show()
-
-        // 依照你的要求，將按鈕文字變為黑色
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(Color.BLACK)
-        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(Color.BLACK)
-    }
 
     private fun applyFilters() {
         val now = System.currentTimeMillis()
@@ -215,7 +200,7 @@ class SessionListActivity : AppCompatActivity() {
         rebuildList(filtered)
     }
 
-    private fun rebuildList(sessions: List<SessionMeta>) {
+    private fun rebuildList(sessions: List<SessionManager.SessionMeta>) {
         listContainer.removeAllViews()
         val dp = resources.displayMetrics.density
         if (sessions.isEmpty()) {
@@ -229,39 +214,40 @@ class SessionListActivity : AppCompatActivity() {
             return
         }
         sessions.forEach { meta ->
+            val isActive = meta.id == activeSessionId
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 layoutParams = LinearLayout.LayoutParams(MP, (52 * dp).roundToInt())
-                setPadding((16 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0) // 調整 padding 給按鈕
-                setOnClickListener {
-                    setResult(RESULT_OK, Intent().putExtra("session_id", meta.id))
-                    finish()
-                }
+                setPadding((16 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0)
+                setOnClickListener { finishWithResult(meta.id) }
             }
+
             row.addView(TextView(this).apply {
-                text = meta.name; textSize = 15f
-                setTextColor(Color.parseColor("#111111"))
+                text = if (isActive) "${meta.name}（目前）" else meta.name
+                textSize = 15f
+                setTextColor(if (isActive) Color.parseColor("#3F51B5") else Color.parseColor("#111111"))
                 layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
             })
             row.addView(TextView(this).apply {
                 text = meta.formattedDate(); textSize = 12f
                 setTextColor(Color.parseColor("#AAAAAA"))
-                layoutParams = LinearLayout.LayoutParams(WC, WC)
-            })
-            
-            // --- 加入刪除按鈕 ---
-            row.addView(TextView(this).apply {
-                text = "✕"; textSize = 18f; gravity = Gravity.CENTER
-                setTextColor(Color.parseColor("#DDDDDD"))
-                layoutParams = LinearLayout.LayoutParams((44 * dp).roundToInt(), (44 * dp).roundToInt())
-                setOnClickListener { e ->
-                    // 阻止事件傳遞給 row (不觸發讀取文件)
-                    e.cancelPendingInputEvents() 
-                    showDeleteConfirmDialog(meta)
+                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                    it.marginEnd = (4 * dp).roundToInt()
                 }
             })
-            // ------------------
+            row.addView(TextView(this).apply {
+                text = "✏"; textSize = 16f; gravity = Gravity.CENTER
+                setTextColor(Color.parseColor("#888888"))
+                layoutParams = LinearLayout.LayoutParams((40 * dp).roundToInt(), (44 * dp).roundToInt())
+                setOnClickListener { showRenameDialog(meta) }
+            })
+            row.addView(TextView(this).apply {
+                text = "🗑"; textSize = 16f; gravity = Gravity.CENTER
+                setTextColor(Color.parseColor("#E53935"))
+                layoutParams = LinearLayout.LayoutParams((40 * dp).roundToInt(), (44 * dp).roundToInt())
+                setOnClickListener { showDeleteConfirmDialog(meta) }
+            })
 
             listContainer.addView(row)
             listContainer.addView(View(this).apply {
@@ -273,13 +259,76 @@ class SessionListActivity : AppCompatActivity() {
         }
     }
 
-    private fun loadAllSessions(): List<SessionMeta> =
-        (sessionsDir.listFiles { f -> f.extension == "json" } ?: emptyArray())
-            .mapNotNull { file ->
-                try {
-                    val j = org.json.JSONObject(file.readText())
-                    SessionMeta(j.getString("id"), j.getString("name"), j.getLong("lastAccessed"))
-                } catch (_: Exception) { null }
+    private fun createNewSession() {
+        val dp = resources.displayMetrics.density
+        val defaultName = SessionManager.nextNewSessionName(filesDir)
+        val editText = EditText(this).apply {
+            setText(defaultName); setSingleLine(); selectAll()
+            setPadding((16 * dp).roundToInt(), (12 * dp).roundToInt(),
+                       (16 * dp).roundToInt(), (12 * dp).roundToInt())
+        }
+        AlertDialog.Builder(this)
+            .setTitle("新增文檔")
+            .setView(editText)
+            .setPositiveButton("確定") { _, _ ->
+                val name = editText.text.toString().trim().ifEmpty { defaultName }
+                val newId = java.util.UUID.randomUUID().toString()
+                SessionManager.saveSession(
+                    filesDir = filesDir, id = newId, name = name,
+                    columnData = emptyList(), columnBreaks = emptySet(),
+                    fontIndex = 0, fontSizeSp = 24f, wordGapDp = 3f,
+                    gridTextColor = android.graphics.Color.BLACK,
+                    bgColor = android.graphics.Color.WHITE,
+                    bgImageUri = null, bgImageMatrixValues = null,
+                    inputMode = "SEQUENTIAL"
+                )
+                finishWithResult(newId)
             }
-            .sortedByDescending { it.lastAccessed }
+            .setNegativeButton("取消", null)
+            .show().also { dialog ->
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(Color.BLACK)
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(Color.BLACK)
+            }
+    }
+
+    private fun showRenameDialog(meta: SessionManager.SessionMeta) {
+        val dp = resources.displayMetrics.density
+        val editText = EditText(this).apply {
+            setText(meta.name); setSingleLine(); selectAll()
+            setPadding((16 * dp).roundToInt(), (12 * dp).roundToInt(),
+                       (16 * dp).roundToInt(), (12 * dp).roundToInt())
+        }
+        AlertDialog.Builder(this)
+            .setTitle("重新命名")
+            .setView(editText)
+            .setPositiveButton("確定") { _, _ ->
+                val newName = editText.text.toString().trim().ifEmpty { meta.name }
+                SessionManager.renameSession(filesDir, meta.id, newName)
+                if (meta.id == activeSessionId) renamedCurrentSessionName = newName
+                allSessions = SessionManager.listSessions(filesDir)
+                applyFilters()
+            }
+            .setNegativeButton("取消", null)
+            .show().also { dialog ->
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(Color.BLACK)
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(Color.BLACK)
+            }
+    }
+
+    private fun showDeleteConfirmDialog(meta: SessionManager.SessionMeta) {
+        AlertDialog.Builder(this)
+            .setTitle("刪除文檔")
+            .setMessage("確定要刪除「${meta.name}」嗎？此操作無法復原。")
+            .setPositiveButton("確定") { _, _ ->
+                SessionManager.deleteSession(filesDir, meta.id)
+                allSessions = SessionManager.listSessions(filesDir)
+                applyFilters()
+                Toast.makeText(this, "已刪除", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("取消", null)
+            .show().also { dialog ->
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(Color.BLACK)
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(Color.BLACK)
+            }
+    }
 }

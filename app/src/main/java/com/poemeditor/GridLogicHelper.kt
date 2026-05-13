@@ -52,6 +52,15 @@ object GridLogicHelper {
             c++; rStart = 0
         }
         while (flat.isNotEmpty() && flat.last().isBlank()) flat.removeLast()
+        var blankBudget = newChars.length
+        val shifted = ArrayList<String>(flat.size)
+        for (ch in flat) {
+            if (blankBudget > 0 && ch.isBlank()) {
+                blankBudget--
+                continue
+            }
+            shifted.add(ch)
+        }
 
         c = insertCol; rStart = insertRow
         while (c < maxColumns) {
@@ -68,7 +77,7 @@ object GridLogicHelper {
             setColumnChar(columnData, wc, wr, ch.toString())
             wr++; if (wr >= numRows) { wr = 0; wc++ }
         }
-        for (ch in flat) {
+        for (ch in shifted) {
             if (wc >= maxColumns) break
             if (wc > insertCol && columnBreaks.contains(wc)) break
             setColumnChar(columnData, wc, wr, ch)
