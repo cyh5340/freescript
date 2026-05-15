@@ -96,6 +96,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private val previewCells = mutableListOf<Int>()
     private var hScroll: HorizontalScrollView? = null
     private val MAX_COLUMNS = 50
+    // Zero-width space used as the SEQUENTIAL writing-frontier marker. It occupies a cell
+    // (so the cell is non-empty and tappable, bypassing the empty-tap redirect) but renders
+    // with no visible width. Distinct from " " (gap-fill space) so we can safely sweep stale
+    // markers without touching real spaces.
+    private val FRONTIER_MARKER = "\u200B"
     private var currentCellSize = 0
     private var focusedCellIndex = -1  // index of EditText with current focus highlight, -1 = none
     private var cursorBefore    = false // true = insert BEFORE focused cell, false = insert AFTER
@@ -110,6 +115,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private var toolsVisible = false     // true when allToolsPanel is showing instead of keyboard
     private val translateHandler by lazy { Handler(Looper.getMainLooper()) }
     private var translateRunnable: Runnable? = null
+    private val historyBurstHandler = Handler(Looper.getMainLooper())
+    private var historyBurstReset: Runnable? = null
+    private var historyBurstActive = false
 
     // ── Selection state ────────────────────────────────────────────────
     private var isSelecting      = false
@@ -362,7 +370,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     // showKeyboard: true  = open IME and re-bind it; false = keep IME closed (style rebuilds).
     // No Paint or Canvas work — purely a data + focus update.
     private fun focusCell(index: Int, cursorBefore: Boolean = true, showKeyboard: Boolean = true) {
-        gridEditorController.ensureColumnBuilt(index / numRows.coerceAtLeast(1))
+        // SCATTER freezes the canvas: never extend the built-column range; if the index
+        // lands in an unbuilt column the focus request is dropped silently.
+        if (inputMode != InputMode.SCATTER) {
+            gridEditorController.ensureColumnBuilt(index / numRows.coerceAtLeast(1))
+        }
         val et = editTextFields.getOrNull(index) ?: return
         this.cursorBefore = cursorBefore
         if (!isSelecting) editTextFields.getOrNull(focusedCellIndex)?.setBackgroundColor(Color.TRANSPARENT)
@@ -1169,6 +1181,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     // Diffs each cell against columnData and only calls setText when the value changed,
     // keeping every EditText instance alive so the IMM never loses its focus target.
     private fun refreshGrid() {
+        // Re-anchor the SEQUENTIAL writing-frontier marker. Insert-shift paths (typing
+        // onto the marker) trim the marker as a trailing blank; this restores it so the
+        // tap redirect can find the writing frontier again.
+        placeFrontierMarker()
         clearComposingPreview()
         focusedCellIndex = -1
         val builtColCount = if (numRows > 0) editTextFields.size / numRows else 0
@@ -1306,6 +1322,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun ensureBufferColumn() {
+        // SCATTER never grows the canvas; new content stays within the existing built range.
+        if (inputMode == InputMode.SCATTER) return
         // Ensure there is at least one empty column beyond the last data column.
         val neededCol = columnData.size.coerceIn(0, MAX_COLUMNS - 1)
         gridEditorController.ensureColumnBuilt(neededCol)
@@ -1382,6 +1400,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         }
         hScroll?.setOnScrollChangeListener { _, scrollX, _, _, _ ->
             if (isSelecting) repositionHandles()
+            // SCATTER freezes the built range; scrolling reveals the empty skeleton but
+            // never grows the canvas. SEQUENTIAL keeps growing it lazily.
+            if (inputMode == InputMode.SCATTER) return@setOnScrollChangeListener
             // Build columns as the user scrolls into unbuilt territory.
             val cs = currentCellSize.takeIf { it > 0 } ?: return@setOnScrollChangeListener
             val gw = MAX_COLUMNS * cs
@@ -1560,11 +1581,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             },
             getLastKeyboardHeight = { lastKeyboardHeight },
             setMainScrollPaddingBottom = { mainScrollView.setPadding(0, 0, 0, it) },
-            getNumColumns = { numColumns },
             getNumRows = { numRows },
-            getEditFieldAt = { editTextFields.getOrNull(it) },
             focusCell = { focusCell(it, showKeyboard = true) },
-            scrollToColumn = { scrollToColumn(it) }
+            scrollToColumn = { scrollToColumn(it) },
+            findSequentialTapTarget = { findSequentialTapTarget(it) }
         )
 
         // Key handler for Enter and DEL (hardware keyboard + many soft keyboards).
@@ -1621,10 +1641,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                 if (stillComposing) return
                 clearComposingPreview()
                 val raw = editable?.toString() ?: return
-                pushHistory()
                 val cellCol = index / numRows
                 val cellRow = index % numRows
                 if (raw.isEmpty()) {
+                    pushHistoryBreakingBurst()
                     val originalChar = columnData.getOrNull(cellCol)?.getOrNull(cellRow) ?: ""
                     // Island: non-blank cell backspace-deletes with reflow regardless of mode.
                     if (originalChar.isNotEmpty() && (inputMode == InputMode.SEQUENTIAL || originalChar.isNotBlank())) {
@@ -1646,6 +1666,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                 if (text.contains('\n') && text.count { it == '\n' } == 1) {
                     val withoutBreak = text.replace("\n", "")
                     if (withoutBreak == originalChar || (originalChar.isEmpty() && withoutBreak.isEmpty())) {
+                        pushHistoryBreakingBurst()
                         suppress = true
                         editable.replace(0, editable.length, originalChar)
                         gridContainer.post { insertColumnBreak(cellCol, cellRow) }
@@ -1655,6 +1676,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
 
                 if (inputMode == InputMode.SCATTER && originalChar.isNotEmpty()
                         && text.length > 1 && !text.contains('\n')) {
+                    pushHistoryBreakingBurst()
                     if (originalChar.isNotBlank()) {
                         // Island: multi-char commit on a non-blank cell → insert-shift.
                         val newChars: String? = when {
@@ -1688,6 +1710,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                 }
 
                 if (text.length > 1 || text.contains('\n')) {
+                    pushHistoryBreakingBurst()
                     // ── Insert-shift (SEQUENTIAL only) ────────────────────────────────
                     if (text.length >= 2 && !text.contains('\n')
                             && originalChar.isNotEmpty() && inputMode == InputMode.SEQUENTIAL) {
@@ -1742,6 +1765,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                     }
 
                     if (charIdx < text.length) {
+                        // SCATTER caps paste at the last built column; SEQUENTIAL grows freely.
+                        val maxCol = if (inputMode == InputMode.SCATTER && numRows > 0)
+                            (editTextFields.size / numRows - 1).coerceAtLeast(0)
+                        else MAX_COLUMNS - 1
                         suppress = true
                         editable.replace(0, editable.length, text[charIdx].toString())
                         setColumnChar(pCol, pRow, text[charIdx].toString())
@@ -1749,11 +1776,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                         if (pRow >= numRows) { pRow = 0; pCol++ }
 
                         withRestoring {
-                            while (charIdx < text.length && pCol < MAX_COLUMNS) {
+                            while (charIdx < text.length && pCol <= maxCol) {
                                 val ch = text[charIdx++]
                                 if (ch == '\n') { pCol++; pRow = 0; columnBreaks.add(pCol); continue }
                                 if (pRow >= numRows) { pRow = 0; pCol++ }
-                                if (pCol >= MAX_COLUMNS) break
+                                if (pCol > maxCol) break
                                 setColumnChar(pCol, pRow, ch.toString())
                                 pRow++
                             }
@@ -1776,6 +1803,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                 } else {
                     // Island: non-blank occupied cell in SCATTER → insert-shift.
                     if (inputMode == InputMode.SCATTER && originalChar.isNotBlank()) {
+                        pushHistoryBreakingBurst()
                         val before = focusedCellIndex == index && cursorBefore
                         val focusTarget = performInsert(index, raw) ?: run {
                             suppress = true; editable.replace(0, editable.length, originalChar); return
@@ -1785,6 +1813,12 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                             if (before) raw else originalChar)
                         postRefreshFocusColumn(focusTarget)
                     } else {
+                        // Fast path: single char into an empty/space cell.
+                        // Debounce history (only snapshot at start of each burst).
+                        // advanceToNextCell must stay synchronous — deferring it via post
+                        // would leave the IME on the current cell, causing the next
+                        // keystroke to overwrite this cell instead of advancing.
+                        maybePushHistoryForTyping()
                         setColumnChar(cellCol, cellRow, raw)
                         ensureBufferColumn()
                         advanceToNextCell(index, editTextFields.size)
@@ -2028,6 +2062,28 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         updateUndoRedoButtons()
     }
 
+    // Captures the pre-burst state on the FIRST keystroke of a typing burst, then
+    // suppresses pushHistory() for subsequent keystrokes until the user pauses ≥1 s.
+    // Structural operations (delete, paste, Enter, insert-shift) call
+    // pushHistoryBreakingBurst() instead, which always pushes and resets the burst so
+    // the next typing run starts a fresh undo entry.
+    private fun maybePushHistoryForTyping() {
+        if (!historyBurstActive) {
+            pushHistory()
+            historyBurstActive = true
+        }
+        historyBurstReset?.let { historyBurstHandler.removeCallbacks(it) }
+        historyBurstReset = Runnable { historyBurstActive = false }
+            .also { historyBurstHandler.postDelayed(it, 1_000L) }
+    }
+
+    private fun pushHistoryBreakingBurst() {
+        historyBurstActive = false
+        historyBurstReset?.let { historyBurstHandler.removeCallbacks(it) }
+        historyBurstReset = null
+        pushHistory()
+    }
+
     private fun performUndo() {
         val state = editorViewModel.undo(snapshotState()) ?: return
         restoreHistoryState(state)
@@ -2178,8 +2234,14 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         }
     }
 
-    // When switching SCATTER → SEQUENTIAL, fill empty slots between first and last
-    // occupied cell with a half-width space so auto-advance never skips a gap.
+    // When switching SCATTER → SEQUENTIAL, lay out each paragraph as:
+    //   • For each column that holds content: fill rows 0..lastOccupiedRow with a
+    //     half-width space wherever empty, then place one line-ending space at
+    //     lastOccupiedRow + 1 (if within the column). Cells beyond that stay empty.
+    //   • Empty columns sandwiched between content columns: a single line-ending
+    //     space at row 0; rows 1..numRows-1 stay empty.
+    //   • Empty columns outside the content span (before the first content column
+    //     or after the last) are left entirely empty.
     private fun fillGapsForSequentialMode() {
         if (numRows <= 0) return
         val paraStarts = mutableListOf(0).also { it.addAll(columnBreaks.sorted()) }
@@ -2187,33 +2249,54 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             for (i in paraStarts.indices) {
                 val paraStart = paraStarts[i]
                 val paraEnd = if (i + 1 < paraStarts.size) paraStarts[i + 1] - 1 else numColumns - 1
-                var firstIdx = -1; var lastIdx = -1
+
+                var firstContentCol = -1
+                var lastContentCol = -1
                 for (col in paraStart..paraEnd) {
                     val colData = columnData.getOrNull(col) ?: continue
-                    for (row in colData.indices) {
-                        if (colData[row].isNotEmpty()) {
-                            val idx = col * numRows + row
-                            if (firstIdx < 0) firstIdx = idx
-                            lastIdx = idx
+                    if (colData.any { it.isNotEmpty() }) {
+                        if (firstContentCol < 0) firstContentCol = col
+                        lastContentCol = col
+                    }
+                }
+                if (firstContentCol < 0) continue
+
+                for (col in paraStart..paraEnd) {
+                    val colData = columnData.getOrNull(col)
+                    val hasContent = colData != null && colData.any { it.isNotEmpty() }
+                    if (hasContent) {
+                        var lastOccRow = -1
+                        for (row in colData!!.indices) {
+                            if (colData[row].isNotEmpty()) lastOccRow = row
+                        }
+                        for (row in 0..lastOccRow) {
+                            if ((columnData.getOrNull(col)?.getOrNull(row) ?: "").isEmpty()) {
+                                setColumnChar(col, row, " ")
+                            }
+                        }
+                        if (lastOccRow + 1 < numRows &&
+                            (columnData.getOrNull(col)?.getOrNull(lastOccRow + 1) ?: "").isEmpty()) {
+                            setColumnChar(col, lastOccRow + 1, FRONTIER_MARKER)
+                        }
+                    } else if (col in (firstContentCol + 1)..(lastContentCol - 1)) {
+                        if ((columnData.getOrNull(col)?.getOrNull(0) ?: "").isEmpty()) {
+                            setColumnChar(col, 0, FRONTIER_MARKER)
                         }
                     }
                 }
-                if (firstIdx < 0) continue
-                for (idx in firstIdx..lastIdx) {
-                    val c = idx / numRows; val r = idx % numRows
-                    if ((columnData.getOrNull(c)?.getOrNull(r) ?: "").isEmpty()) setColumnChar(c, r, " ")
-                }
             }
         }
-        placeFrontierMarker()
         refreshGrid()
     }
 
-    // Places a half-width space at the cell immediately after the last char of each
-    // paragraph in SEQUENTIAL mode. The marker makes the writing-frontier cell tappable
-    // (it's no longer empty, so the tap-redirect in CellInputController skips it) and
-    // typing onto a space cell goes through the existing insert-shift path, pushing the
-    // marker one cell forward automatically.
+    // Maintains exactly one FRONTIER_MARKER per SEQUENTIAL paragraph at the cell
+    // immediately after the paragraph's last real-content cell.
+    //   1. Locate the last cell whose content is neither empty nor a marker.
+    //   2. Any FRONTIER_MARKER positioned before that frontier is "stale" (the user
+    //      typed past it via the redirect); demote it to a regular space so it acts
+    //      as a gap-filler instead of leaving a hole.
+    //   3. Place a fresh FRONTIER_MARKER at frontier, unless one already sits there.
+    // Idempotent — safe to call after any content mutation.
     private fun placeFrontierMarker() {
         if (inputMode != InputMode.SEQUENTIAL || numRows <= 0) return
         val paraStarts = mutableListOf(0).also { it.addAll(columnBreaks.sorted()) }
@@ -2221,26 +2304,84 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             for (i in paraStarts.indices) {
                 val paraStart = paraStarts[i]
                 val paraEnd = if (i + 1 < paraStarts.size) paraStarts[i + 1] - 1 else numColumns - 1
-                var lastIdx = -1
+
+                var lastRealIdx = -1
                 for (col in paraStart..paraEnd) {
                     val colData = columnData.getOrNull(col) ?: continue
                     for (row in colData.indices) {
-                        if (colData[row].isNotEmpty()) lastIdx = col * numRows + row
+                        val ch = colData[row]
+                        if (ch.isNotEmpty() && ch != FRONTIER_MARKER) {
+                            lastRealIdx = col * numRows + row
+                        }
                     }
                 }
-                if (lastIdx < 0) continue
-                val nextIdx = lastIdx + 1
-                val nextCol = nextIdx / numRows
-                val nextRow = nextIdx % numRows
-                if (nextCol > paraEnd) continue
-                if ((columnData.getOrNull(nextCol)?.getOrNull(nextRow) ?: "").isEmpty()) {
-                    setColumnChar(nextCol, nextRow, " ")
-                    editTextFields.getOrNull(nextIdx)?.let { et ->
-                        if (et.text.toString() != " ") et.setText(" ")
+                if (lastRealIdx < 0) continue
+                val frontierIdx = lastRealIdx + 1
+                val frontierCol = frontierIdx / numRows
+                val frontierRow = frontierIdx % numRows
+                if (frontierCol > paraEnd) continue
+
+                // Demote any stale markers sitting before the new frontier.
+                for (col in paraStart..paraEnd) {
+                    val colData = columnData.getOrNull(col) ?: continue
+                    for (row in colData.indices) {
+                        if (colData[row] == FRONTIER_MARKER) {
+                            val idx = col * numRows + row
+                            if (idx < frontierIdx) {
+                                setColumnChar(col, row, " ")
+                                editTextFields.getOrNull(idx)?.let { et ->
+                                    if (et.text.toString() != " ") et.setText(" ")
+                                }
+                            }
+                        }
                     }
                 }
+
+                val currentAtFrontier = columnData.getOrNull(frontierCol)?.getOrNull(frontierRow) ?: ""
+                if (currentAtFrontier.isEmpty()) {
+                    setColumnChar(frontierCol, frontierRow, FRONTIER_MARKER)
+                    editTextFields.getOrNull(frontierIdx)?.let { et ->
+                        if (et.text.toString() != FRONTIER_MARKER) et.setText(FRONTIER_MARKER)
+                    }
+                }
+                // If currentAtFrontier is FRONTIER_MARKER or non-empty content, no-op.
             }
         }
+    }
+
+    // Resolves the SEQUENTIAL tap target when the user taps an empty cell.
+    //   1. Tapped column has a FRONTIER_MARKER → land on the marker (writing frontier).
+    //   2. Tapped column is empty → scan rightward (decreasing col index) within the
+    //      same paragraph for the closest column that holds a FRONTIER_MARKER.
+    //   3. Nothing reachable AND the whole document is empty → land at the paragraph
+    //      start (paraStart row 0), so the user begins writing at the natural origin.
+    //   4. Otherwise return -1 (no redirect — let the tap land where the user clicked).
+    private fun findSequentialTapTarget(tappedIndex: Int): Int {
+        if (numRows <= 0) return -1
+        val tappedCol = tappedIndex / numRows
+        val sortedBreaks = columnBreaks.sorted()
+        val paraStart = sortedBreaks.lastOrNull { it <= tappedCol } ?: 0
+
+        val tappedColData = columnData.getOrNull(tappedCol)
+        if (tappedColData != null) {
+            for (row in tappedColData.indices) {
+                if (tappedColData[row] == FRONTIER_MARKER) return tappedCol * numRows + row
+            }
+        }
+
+        for (col in (tappedCol - 1) downTo paraStart) {
+            val colData = columnData.getOrNull(col) ?: continue
+            for (row in colData.indices) {
+                if (colData[row] == FRONTIER_MARKER) return col * numRows + row
+            }
+        }
+
+        val paragraphHasContent = (paraStart..tappedCol).any { col ->
+            columnData.getOrNull(col)?.any { it.isNotEmpty() } == true
+        }
+        if (!paragraphHasContent) return paraStart * numRows
+
+        return -1
     }
 
     // ── ViewFactory.Callbacks ──────────────────────────────────────────

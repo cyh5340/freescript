@@ -20,11 +20,10 @@ class CellInputController {
         dismissToolsPanel: () -> Unit,
         getLastKeyboardHeight: () -> Int,
         setMainScrollPaddingBottom: (Int) -> Unit,
-        getNumColumns: () -> Int,
         getNumRows: () -> Int,
-        getEditFieldAt: (Int) -> EditText?,
         focusCell: (Int) -> Unit,
-        scrollToColumn: (Int) -> Unit
+        scrollToColumn: (Int) -> Unit,
+        findSequentialTapTarget: (Int) -> Int
     ) {
         et.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_UP) {
@@ -55,20 +54,8 @@ class CellInputController {
                 }
 
                 if (getInputMode() == InputMode.SEQUENTIAL && et.text.isEmpty()) {
-                    var searchCol = 0
-                    var target = -1
-                    val numColumns = getNumColumns()
                     val numRows = getNumRows()
-                    while (searchCol < numColumns) {
-                        val emptyRow = (0 until numRows).firstOrNull { r ->
-                            getEditFieldAt(searchCol * numRows + r)?.text?.isEmpty() == true
-                        }
-                        if (emptyRow != null) {
-                            target = searchCol * numRows + emptyRow
-                            break
-                        }
-                        searchCol++
-                    }
+                    val target = findSequentialTapTarget(index)
                     if (target >= 0 && target != index) {
                         focusCell(target)
                         scrollToColumn(target / numRows.coerceAtLeast(1))

@@ -181,7 +181,11 @@ Calls `buildColumn` for every unbuilt column from `builtColumns.max + 1` up to `
 - `performInsert(index, newChars)`: shared insert core; computes the `(iCol, iRow)` insertion point from `cursorBefore`, calls `insertCharsAt`, returns the focus target index after the inserted chars.
 - `deletePreviousSequentialCell(cellCol, cellRow, index)`: SEQUENTIAL backspace — removes the char at `(cellCol, cellRow-1)` (or last occupied in prev column when `cellRow==0`), reflows, refocuses.
 - `removeColumnBreak(cellCol)`: reverse of `insertColumnBreak`; removes the break marker at `cellCol`, reflows the two columns back together, and lands the cursor at the last occupied position in the preceding column.
-- `fillGapsForSequentialMode()`: when switching SCATTER→SEQUENTIAL, fills empty slots with a half-width space so auto-advance never skips a gap. Processes each paragraph independently (respects `columnBreaks`) so spaces never cross paragraph boundaries.
+- `fillGapsForSequentialMode()`: when switching SCATTER→SEQUENTIAL, lays out each paragraph per-column:
+  - **Columns with content**: rows `0..lastOccupiedRow` are filled with `" "` (half-width gap-fill space) wherever empty; one `FRONTIER_MARKER` is placed at `lastOccupiedRow + 1` (if it fits in the column). Cells beyond stay empty.
+  - **Empty columns sandwiched between content columns** (i.e. in `firstContentCol+1 .. lastContentCol-1`): a single `FRONTIER_MARKER` at row 0; the rest of the column stays empty.
+  - **Empty columns outside the content span** (before the first content column or after the last): left entirely empty.
+  - Each paragraph (delimited by `columnBreaks`) is processed independently. `FRONTIER_MARKER` (not `" "`) is used for line-ending cells, so `placeFrontierMarker` can later distinguish them from gap-fill spaces and clean up stale ones.
 - `showPopupSeekbar(anchor, max, initial, format, onChange)`: floating `PopupWindow` seekbar anchored above a chip; used for font size (字號) and word gap (字距).
 
 ## Reflow
@@ -213,8 +217,15 @@ Touch listeners consume all touch events. Native cursor placement should not dec
 
 Label in UI: 連續輸入.
 
-- **Writing-frontier marker**: a half-width space sits in the cell immediately after the last char of each paragraph. The marker keeps that cell non-empty so the user can tap it directly (the empty-tap redirect at `CellInputController.kt:57` is skipped). Typing onto the marker goes through the existing insert-shift / SCATTER-overwrite path — the space gets pushed forward, and the new char takes its place. `placeFrontierMarker()` is called from `rebuildGrid` (end-of), `advanceToNextCell`, `restoreHistoryState`, and `fillGapsForSequentialMode` so the marker stays at the correct trailing position through writes, undo/redo, mode switches, and session loads.
-- Empty tap (other than the marker cell) redirects to first empty cell in column-major flow.
+- **Writing-frontier marker**: `FRONTIER_MARKER` = `"​"` (zero-width space) sits in the cell immediately after the paragraph's last real-content cell. The marker keeps that cell non-empty so the user can tap it directly (the empty-tap redirect at `CellInputController.kt:57` is skipped). It's a distinct character from `" "` (gap-fill space) so stale markers can be detected and cleaned up safely without touching real spaces. Typing onto the marker goes through the existing insert-shift path — the marker is trimmed (it's `isBlank()`), the new char takes its place, and `placeFrontierMarker()` re-places a fresh marker one cell forward. `placeFrontierMarker()` is called from `refreshGrid` (start-of — covers every post-mutation refresh including insert-shift, paste, delete, column break), `advanceToNextCell` (covers single-char writes that bypass `refreshGrid`), `rebuildGrid` (end-of), and `restoreHistoryState`. It is **idempotent** and self-correcting:
+  1. Locates the last cell whose content is neither empty nor a marker (the "real-content frontier").
+  2. **Demotes** any marker positioned before that frontier to `" "` (a gap-filler) — this handles the case where the user tapped past a marker via the redirect and typed elsewhere, leaving the old marker orphaned.
+  3. Places a fresh marker at the frontier, or no-ops if one is already there.
+- **Empty-cell tap redirect** (`findSequentialTapTarget` in `MainActivity`, invoked from `CellInputController.attachTouchListener`):
+  1. If the tapped column already contains a `FRONTIER_MARKER`, the cursor jumps to that marker.
+  2. Otherwise the search walks **rightward** in the RTL layout — decreasing column index — within the same paragraph (bounded by `columnBreaks`), and jumps to the first `FRONTIER_MARKER` it finds.
+  3. If the paragraph has no content at all (empty document or empty fresh paragraph), the cursor lands at `paraStart` row 0 so the user begins at the natural origin.
+  4. Otherwise no redirect — the tap lands where the user clicked.
 - Occupied typing uses insert-shift.
 - Occupied punctuation uses insert-shift.
 - DEL removes previous content and calls `reflowColumnData(numRows)`.
@@ -225,6 +236,7 @@ Label in UI: 連續輸入.
 
 Label in UI: 灑花輸入.
 
+- **Canvas is frozen** — SCATTER never grows the built-column range. `focusCell`, `ensureBufferColumn`, the `hScroll` scroll listener, and the paste-multi loop all gate their `ensureColumnBuilt` / column-extension calls on `inputMode != InputMode.SCATTER`. Paste content beyond the last built column is dropped. Column growth (and lazy build on scroll) only happens in SEQUENTIAL mode.
 - Tap lands exactly where tapped.
 - Occupied **space** cell or empty cell: typing overwrites current cell and advances one cell.
 - Occupied **non-blank** cell (island): typing uses insert-shift, same as SEQUENTIAL.
@@ -464,6 +476,7 @@ Image transform:
 - `pushHistory()` should be called at direct user-action mutation entry points to avoid duplicate history frames.
 - Keep `insertedImages` as the primary model; `bgImageUri`/`bgImageMatrix` are now mainly the runtime cache for the currently active image (gesture target + quick persistence path), not the main multi-image storage model.
 - Style/setting changes (font, size, word-gap, colors) happen only while the tools panel is open and IME is hidden, so `rebuildGrid()` is acceptable there. Reserve `refreshGrid()` (no view destruction) for content edits made with the IME open.
+- SCATTER must never grow the built-column range. Any new column-build hook (focus, scroll, buffer, paste expansion) MUST gate on `inputMode != InputMode.SCATTER`. Column growth is a SEQUENTIAL-only operation.
 
 ## Build
 
