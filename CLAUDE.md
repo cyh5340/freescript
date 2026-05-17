@@ -11,15 +11,14 @@ app/src/main/
 |-- assets/fonts/LXGWWenKai-Regular.ttf
 |-- java/com/poemeditor/
 |   |-- MainActivity.kt                  # activity coordinator: TextWatcher, selection overlay, image gestures, keyboard insets
+|   |-- PoemCanvasView.kt                # canvas renderer for characters, cursor, selection, composing preview
 |   |-- ViewFactory.kt                   # programmatic UI factory; Callbacks bridge to MainActivity
-|   |-- CellInputController.kt           # extracted cell touch + hardware key listeners; owns lastTapIndex/lastTapTime
-|   |-- GridEditorController.kt          # extracted grid column/lazy build controller
-|   |-- GridLogicHelper.kt               # pure data logic: setColumnChar, reflowColumnData, insertCharsAt
+|   |-- GridLogicHelper.kt               # pure data logic: FRONTIER_MARKER/LINE_END_MARKER constants, setColumnChar, reflowColumnData, insertCharsAt, placeFrontierMarker, fillGapsForSequentialMode, findSequentialTapTarget
 |   |-- EditorViewModel.kt               # undo/redo stacks + thin save/load/ensureDefault wrappers over SessionRepository
 |   |-- EditorStateModels.kt             # InsertedImageState + EditorHistoryState
 |   |-- SessionRepository.kt             # one-method-each delegate over SessionManager (save/load/ensureDefault)
-|   |-- SessionManager.kt                # JSON conversion + file I/O helpers; ScreenshotHelper companion
-|   |-- ScreenshotHelper.kt              # captureView + saveToGallery (MediaStore / legacy path)
+|   |-- SessionManager.kt                # JSON conversion + file I/O helpers
+|   |-- ScreenshotController.kt          # screenshot flow + ScreenshotCropView (crop overlay); all in one file
 |   |-- SessionListActivity.kt           # full session list with search/date filters + inline rename
 |   `-- AppConfig.kt                     # user-selectable constants: palettes/font sizes/punctuation
 `-- res/
@@ -40,26 +39,28 @@ FrameLayout rootFrame
 |   |-- NestedScrollView mainScrollView
 |   |   `-- LinearLayout gridContainer
 |   |       `-- HorizontalScrollView hScroll
-|   |           `-- GridLayout RTL, numRows x MAX_COLUMNS (skeleton always MAX_COLUMNS wide)
-|   |               `-- EditText cells  ← only built columns have cells; unbuilt cols have no views
+|   |           `-- PoemCanvasView poemCanvas  ← draws all MAX_COLUMNS columns, cursor, selection, preview text
 |   `-- LinearLayout bottomPanel        ← built by ViewFactory.buildBottomPanel()
 |       |-- divider
 |       |-- HorizontalScrollView punctToolbar    ← visible only while IME is open
 |       `-- FrameLayout toolbar, 54dp, white
 |           |-- LinearLayout mainBar             ← default visible: 工具 | divider | 標點
 |           `-- LinearLayout punctBar            ← shown when 標點 tapped: ← | divider | HScrollView(punct)
-|-- NestedScrollView allToolsPanel               ← Gravity.BOTTOM overlay, height = lastKeyboardHeight
-|   `-- LinearLayout content (vertical)
-|       |-- buildFontRow (no label): font spinner + 字號 chip + 字距 chip, all inline
-|       |-- text color swatch row (no label)
-|       |-- 底色 inline row: label + HScrollView(bg color swatches)
-|       |-- 插入 inline row: 選圖 chip + avatar list (tap avatar = select active, × = delete)
-|       |-- 輸入模式 inline row: 灑花輸入 / 連續輸入 chips
-|       `-- 檔案 inline row: filename + 所有文檔 chip
+|-- LinearLayout allToolsPanel                   ← Gravity.BOTTOM overlay, height = lastKeyboardHeight
+|   |-- TextView "▾" collapse button
+|   `-- NestedScrollView
+|       `-- LinearLayout content (vertical)
+|           |-- buildFontRow (no label): font spinner + 字號 chip + 字距 chip, all inline
+|           |-- text color swatch row (no label)
+|           |-- 底色 inline row: label + HScrollView(bg color swatches)
+|           |-- 插入 inline row: 選圖 chip + avatar list (tap avatar = select active, × = delete)
+|           |-- 輸入模式 inline row: 灑花輸入 / 連續輸入 chips
+|           `-- 檔案 inline row: filename + 所有文檔 chip
 |-- View startHandle                             ← blue oval, positioned by positionHandleAt()
 |-- View endHandle                               ← blue oval, positioned by positionHandleAt()
 |-- LinearLayout selectionOptionsView            ← 複製/剪下/貼上/選取整行/選取整段/全選, shown left of selection
-`-- TextView handlePasteView                     ← mini 貼上 bubble shown on handle tap (no drag)
+|-- TextView handlePasteView                     ← mini 貼上 bubble shown on handle tap (no drag)
+`-- EditText ghostInput                          ← 1x1 invisible IME target; all typed text is routed through MainActivity
 ```
 
 **Keyboard / tools mutual exclusion:**
@@ -102,7 +103,8 @@ FrameLayout rootFrame
 
 - `columnData[col][row]` is one character or `""`.
 - Column 0 is the rightmost visible column.
-- `EditText` content is a view cache, not canonical state.
+- `PoemCanvasView` renders from `columnData`; there are no per-cell `EditText` views.
+- `ghostInput` is only the IME bridge. Its sentinel/text is not canonical document state.
 - `setColumnChar(col, row, ch)` grows lists as needed and should be used for cell writes.
 - `clearDocumentContent()` clears `columnData` and `columnBreaks`.
 
@@ -129,63 +131,44 @@ gridHeight = numRows * cellSize
 numColumns = MAX_COLUMNS = 50  (always; grid skeleton is always full width for accurate scrollbar)
 ```
 
-`rebuildGrid()` computes this and rebuilds all cells. It is for settings/session changes, not keyboard open/close. Style changes (font, size, gap, color) only fire while the tools panel is open, where IME is closed by design — so the rebuild's IME interruption is not a concern.
+`rebuildGrid()` computes this and calls `poemCanvas.updateData(...)` so the canvas can relayout/redraw. It is for settings/session changes, not keyboard open/close. Style changes (font, size, gap, color) only fire while the tools panel is open, where IME is closed by design — so the rebuild's IME interruption is not a concern.
 
-`refreshGrid()` diffs current `EditText` views against `columnData` and updates in place. It only iterates built columns (`editTextFields.size / numRows`). Prefer it for content changes so the IME does not flicker.
+`refreshGrid()` refreshes markers/composing preview and calls `poemCanvas.refreshContent(columnData)` without rebuilding layout. Prefer it for content changes so the IME does not flicker.
 
-## Lazy Grid Loading
+## Canvas Renderer And IME
 
-The grid uses **on-demand column construction** to keep startup fast and the UI thread free during typing.
+The editor now uses a single custom canvas view plus an invisible IME target.
 
-### Initial build (`buildInitialColumns`)
+### `PoemCanvasView.kt`
 
-Called once at the end of `rebuildGrid`. Synchronously builds exactly:
+- Draws characters, line-end markers, selection highlights, composing preview, and the blinking insertion cursor.
+- Stores no canonical document state; `MainActivity.columnData` remains the source of truth.
+- `cellRect(index)` and `cellIndexAtTouch(x, y)` are the geometry APIs used by focus, selection handles, keyboard scrolling, and touch placement.
+- Canvas width is always `MAX_COLUMNS * currentCellSize`, so horizontal scroll math and the custom scroll indicator stay stable.
 
-```text
-max(visibleCols, lastDataCol + 1)
-```
+### `ghostInput` in `MainActivity.kt`
 
-where `visibleCols = mainScrollView.width / cellSize + 1`. This guarantees col 0 (top-right) and all content columns are present on the first frame. No background loop is started.
-
-### On-demand growth
-
-New columns are created only when actually needed:
-
-- **Typing reaches the last built column**: `ensureBufferColumn()` → `ensureColumnBuilt(columnData.size)` adds exactly one column.
-- **Scrolling reveals unbuilt columns**: `onScrollChangeListener` computes `highestVisible = (MAX_COLUMNS * cs - scrollX) / cs` and calls `ensureColumnBuilt(highestVisible + 1)` if beyond last built.
-- **Focus / handle drag into unbuilt column**: `focusCell(index)` calls `ensureColumnBuilt(index / numRows)` before accessing `editTextFields`.
-
-### Key fields
-
-- `builtColumns: HashSet<Int>` — which column indices have cells in the grid.
-- Grid lazy-build routines are now hosted in `GridEditorController`; `MainActivity` delegates `buildInitialColumns()` / `ensureColumnBuilt(...)` to the controller.
-
-### `buildColumn(col, grid, fontPx, cellSize)`
-
-Appends `numRows` EditText cells for `col` to `editTextFields` and `grid`. Sets `isRestoring = true` during construction so TextWatcher never fires. Must always be called in ascending column order because `editTextFields` is a contiguous list (`index = col * numRows + row`).
-
-### `ensureColumnBuilt(col)`
-
-Calls `buildColumn` for every unbuilt column from `builtColumns.max + 1` up to `col` inclusive. Synchronous; safe to call on the UI thread at any time.
+- A hidden 1x1 `EditText` attached directly to `rootFrame`.
+- Holds `GHOST_SENTINEL` so backspace can be detected when the sentinel is deleted.
+- `setupGhostInput()` owns hardware/backspace handling, Enter, IME composing preview, paste/multi-char commits, and single-char typing.
+- `focusCell(...)` requests focus on `ghostInput`, restarts IME when needed, and draws the real cursor on `poemCanvas`.
 
 ## Current Helper Structure
 
 - `withRestoring { ... }`: sets `isRestoring` safely around programmatic mutations.
 - `persistCurrentState()`: saves both current session JSON and SharedPreferences.
-- `advanceToNextCell(index, total)`: moves focus to `index + 1`, sets `cursorBefore = true`, scrolls column into view.
+- `advanceToNextCell(index, total)`: moves focus to `index + 1`, calls `poemCanvas.setCursor(nextIdx)`, applies upper-view top-scroll logic, scrolls column into view.
 - `postRefreshFocusColumn(targetIndex, col)`: posts `refreshGrid()`, `focusCell(...)`, and `scrollToColumn(...)`.
+- `scrollToTopIfCursorInUpperView(index)`: if `poemCanvas.cellRect(index).top` is in the upper 35% of `mainScrollView`, posts `mainScrollView.scrollTo(0, 0)`. This is the universal fix for cursor placement after word wrap, Enter/newline, paste/IME commits, tap focus, and backspace.
 - `refreshModeChips()`: only place that recolors writing mode chips.
 - `columnDataToJson()`, `columnBreaksToJson()`, `loadColumnDataFromJson(...)`, `loadColumnBreaksFromJson(...)`: thin wrappers delegating to `SessionManager`.
 - `setColumnChar(col, row, ch)`, `reflowColumnData(newNumRows)`, `insertCharsAt(...)`: thin wrappers delegating to `GridLogicHelper`.
+- `placeFrontierMarker()`, `fillGapsForSequentialMode()`, `findSequentialTapTarget(index)`: thin wrappers delegating to `GridLogicHelper` — all pure data logic lives there.
 - `insertCharsAt(insertCol, insertRow, newChars)`: flat-slice insert-shift; captures content from `(insertCol, insertRow)` forward, writes `newChars`, re-appends displaced content. Never crosses a `columnBreaks` boundary. Trailing **blank** cells (empty or space) are trimmed from the captured slice so island overflow never pushes spaces forward.
-- `performInsert(index, newChars)`: shared insert core; computes the `(iCol, iRow)` insertion point from `cursorBefore`, calls `insertCharsAt`, returns the focus target index after the inserted chars.
+- `performInsert(newChars)`: shared insert core; always inserts at `focusedCellIndex`, calls `insertCharsAt`, returns `lastWrittenIdx + 1` (the new cursor position).
 - `deletePreviousSequentialCell(cellCol, cellRow, index)`: SEQUENTIAL backspace — removes the char at `(cellCol, cellRow-1)` (or last occupied in prev column when `cellRow==0`), reflows, refocuses.
-- `removeColumnBreak(cellCol)`: reverse of `insertColumnBreak`; removes the break marker at `cellCol`, reflows the two columns back together, and lands the cursor at the last occupied position in the preceding column.
-- `fillGapsForSequentialMode()`: when switching SCATTER→SEQUENTIAL, lays out each paragraph per-column:
-  - **Columns with content**: rows `0..lastOccupiedRow` are filled with `" "` (half-width gap-fill space) wherever empty; one `FRONTIER_MARKER` is placed at `lastOccupiedRow + 1` (if it fits in the column). Cells beyond stay empty.
-  - **Empty columns sandwiched between content columns** (i.e. in `firstContentCol+1 .. lastContentCol-1`): a single `FRONTIER_MARKER` at row 0; the rest of the column stays empty.
-  - **Empty columns outside the content span** (before the first content column or after the last): left entirely empty.
-  - Each paragraph (delimited by `columnBreaks`) is processed independently. `FRONTIER_MARKER` (not `" "`) is used for line-ending cells, so `placeFrontierMarker` can later distinguish them from gap-fill spaces and clean up stale ones.
+- `removeColumnBreak(cellCol)`: reverse of `handleEnter`; clears the `LINE_END_MARKER` from the preceding column, removes the break, reflows the two columns back together, and lands the cursor at the last occupied position in the preceding column.
+- `makeRoomBeforeParagraphBreakForLineEndInsert(cellCol, cellRow, insertedLength)`: called before `performInsert` when typing onto a `LINE_END_MARKER` cell that sits at a paragraph boundary. Inserts empty columns between the current paragraph and the next so the new chars have room without overflowing into the following paragraph.
 - `showPopupSeekbar(anchor, max, initial, format, onChange)`: floating `PopupWindow` seekbar anchored above a chip; used for font size (字號) and word gap (字距).
 
 ## Reflow
@@ -201,11 +184,12 @@ Reflow stream rules:
 
 ## Focus And Cursor
 
-`focusCell(index, cursorBefore, showKeyboard)` is central focus management.
+`focusCell(index, showKeyboard)` is central focus management.
 
-- Calls `ensureColumnBuilt(index / numRows)` first — guarantees the column's cells exist before accessing `editTextFields[index]`.
-- Stores logical insertion side in `cursorBefore`.
-- Requests focus and sets selection to 0.
+- `focusedCellIndex` IS the insertion point; cursor (`poemCanvas.setCursor(index)`) is always drawn at the top of that cell.
+- Calls `scrollToTopIfCursorInUpperView(index)` after placing the canvas cursor. This is intentionally based on the cursor's vertical position, not the input path, so word wrap and Enter share the same behavior.
+- Tapping the top half of an occupied cell calls `focusCell(index)`; tapping the bottom half calls `focusCell(index + 1)`, letting the user insert before or after a character.
+- Requests focus on `ghostInput`.
 - Shows/restarts IME when requested.
 - Schedules keyboard translation.
 
@@ -217,26 +201,27 @@ Touch listeners consume all touch events. Native cursor placement should not dec
 
 Label in UI: 連續輸入.
 
-- **Writing-frontier marker**: `FRONTIER_MARKER` = `"​"` (zero-width space) sits in the cell immediately after the paragraph's last real-content cell. The marker keeps that cell non-empty so the user can tap it directly (the empty-tap redirect at `CellInputController.kt:57` is skipped). It's a distinct character from `" "` (gap-fill space) so stale markers can be detected and cleaned up safely without touching real spaces. Typing onto the marker goes through the existing insert-shift path — the marker is trimmed (it's `isBlank()`), the new char takes its place, and `placeFrontierMarker()` re-places a fresh marker one cell forward. `placeFrontierMarker()` is called from `refreshGrid` (start-of — covers every post-mutation refresh including insert-shift, paste, delete, column break), `advanceToNextCell` (covers single-char writes that bypass `refreshGrid`), `rebuildGrid` (end-of), and `restoreHistoryState`. It is **idempotent** and self-correcting:
-  1. Locates the last cell whose content is neither empty nor a marker (the "real-content frontier").
-  2. **Demotes** any marker positioned before that frontier to `" "` (a gap-filler) — this handles the case where the user tapped past a marker via the redirect and typed elsewhere, leaving the old marker orphaned.
-  3. Places a fresh marker at the frontier, or no-ops if one is already there.
-- **Empty-cell tap redirect** (`findSequentialTapTarget` in `MainActivity`, invoked from `CellInputController.attachTouchListener`):
-  1. If the tapped column already contains a `FRONTIER_MARKER`, the cursor jumps to that marker.
-  2. Otherwise the search walks **rightward** in the RTL layout — decreasing column index — within the same paragraph (bounded by `columnBreaks`), and jumps to the first `FRONTIER_MARKER` it finds.
+- **Writing-frontier marker**: `FRONTIER_MARKER` = `"​"` (zero-width space) and `LINE_END_MARKER` = `"↵"` are `const val` in `GridLogicHelper`; `MainActivity` and `PoemCanvasView` both reference them there. `FRONTIER_MARKER` sits in the cell immediately after the last real-content cell **in the last paragraph**. `LINE_END_MARKER` is placed at the start of the first empty column after the last real-content cell **in every non-last paragraph** (i.e. row 0 of the column immediately following content). Both markers keep cells non-empty so taps land there directly. `placeFrontierMarker()` (logic in `GridLogicHelper`, thin wrapper in `MainActivity`) manages both: it is called from `refreshGrid`, `advanceToNextCell`, `rebuildGrid`, and `restoreHistoryState`. It is **idempotent** and self-correcting:
+  1. Locates the last real-content cell per paragraph (anything that isn't empty, FRONTIER_MARKER, or LINE_END_MARKER).
+  2. **Demotes** any stale marker sitting before the new frontier position to `" "` (gap-filler).
+  3. Places the appropriate marker (`FRONTIER_MARKER` for the last para, `LINE_END_MARKER` for others) at the frontier, or no-ops if one is already there.
+  4. Empty non-last paragraphs get `LINE_END_MARKER` at row 0 of their start column to show the blank line visually.
+- **Empty-cell tap redirect** (`findSequentialTapTarget` logic in `GridLogicHelper`, thin wrapper in `MainActivity`, invoked from `setupCanvasTouchListener`):
+  1. If the tapped column contains a `FRONTIER_MARKER` or `LINE_END_MARKER`, the cursor jumps to that marker.
+  2. Otherwise the search walks **rightward** in the RTL layout — decreasing column index — within the same paragraph (bounded by `columnBreaks`), and jumps to the first column holding a marker.
   3. If the paragraph has no content at all (empty document or empty fresh paragraph), the cursor lands at `paraStart` row 0 so the user begins at the natural origin.
   4. Otherwise no redirect — the tap lands where the user clicked.
 - Occupied typing uses insert-shift.
 - Occupied punctuation uses insert-shift.
 - DEL removes previous content and calls `reflowColumnData(numRows)`.
-- Enter splits before the focused row, inserts a new column on the left, and shifts existing columns left/preserves them.
-- Switching SCATTER -> SEQUENTIAL calls `fillGapsForSequentialMode()`.
+- Enter places `LINE_END_MARKER` (↵) at the cursor cell, extracts the tail, inserts a new structural column on the left for the tail, and shifts subsequent paragraphs right.
+- Switching SCATTER -> SEQUENTIAL calls `fillGapsForSequentialMode()` (logic in `GridLogicHelper`, thin wrapper in `MainActivity`).
 
 ### SCATTER
 
 Label in UI: 灑花輸入.
 
-- **Canvas is frozen** — SCATTER never grows the built-column range. `focusCell`, `ensureBufferColumn`, the `hScroll` scroll listener, and the paste-multi loop all gate their `ensureColumnBuilt` / column-extension calls on `inputMode != InputMode.SCATTER`. Paste content beyond the last built column is dropped. Column growth (and lazy build on scroll) only happens in SEQUENTIAL mode.
+- **Canvas is fixed-width** — `PoemCanvasView` always renders the `MAX_COLUMNS` skeleton. SCATTER does not structurally shift text through SEQUENTIAL insert paths; paste/multi-char writes are capped by the existing data bounds for the mode.
 - Tap lands exactly where tapped.
 - Occupied **space** cell or empty cell: typing overwrites current cell and advances one cell.
 - Occupied **non-blank** cell (island): typing uses insert-shift, same as SEQUENTIAL.
@@ -244,7 +229,7 @@ Label in UI: 灑花輸入.
 - DEL on an empty or space cell: removes at current row and pads with `""` to preserve row alignment.
 - Punctuation on a **non-blank** cell (island): insert-shift, same as SEQUENTIAL.
 - Punctuation on an empty or space cell: writes directly and advances.
-- Enter splits before the focused row, moves current row and following rows into the left column at row 0, and overwrites that target column instead of inserting a new one.
+- Enter writes `LINE_END_MARKER` (↵) at the cursor cell and adds a `columnBreaks` entry for the next column without structural shift.
 - Font/gap changes do not reflow content.
 
 ### SCATTER Islands
@@ -260,13 +245,17 @@ When island content overflows into the following cells during insertion, trailin
 
 ## Enter / Newline
 
-All Enter paths call `insertColumnBreak(cellCol, cursorRow)`:
+All Enter paths call `handleEnter()`:
 
 - hardware `KEYCODE_ENTER`
 - soft IME editor action
 - single committed `\n` caught by `TextWatcher`
 
-Cells keep selection at 0, so Enter splits before `cursorRow`. The focused cell belongs to the moved tail.
+**SEQUENTIAL**: extracts the tail (cursor row onwards), places `LINE_END_MARKER` (↵) at the cursor cell, does a structural column insert (`columnData.add(nextCol, tail)`) so following paragraphs shift right, and jumps to `nextCol * numRows`.
+
+**SCATTER**: writes `LINE_END_MARKER` in place at the cursor cell and adds a `columnBreaks` entry for `nextCol` without structural shift.
+
+Backspace on a `LINE_END_MARKER` cell calls `removeColumnBreak` to reverse the split.
 
 ## Character Input
 
@@ -397,7 +386,7 @@ Tapping 工具 calls `switchToTools()` / `switchToKeyboard()`. Tapping 標點 sw
 
 ## Tools Panel
 
-`allToolsPanel` is a `NestedScrollView` overlaid on `rootFrame` at `Gravity.BOTTOM`. Height is set to `lastKeyboardHeight` when shown (fallback 280dp). It is GONE by default and toggled by `switchToTools/switchToKeyboard`.
+`allToolsPanel` is a `LinearLayout` overlaid on `rootFrame` at `Gravity.BOTTOM`. Height is set to `lastKeyboardHeight` when shown (fallback 280dp). It is GONE by default and toggled by `switchToTools/switchToKeyboard`. It contains a collapse `▾` button at the top, then a `NestedScrollView` wrapping the section content.
 
 Sections (top to bottom), each separated by a `subDivider`:
 
@@ -428,12 +417,18 @@ Font size and word gap use `showPopupSeekbar(anchor, max, initial, format, onCha
 
 ## Screenshot
 
-`takeScreenshot()`:
-1. Hides handles, selection overlay, paste bubble; hides `allToolsPanel` temporarily; sets `isCursorVisible = false` on the focused cell.
-2. Creates `Bitmap(rootFrame.width, mainScrollView.height)` — the canvas height naturally clips the toolbar off the bottom.
-3. Calls `rootFrame.draw(canvas)`.
-4. Restores visibility; saves via `saveBitmapToGallery`.
-- API 29+: `MediaStore.Images` with `RELATIVE_PATH = Pictures/PoemEditor` (no permission needed).
+Owned by `ScreenshotController` (initialized `by lazy` in `MainActivity`). `MainActivity.takeScreenshot()` just delegates to `screenshotController.takeScreenshot()`.
+
+Flow:
+1. Hides transient views (handles, selection options, paste bubble); hides `allToolsPanel` if open; stops cursor blink on `PoemCanvasView`.
+2. If the soft keyboard is open, dismisses it and waits for the next `OnGlobalLayoutListener` callback before continuing (so the layout settles).
+3. Shows `ScreenshotCropView` — a full-screen overlay with a 4-corner draggable crop region. The initial region is pre-set to the poem grid bounds (top/bottom computed from `gridContainer` location + `numRows * cellSize`). The area outside the crop rect is dimmed; the selected region shows live content through.
+4. User drags corner handles to adjust the crop, then taps 確認 or 取消.
+5. On confirm: hides `ScreenshotCropView`, sets `poemCanvas.hideLineEndMarkers = true`, calls `captureView(rootFrame, cropL, cropT, cropW, cropH)` — translates the Canvas so only the cropped rect is drawn, then resets `hideLineEndMarkers`. Saves result via `saveToGallery`.
+6. Restores `bottomPanel`, cursor blink, `allToolsPanel` (if was open), and selection handles via `Callbacks.onScreenshotRestored()`.
+
+`captureView` and `saveToGallery` are private methods of `ScreenshotController`:
+- API 29+: `MediaStore.Images` with `RELATIVE_PATH = Pictures/Screenshots` (no permission needed).
 - API 24–28: writes to `Environment.DIRECTORY_PICTURES`, uses `MediaScannerConnection`. Requires `WRITE_EXTERNAL_STORAGE` (declared in manifest with `maxSdkVersion="28"`).
 
 ## Inserted Image (Overlay)
@@ -463,20 +458,22 @@ Image transform:
 - Do not rebuild grid on keyboard open/close.
 - Use `withRestoring` for programmatic text/model mutations.
 - Preserve mode differences. Most regressions come from accidentally sending SCATTER through SEQUENTIAL insert-shift paths — use the island check (`isNotBlank()`) to gate correctly.
-- Keep `EditText` ids/tags unique across rebuilds.
 - Keep custom background persistence app-owned, not dependent on external URI permission.
 - `stableMaxHeight` must never be derived while the IME is open. The `OnGlobalLayoutListener` guards this with an `!imeVisible` check.
 - The toolbar `FrameLayout` height and `allToolsPanel` height must match `lastKeyboardHeight` so the grid's paddingBottom transition is seamless.
 - `numColumns = MAX_COLUMNS = 50` always; never recalculate from data size. The grid skeleton is always full width.
-- `editTextFields` is a contiguous list; columns must be built in order 0, 1, 2, … Never skip a column.
-- `ensureColumnBuilt(col)` must be called before accessing `editTextFields[col * numRows + row]` for any column not guaranteed to be in the sync build batch.
-- `insertCharsAt` trims trailing **blank** cells (`isBlank()`, not just `isEmpty()`) so island overflow never pushes trailing spaces forward.
+- `PoemCanvasView` is the only visible text/cursor/selection renderer; do not reintroduce per-cell `EditText` rendering.
+- Keep `ghostInput` invisible and out of document state. It is only for IME/backspace/composition capture.
+- Cursor-driven vertical reset belongs in `scrollToTopIfCursorInUpperView`, not in individual typing/Enter/paste branches.
+- `insertCharsAt` trims only **trailing** blank cells (`isBlank()`) from the captured slice before writing displaced content. Internal blanks (spaces between characters) are preserved in position — do not add a "blank budget" or any mechanism that absorbs internal blanks, as that would silently drop gap-fill spaces in SEQUENTIAL mode.
 - ViewFactory interface method names must not clash with MainActivity property getter names (use `provide*` prefix for catalogue-style accessors).
 - `applyBackground(color)` sets only `bgColor` and `rootFrame` background — it never removes inserted images.
 - `pushHistory()` should be called at direct user-action mutation entry points to avoid duplicate history frames.
 - Keep `insertedImages` as the primary model; `bgImageUri`/`bgImageMatrix` are now mainly the runtime cache for the currently active image (gesture target + quick persistence path), not the main multi-image storage model.
 - Style/setting changes (font, size, word-gap, colors) happen only while the tools panel is open and IME is hidden, so `rebuildGrid()` is acceptable there. Reserve `refreshGrid()` (no view destruction) for content edits made with the IME open.
-- SCATTER must never grow the built-column range. Any new column-build hook (focus, scroll, buffer, paste expansion) MUST gate on `inputMode != InputMode.SCATTER`. Column growth is a SEQUENTIAL-only operation.
+- SCATTER must not be routed through SEQUENTIAL structural insert-shift behavior unless the local island rule explicitly allows it.
+- `FRONTIER_MARKER` and `LINE_END_MARKER` are defined once in `GridLogicHelper` as `const val`. Do not redefine them in `MainActivity` or `PoemCanvasView` — reference `GridLogicHelper.FRONTIER_MARKER` / `GridLogicHelper.LINE_END_MARKER` directly (or via the private `get()` aliases in `MainActivity`).
+- Pure data logic on `columnData`/`columnBreaks` (marker placement, gap-fill, tap targeting) belongs in `GridLogicHelper`, not in `MainActivity`. `MainActivity` keeps thin wrappers. Scrolling coordination (`scrollToColumn`, `scrollToTopIfCursorInUpperView`) is editor-level and stays in `MainActivity`; it does not belong in `ViewFactory` or `PoemCanvasView`.
 
 ## Build
 

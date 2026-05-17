@@ -1,0 +1,90 @@
+<resources>
+    <string name="app_name">直書</string>
+
+    <!-- Tools panel -->
+    <string name="label_insert">插入</string>
+    <string name="btn_select_image">選圖</string>
+    <string name="label_bg_color">底色</string>
+    <string name="label_font">字體</string>
+    <string name="label_font_size">字號</string>
+    <string name="label_word_gap">字距</string>
+    <string name="label_input_mode">輸入模式</string>
+    <string name="btn_input_field">輸入框</string>
+    <string name="mode_scatter">灑花輸入</string>
+    <string name="mode_sequential">連續輸入</string>
+    <string name="label_file">檔案</string>
+    <string name="btn_all_docs">所有文檔</string>
+
+    <!-- Selection menu -->
+    <string name="action_copy">複製</string>
+    <string name="action_cut">剪下</string>
+    <string name="action_paste">貼上</string>
+    <string name="action_select_line">選取整行</string>
+    <string name="action_select_paragraph">選取整段</string>
+    <string name="action_select_all">全選</string>
+
+    <!-- Toasts -->
+    <string name="toast_copied">已複製</string>
+    <string name="toast_cut">已剪下</string>
+    <string name="toast_pasted">已貼上</string>
+    <string name="toast_max_images">最多可插入 5 張圖片</string>
+    <string name="toast_session_deleted">已刪除</string>
+
+    <!-- Screenshot -->
+    <string name="screenshot_saved">已儲存至相簿</string>
+    <string name="screenshot_failed">儲存失敗</string>
+    <string name="screenshot_saving">截圖中…</string>
+    <string name="screenshot_cancel">取消</string>
+    <string name="screenshot_confirm">確認</string>
+
+    <!-- Session list -->
+    <string name="session_list_title">所有文檔</string>
+    <string name="btn_new_session">新增</string>
+    <string name="hint_search_sessions">搜尋文檔名稱</string>
+    <string name="filter_all">全部</string>
+    <string name="filter_this_week">本週</string>
+    <string name="filter_this_month">本月</string>
+    <string name="session_empty_message">沒有符合的文檔</string>
+    <string name="session_current_indicator">（目前）</string>
+    <string name="session_stat_chars">字</string>
+    <string name="session_stat_images">圖</string>
+
+    <!-- Dialogs -->
+    <string name="dialog_new_session_title">新增文檔</string>
+    <string name="dialog_rename_title">重新命名</string>
+    <string name="dialog_delete_title">刪除文檔</string>
+    <string name="dialog_delete_message">確定要刪除「%s」嗎？此操作無法復原。</string>
+    <string name="dialog_ok">確定</string>
+    <string name="dialog_cancel">取消</string>
+
+    <!-- Default session name -->
+    <string name="default_session_name">文檔</string>
+
+    <!-- Background color labels -->
+    <string name="bg_color_white">白</string>
+    <string name="bg_color_cream">米</string>
+    <string name="bg_color_antique">古</string>
+    <string name="bg_color_pink">粉</string>
+    <string name="bg_color_orange">橙</string>
+    <string name="bg_color_green">草</string>
+    <string name="bg_color_blue">藍</string>
+    <string name="bg_color_purple">紫</string>
+    <string name="bg_color_tea">茶</string>
+    <string name="bg_color_brown">棕</string>
+    <string name="bg_color_night">夜</string>
+    <string name="bg_color_dark">深</string>
+    <string name="bg_color_black">黑</string>
+
+    <!-- Text color labels -->
+    <string name="text_color_ink">墨</string>
+    <string name="text_color_charcoal">炭</string>
+    <string name="text_color_gray">灰</string>
+    <string name="text_color_white">白</string>
+    <string name="text_color_indigo">藍墨</string>
+    <string name="text_color_vermilion">硃</string>
+    <string name="text_color_gold">金</string>
+    <string name="text_color_jade">翠</string>
+    <string name="text_color_purple">紫</string>
+    <string name="text_color_crimson">赤</string>
+    <string name="text_color_blue">藍</string>
+</resources>

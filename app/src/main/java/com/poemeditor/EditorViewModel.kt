@@ -65,22 +65,14 @@ class EditorViewModel(
         bgImageMatrixValues: FloatArray?,
         inputMode: String,
         insertedImages: List<InsertedImageState>,
-        activeImageIndex: Int
+        activeImageIndex: Int,
+        gridPadTop: Int = 0, gridPadBottom: Int = 0,
+        gridPadLeft: Int = 0, gridPadRight: Int = 0
     ) = sessionRepository.saveSession(
-        id,
-        name,
-        columnData,
-        columnBreaks,
-        fontIndex,
-        fontSizeSp,
-        wordGapDp,
-        gridTextColor,
-        bgColor,
-        bgImageUri,
-        bgImageMatrixValues,
-        inputMode,
-        insertedImages,
-        activeImageIndex
+        id, name, columnData, columnBreaks,
+        fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
+        bgImageMatrixValues, inputMode, insertedImages, activeImageIndex,
+        gridPadTop, gridPadBottom, gridPadLeft, gridPadRight
     )
 
     fun ensureDefaultSession(
@@ -97,21 +89,13 @@ class EditorViewModel(
         bgImageMatrixValues: FloatArray?,
         inputMode: String,
         insertedImages: List<InsertedImageState>,
-        activeImageIndex: Int
+        activeImageIndex: Int,
+        gridPadTop: Int = 0, gridPadBottom: Int = 0,
+        gridPadLeft: Int = 0, gridPadRight: Int = 0
     ) = sessionRepository.ensureDefaultSession(
-        id,
-        name,
-        columnData,
-        columnBreaks,
-        fontIndex,
-        fontSizeSp,
-        wordGapDp,
-        gridTextColor,
-        bgColor,
-        bgImageUri,
-        bgImageMatrixValues,
-        inputMode,
-        insertedImages,
-        activeImageIndex
+        id, name, columnData, columnBreaks,
+        fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
+        bgImageMatrixValues, inputMode, insertedImages, activeImageIndex,
+        gridPadTop, gridPadBottom, gridPadLeft, gridPadRight
     )
 }

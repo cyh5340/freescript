@@ -18,24 +18,15 @@ class SessionRepository(private val filesDir: File) {
         bgImageMatrixValues: FloatArray?,
         inputMode: String,
         insertedImages: List<InsertedImageState>,
-        activeImageIndex: Int
+        activeImageIndex: Int,
+        gridPadTop: Int = 0, gridPadBottom: Int = 0,
+        gridPadLeft: Int = 0, gridPadRight: Int = 0
     ) {
         SessionManager.saveSession(
-            filesDir,
-            id,
-            name,
-            columnData,
-            columnBreaks,
-            fontIndex,
-            fontSizeSp,
-            wordGapDp,
-            gridTextColor,
-            bgColor,
-            bgImageUri,
-            bgImageMatrixValues,
-            inputMode,
-            insertedImages,
-            activeImageIndex
+            filesDir, id, name, columnData, columnBreaks,
+            fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
+            bgImageMatrixValues, inputMode, insertedImages, activeImageIndex,
+            gridPadTop, gridPadBottom, gridPadLeft, gridPadRight
         )
     }
 
@@ -55,24 +46,15 @@ class SessionRepository(private val filesDir: File) {
         bgImageMatrixValues: FloatArray?,
         inputMode: String,
         insertedImages: List<InsertedImageState>,
-        activeImageIndex: Int
+        activeImageIndex: Int,
+        gridPadTop: Int = 0, gridPadBottom: Int = 0,
+        gridPadLeft: Int = 0, gridPadRight: Int = 0
     ) {
         SessionManager.ensureDefaultSession(
-            filesDir,
-            id,
-            name,
-            columnData,
-            columnBreaks,
-            fontIndex,
-            fontSizeSp,
-            wordGapDp,
-            gridTextColor,
-            bgColor,
-            bgImageUri,
-            bgImageMatrixValues,
-            inputMode,
-            insertedImages,
-            activeImageIndex
+            filesDir, id, name, columnData, columnBreaks,
+            fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
+            bgImageMatrixValues, inputMode, insertedImages, activeImageIndex,
+            gridPadTop, gridPadBottom, gridPadLeft, gridPadRight
         )
     }
 }

@@ -26,6 +26,12 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
     var undoButton: TextView? = null
     var redoButton: TextView? = null
     var insertImageContainer: LinearLayout? = null
+    var scrollIndicatorContainer: FrameLayout? = null
+    var scrollIndicatorThumb: View? = null
+
+    private var isScrollIndicatorDragging = false
+    private var scrollIndicatorDragStartX = 0f
+    private var scrollIndicatorDragStartScrollX = 0
 
     interface Callbacks {
         fun provideFontCatalogue(): List<FontEntry>
@@ -57,8 +63,107 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
         fun onUndoAction()
         fun onRedoAction()
         fun onScreenshot()
+        fun onInputFieldEdit()
         fun canUndo(): Boolean
         fun canRedo(): Boolean
+        fun getNumColumns(): Int
+        fun getCurrentCellSize(): Int
+        fun getHScrollView(): HorizontalScrollView?
+    }
+
+    // ── Scroll indicator ────────────────────────────────────────���────────
+    fun buildScrollIndicator(dp: Float): FrameLayout {
+        val trackH = (4 * dp).roundToInt().coerceAtLeast(4)
+
+        val track = View(context).apply {
+            layoutParams = FrameLayout.LayoutParams(MP, FrameLayout.LayoutParams.MATCH_PARENT)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(android.graphics.Color.argb(35, 0, 0, 0))
+                cornerRadius = trackH / 2f
+            }
+        }
+
+        val thumb = View(context).apply {
+            layoutParams = FrameLayout.LayoutParams(0, FrameLayout.LayoutParams.MATCH_PARENT)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                setColor(android.graphics.Color.argb(130, 80, 80, 80))
+                cornerRadius = trackH / 2f
+            }
+        }
+        scrollIndicatorThumb = thumb
+
+        val container = FrameLayout(context).apply {
+            layoutParams = LinearLayout.LayoutParams(MP, trackH)
+                .apply { setMargins((8 * dp).roundToInt(), (6 * dp).roundToInt(),
+                                    (8 * dp).roundToInt(), (6 * dp).roundToInt()) }
+            addView(track)
+            addView(thumb)
+            visibility = View.GONE
+        }
+        scrollIndicatorContainer = container
+
+        container.setOnTouchListener { v, event ->
+            val s = cb.getHScrollView() ?: return@setOnTouchListener false
+            val trackW = v.width
+            val thumbW = (scrollIndicatorThumb?.width ?: 0)
+            val usable = (trackW - thumbW).coerceAtLeast(1)
+            val contentW = cb.getNumColumns() * cb.getCurrentCellSize()
+            val viewportW = s.width
+            val maxScrollX = (contentW - viewportW).coerceAtLeast(1)
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    isScrollIndicatorDragging = true
+                    scrollIndicatorDragStartX = event.x
+                    scrollIndicatorDragStartScrollX = s.scrollX
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (!isScrollIndicatorDragging) return@setOnTouchListener false
+                    val dx = event.x - scrollIndicatorDragStartX
+                    val scrollDelta = (dx / usable * maxScrollX).roundToInt()
+                    val newScrollX = (scrollIndicatorDragStartScrollX + scrollDelta).coerceIn(0, maxScrollX)
+                    s.scrollTo(newScrollX, 0)
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    isScrollIndicatorDragging = false
+                    true
+                }
+                else -> false
+            }
+        }
+
+        return container
+    }
+
+    fun updateScrollIndicator() {
+        val s = cb.getHScrollView() ?: return
+        val container = scrollIndicatorContainer ?: return
+        val thumb = scrollIndicatorThumb ?: return
+        val viewportW = s.width
+        val contentW = cb.getNumColumns() * cb.getCurrentCellSize()
+        if (viewportW <= 0 || contentW <= viewportW) {
+            container.visibility = View.GONE
+            return
+        }
+        container.visibility = View.VISIBLE
+        container.post {
+            val trackW = container.width
+            if (trackW <= 0) return@post
+            val density = context.resources.displayMetrics.density
+            val ratio = viewportW.toFloat() / contentW
+            val thumbW = (trackW * ratio).roundToInt().coerceAtLeast((24 * density).roundToInt())
+            val usable = (trackW - thumbW).coerceAtLeast(0)
+            val maxScrollX = (contentW - viewportW).coerceAtLeast(1)
+            val thumbLeft = (usable * s.scrollX.toFloat() / maxScrollX).roundToInt()
+            thumb.layoutParams = (thumb.layoutParams as FrameLayout.LayoutParams).apply {
+                width = thumbW
+                leftMargin = thumbLeft
+            }
+            thumb.requestLayout()
+        }
     }
 
     // ── Bottom panel ─────────────────────────────────────────────────────
@@ -92,7 +197,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             layoutParams = FrameLayout.LayoutParams(MP, toolbarH)
             setBackgroundColor(Color.WHITE)
 
-            val tCell = buildCategoryCell("工具", toolbarH) { cb.onToolsToggle() }
+            val tCell = buildCategoryCell("⚙", toolbarH) { cb.onToolsToggle() }
             toolsCell = tCell
             addView(tCell)
             addView(divider(toolbarH, dp))
@@ -272,7 +377,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             visibility = View.GONE
 
             addView(TextView(context).apply {
-                text = "收起 ▾"; textSize = 12f; gravity = Gravity.CENTER
+                text = "▾"; textSize = 12f; gravity = Gravity.CENTER
                 setTextColor(context.getColor(R.color.text_light))
                 layoutParams = LinearLayout.LayoutParams(MP, (36 * dp).roundToInt())
                 setOnClickListener { cb.onCollapsePanel() }
@@ -303,7 +408,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             setPadding(hPad, vPad, hPad, vPad)
 
             addView(TextView(context).apply {
-                text = "插入"; textSize = 11f
+                text = context.getString(R.string.label_insert); textSize = 11f
                 setTextColor(context.getColor(R.color.text_lighter))
                 layoutParams = LinearLayout.LayoutParams(WC, WC).also {
                     it.marginEnd = (8 * dp).roundToInt()
@@ -315,7 +420,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             })
 
             addView(TextView(context).apply {
-                text = "選圖"; textSize = 13f; gravity = Gravity.CENTER
+                text = context.getString(R.string.btn_select_image); textSize = 13f; gravity = Gravity.CENTER
                 setTextColor(context.getColor(R.color.text_dark))
                 background = GradientDrawable().apply {
                     setColor(Color.TRANSPARENT)
@@ -350,7 +455,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             setPadding((12 * dp).roundToInt(), 0, 0, 0)
 
             addView(TextView(context).apply {
-                text = "底色"; textSize = 11f
+                text = context.getString(R.string.label_bg_color); textSize = 11f
                 setTextColor(context.getColor(R.color.text_lighter))
                 layoutParams = LinearLayout.LayoutParams(WC, WC).also {
                     it.marginEnd = (8 * dp).roundToInt()
@@ -405,7 +510,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 layoutParams = LinearLayout.LayoutParams(swatchSz, swatchSz)
             })
             addView(TextView(context).apply {
-                text = option.label; textSize = 9f
+                text = context.getString(option.labelRes); textSize = 9f
                 setTextColor(Color.DKGRAY); gravity = Gravity.CENTER
                 layoutParams = LinearLayout.LayoutParams(swatchSz, WC)
             })
@@ -447,13 +552,13 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             layoutParams = LinearLayout.LayoutParams(WC, WC)
         }
 
-        addView(label("字體"))
+        addView(label(context.getString(R.string.label_font)))
         addView(buildFontSpinner(dp).also {
             it.layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
         })
         addView(rowDivider())
 
-        addView(label("字號"))
+        addView(label(context.getString(R.string.label_font_size)))
         val sizeChip = chip(cb.getFontSizeSp().toInt().toString())
         fontSizeLabelRef = sizeChip
         sizeChip.setOnClickListener {
@@ -474,7 +579,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
         addView(sizeChip)
         addView(rowDivider())
 
-        addView(label("字距"))
+        addView(label(context.getString(R.string.label_word_gap)))
         val initialGapIdx = AppConfig.WORD_GAP_LIST.indexOfFirst { e -> e.first == cb.getWordGapDp() }
             .coerceAtLeast(0)
         val gapChip = chip(AppConfig.WORD_GAP_LIST[initialGapIdx].second)
@@ -546,18 +651,44 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 layoutParams = LinearLayout.LayoutParams(MP, WC)
-                val hPad = (12 * dp).roundToInt();
+                val hPad = (12 * dp).roundToInt()
                 val vPad = (10 * dp).roundToInt()
                 setPadding(hPad, vPad, hPad, vPad)
 
                 addView(TextView(context).apply {
-                    text = "輸入模式"; textSize = 11f
+                    text = context.getString(R.string.btn_input_field); textSize = 13f; gravity = Gravity.CENTER
+                    setTextColor(context.getColor(R.color.text_dark))
+                    background = GradientDrawable().apply {
+                        setColor(Color.TRANSPARENT)
+                        setStroke((1f * dp).roundToInt(), context.getColor(R.color.stroke))
+                        cornerRadius = 20f * dp
+                    }
+                    val hP = (14 * dp).roundToInt(); val vP = (6 * dp).roundToInt()
+                    setPadding(hP, vP, hP, vP)
+                    layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                        it.marginEnd = (8 * dp).roundToInt()
+                    }
+                    setOnClickListener { cb.onInputFieldEdit() }
+                })
+
+                // Thin divider separating the Field chip from the Input Mode label
+                addView(View(context).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        (1f * dp).roundToInt(), (24 * dp).roundToInt()
+                    ).also {
+                        it.marginStart = (4 * dp).roundToInt()
+                        it.marginEnd   = (12 * dp).roundToInt()
+                    }
+                    setBackgroundColor(context.getColor(R.color.divider))
+                })
+
+                addView(TextView(context).apply {
+                    text = context.getString(R.string.label_input_mode); textSize = 11f
                     setTextColor(context.getColor(R.color.text_lighter))
                     layoutParams = LinearLayout.LayoutParams(WC, WC).also {
                         it.marginEnd = (8 * dp).roundToInt()
                     }
                 })
-
                 addView(View(context).apply {
                     layoutParams = LinearLayout.LayoutParams(0, 0, 1f)
                 })
@@ -568,7 +699,8 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                     layoutParams = LinearLayout.LayoutParams(WC, WC)
                 }
                 modeChipContainer = chips
-                listOf(InputMode.SCATTER to "灑花輸入", InputMode.SEQUENTIAL to "連續輸入")
+                listOf(InputMode.SCATTER to context.getString(R.string.mode_scatter),
+                       InputMode.SEQUENTIAL to context.getString(R.string.mode_sequential))
                     .forEach { (mode, label) ->
                         chips.addView(TextView(context).apply {
                             text = label; textSize = 13f; gravity = Gravity.CENTER
@@ -605,7 +737,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 setPadding(hPad, vPad, hPad, vPad)
 
                 addView(TextView(context).apply {
-                    text = "檔案"; textSize = 11f
+                    text = context.getString(R.string.label_file); textSize = 11f
                     setTextColor(context.getColor(R.color.text_lighter))
                     layoutParams = LinearLayout.LayoutParams(WC, WC).also {
                         it.marginEnd = (8 * dp).roundToInt()
@@ -624,7 +756,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 addView(nameTv)
 
                 addView(TextView(context).apply {
-                    text = "所有文檔"; textSize = 12f; gravity = Gravity.CENTER
+                    text = context.getString(R.string.btn_all_docs); textSize = 12f; gravity = Gravity.CENTER
                     setTextColor(context.getColor(R.color.text_dark))
                     background = GradientDrawable().apply {
                         setColor(Color.TRANSPARENT)
@@ -672,23 +804,23 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 elevation = 16f * dp
                 val pad = (6 * dp).roundToInt(); setPadding(0, pad, 0, pad)
                 visibility = View.GONE
-                addView(btn("複製") { cb.onCopySelection() })
+                addView(btn(context.getString(R.string.action_copy)) { cb.onCopySelection() })
                 addView(sep())
-                addView(btn("剪下") { cb.onCutSelection() })
+                addView(btn(context.getString(R.string.action_cut)) { cb.onCutSelection() })
                 addView(sep())
-                addView(btn("貼上") { cb.onPasteAtSelection() })
+                addView(btn(context.getString(R.string.action_paste)) { cb.onPasteAtSelection() })
                 addView(sep())
-                addView(btn("選取整行") { cb.onSelectEntireLine() })
+                addView(btn(context.getString(R.string.action_select_line)) { cb.onSelectEntireLine() })
                 addView(sep())
-                addView(btn("選取整段") { cb.onSelectEntireParagraph() })
+                addView(btn(context.getString(R.string.action_select_paragraph)) { cb.onSelectEntireParagraph() })
                 addView(sep())
-                addView(btn("全選") { cb.onSelectAll() })
+                addView(btn(context.getString(R.string.action_select_all)) { cb.onSelectAll() })
             }
         }
 
         fun buildHandlePasteView(dp: Float): TextView =
             TextView(context).apply {
-                text = "貼上"
+                text = context.getString(R.string.action_paste)
                 textSize = 13f
                 gravity = Gravity.CENTER
                 setTextColor(context.getColor(R.color.text_dark))

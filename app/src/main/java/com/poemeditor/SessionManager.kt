@@ -6,7 +6,10 @@ object SessionManager {
 
     const val MAX_INSERTED_IMAGES = 5
 
-    data class SessionMeta(val id: String, val name: String, val lastAccessed: Long) {
+    data class SessionMeta(
+        val id: String, val name: String, val lastAccessed: Long,
+        val wordCount: Int = 0, val imageCount: Int = 0
+    ) {
         fun formattedDate(): String {
             val cal = java.util.Calendar.getInstance().also { it.timeInMillis = lastAccessed }
             val now = java.util.Calendar.getInstance()
@@ -23,6 +26,22 @@ object SessionManager {
 
     fun sessionsDir(filesDir: File): File =
         File(filesDir, "poems").also { it.mkdirs() }
+
+    private fun countWordsInJson(j: org.json.JSONObject): Int {
+        val cols = j.optJSONArray("columnData") ?: return 0
+        var count = 0
+        for (c in 0 until cols.length()) {
+            val rows = cols.optJSONArray(c) ?: continue
+            for (r in 0 until rows.length()) {
+                val ch = rows.optString(r)
+                if (ch.isNotBlank() && ch != "​" && ch != "↵") count++
+            }
+        }
+        return count
+    }
+
+    private fun countImagesInJson(j: org.json.JSONObject): Int =
+        j.optJSONArray("insertedImages")?.length() ?: 0
 
     // ── JSON helpers ───────────────────────────────────────────────────
 
@@ -91,7 +110,13 @@ object SessionManager {
             .mapNotNull { file ->
                 try {
                     val j = org.json.JSONObject(file.readText())
-                    SessionMeta(j.getString("id"), j.getString("name"), j.getLong("lastAccessed"))
+                    SessionMeta(
+                        id = j.getString("id"),
+                        name = j.getString("name"),
+                        lastAccessed = j.getLong("lastAccessed"),
+                        wordCount = countWordsInJson(j),
+                        imageCount = countImagesInJson(j)
+                    )
                 } catch (_: Exception) { null }
             }
             .sortedByDescending { it.lastAccessed }
@@ -104,7 +129,9 @@ object SessionManager {
         bgImageMatrixValues: FloatArray?,
         inputMode: String,
         insertedImages: List<InsertedImageState> = emptyList(),
-        activeImageIndex: Int = -1
+        activeImageIndex: Int = -1,
+        gridPadTop: Int = 0, gridPadBottom: Int = 0,
+        gridPadLeft: Int = 0, gridPadRight: Int = 0
     ) {
         val normalizedImages = insertedImages.take(5)
         val normalizedActiveIndex = activeImageIndex.coerceIn(-1, normalizedImages.lastIndex)
@@ -139,6 +166,10 @@ object SessionManager {
             put("insertedImages", imagesArr)
             put("activeImageIndex", normalizedActiveIndex)
             put("inputMode", inputMode)
+            put("gridPadTop",    gridPadTop)
+            put("gridPadBottom", gridPadBottom)
+            put("gridPadLeft",   gridPadLeft)
+            put("gridPadRight",  gridPadRight)
         }
         File(sessionsDir(filesDir), "$id.json").writeText(j.toString())
     }
@@ -159,12 +190,12 @@ object SessionManager {
         File(sessionsDir(filesDir), "$id.json").delete()
     }
 
-    fun nextNewSessionName(filesDir: File): String {
+    fun nextNewSessionName(filesDir: File, baseName: String): String {
         val names = listSessions(filesDir).map { it.name }.toSet()
-        if (!names.contains("文檔")) return "文檔"
+        if (!names.contains(baseName)) return baseName
         var i = 2
-        while (names.contains("文檔 $i")) i++
-        return "文檔 $i"
+        while (names.contains("$baseName $i")) i++
+        return "$baseName $i"
     }
 
     fun renameSession(filesDir: File, id: String, newName: String) {
@@ -186,12 +217,15 @@ object SessionManager {
         bgImageMatrixValues: FloatArray?,
         inputMode: String,
         insertedImages: List<InsertedImageState> = emptyList(),
-        activeImageIndex: Int = -1
+        activeImageIndex: Int = -1,
+        gridPadTop: Int = 0, gridPadBottom: Int = 0,
+        gridPadLeft: Int = 0, gridPadRight: Int = 0
     ) {
         if (listSessions(filesDir).isEmpty()) {
             saveSession(filesDir, id, name, columnData, columnBreaks,
                 fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
-                bgImageMatrixValues, inputMode, insertedImages, activeImageIndex)
+                bgImageMatrixValues, inputMode, insertedImages, activeImageIndex,
+                gridPadTop, gridPadBottom, gridPadLeft, gridPadRight)
         }
     }
 }

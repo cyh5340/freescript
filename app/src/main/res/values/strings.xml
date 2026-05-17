@@ -1,4 +1,90 @@
 <resources>
-    <string name="app_name">直書</string>
-    <string name="add_text_hint">Add text here</string>
+    <string name="app_name">poemeditor</string>
+
+    <!-- Tools panel -->
+    <string name="label_insert">Insert</string>
+    <string name="btn_select_image">Image</string>
+    <string name="label_bg_color">Background</string>
+    <string name="label_font">Font</string>
+    <string name="label_font_size">Size</string>
+    <string name="label_word_gap">Spacing</string>
+    <string name="label_input_mode">Input Mode</string>
+    <string name="btn_input_field">Field</string>
+    <string name="mode_scatter">Free</string>
+    <string name="mode_sequential">Linear</string>
+    <string name="label_file">File</string>
+    <string name="btn_all_docs">All Files</string>
+
+    <!-- Selection menu -->
+    <string name="action_copy">Copy</string>
+    <string name="action_cut">Cut</string>
+    <string name="action_paste">Paste</string>
+    <string name="action_select_line">Select Line</string>
+    <string name="action_select_paragraph">Select Para</string>
+    <string name="action_select_all">Select All</string>
+
+    <!-- Toasts -->
+    <string name="toast_copied">Copied</string>
+    <string name="toast_cut">Cut</string>
+    <string name="toast_pasted">Pasted</string>
+    <string name="toast_max_images">Maximum 5 images per document</string>
+    <string name="toast_session_deleted">Deleted</string>
+
+    <!-- Screenshot -->
+    <string name="screenshot_saved">Saved to gallery</string>
+    <string name="screenshot_failed">Save failed</string>
+    <string name="screenshot_saving">Saving…</string>
+    <string name="screenshot_cancel">Cancel</string>
+    <string name="screenshot_confirm">Confirm</string>
+
+    <!-- Session list -->
+    <string name="session_list_title">All Documents</string>
+    <string name="btn_new_session">New</string>
+    <string name="hint_search_sessions">Search documents</string>
+    <string name="filter_all">All</string>
+    <string name="filter_this_week">This Week</string>
+    <string name="filter_this_month">This Month</string>
+    <string name="session_empty_message">No matching documents</string>
+    <string name="session_current_indicator"> (Current)</string>
+    <string name="session_stat_chars"> chars</string>
+    <string name="session_stat_images"> img</string>
+
+    <!-- Dialogs -->
+    <string name="dialog_new_session_title">New Document</string>
+    <string name="dialog_rename_title">Rename</string>
+    <string name="dialog_delete_title">Delete Document</string>
+    <string name="dialog_delete_message">Delete \"%s\"? This cannot be undone.</string>
+    <string name="dialog_ok">OK</string>
+    <string name="dialog_cancel">Cancel</string>
+
+    <!-- Default session name -->
+    <string name="default_session_name">Document</string>
+
+    <!-- Background color labels -->
+    <string name="bg_color_white">White</string>
+    <string name="bg_color_cream">Cream</string>
+    <string name="bg_color_antique">Antique</string>
+    <string name="bg_color_pink">Pink</string>
+    <string name="bg_color_orange">Orange</string>
+    <string name="bg_color_green">Green</string>
+    <string name="bg_color_blue">Blue</string>
+    <string name="bg_color_purple">Purple</string>
+    <string name="bg_color_tea">Tea</string>
+    <string name="bg_color_brown">Brown</string>
+    <string name="bg_color_night">Night</string>
+    <string name="bg_color_dark">Dark</string>
+    <string name="bg_color_black">Black</string>
+
+    <!-- Text color labels -->
+    <string name="text_color_ink">Ink</string>
+    <string name="text_color_charcoal">Charcoal</string>
+    <string name="text_color_gray">Gray</string>
+    <string name="text_color_white">White</string>
+    <string name="text_color_indigo">Indigo</string>
+    <string name="text_color_vermilion">Red</string>
+    <string name="text_color_gold">Gold</string>
+    <string name="text_color_jade">Jade</string>
+    <string name="text_color_purple">Purple</string>
+    <string name="text_color_crimson">Crimson</string>
+    <string name="text_color_blue">Blue</string>
 </resources>

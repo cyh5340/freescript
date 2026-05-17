@@ -3,39 +3,39 @@ package com.poemeditor
 import android.graphics.Color
 import android.graphics.Typeface
 
-data class ColorOption(val color: Int, val label: String)
+data class ColorOption(val color: Int, val labelRes: Int)
 data class FontEntry(val label: String, val typeface: Typeface)
 
 object AppConfig {
 
     val BG_COLORS = listOf(
-        ColorOption(Color.WHITE,                 "白"),
-        ColorOption(Color.parseColor("#FFF8E7"), "米"),
-        ColorOption(Color.parseColor("#F5E6CA"), "古"),
-        ColorOption(Color.parseColor("#FDE8E8"), "粉"),
-        ColorOption(Color.parseColor("#FFE0B2"), "橙"),
-        ColorOption(Color.parseColor("#E8F5E9"), "草"),
-        ColorOption(Color.parseColor("#E8F4F8"), "藍"),
-        ColorOption(Color.parseColor("#EDE7F6"), "紫"),
-        ColorOption(Color.parseColor("#EFEBE9"), "茶"),
-        ColorOption(Color.parseColor("#3E2723"), "棕"),
-        ColorOption(Color.parseColor("#1A1A2E"), "夜"),
-        ColorOption(Color.parseColor("#2B2B2B"), "深"),
-        ColorOption(Color.BLACK,                 "黑"),
+        ColorOption(Color.WHITE,                 R.string.bg_color_white),
+        ColorOption(Color.parseColor("#FFF8E7"), R.string.bg_color_cream),
+        ColorOption(Color.parseColor("#F5E6CA"), R.string.bg_color_antique),
+        ColorOption(Color.parseColor("#FDE8E8"), R.string.bg_color_pink),
+        ColorOption(Color.parseColor("#FFE0B2"), R.string.bg_color_orange),
+        ColorOption(Color.parseColor("#E8F5E9"), R.string.bg_color_green),
+        ColorOption(Color.parseColor("#E8F4F8"), R.string.bg_color_blue),
+        ColorOption(Color.parseColor("#EDE7F6"), R.string.bg_color_purple),
+        ColorOption(Color.parseColor("#EFEBE9"), R.string.bg_color_tea),
+        ColorOption(Color.parseColor("#3E2723"), R.string.bg_color_brown),
+        ColorOption(Color.parseColor("#1A1A2E"), R.string.bg_color_night),
+        ColorOption(Color.parseColor("#2B2B2B"), R.string.bg_color_dark),
+        ColorOption(Color.BLACK,                 R.string.bg_color_black),
     )
 
     val TEXT_COLORS = listOf(
-        ColorOption(Color.parseColor("#212121"), "墨"),
-        ColorOption(Color.parseColor("#333333"), "炭"),
-        ColorOption(Color.parseColor("#757575"), "灰"),
-        ColorOption(Color.WHITE,                 "白"),
-        ColorOption(Color.parseColor("#1B263B"), "藍墨"),
-        ColorOption(Color.parseColor("#B22222"), "硃"),
-        ColorOption(Color.parseColor("#D4AF37"), "金"),
-        ColorOption(Color.parseColor("#00A86B"), "翠"),
-        ColorOption(Color.parseColor("#4A192C"), "紫"),
-        ColorOption(Color.parseColor("#D32F2F"), "赤"),
-        ColorOption(Color.parseColor("#1976D2"), "藍"),
+        ColorOption(Color.parseColor("#212121"), R.string.text_color_ink),
+        ColorOption(Color.parseColor("#333333"), R.string.text_color_charcoal),
+        ColorOption(Color.parseColor("#757575"), R.string.text_color_gray),
+        ColorOption(Color.WHITE,                 R.string.text_color_white),
+        ColorOption(Color.parseColor("#1B263B"), R.string.text_color_indigo),
+        ColorOption(Color.parseColor("#B22222"), R.string.text_color_vermilion),
+        ColorOption(Color.parseColor("#D4AF37"), R.string.text_color_gold),
+        ColorOption(Color.parseColor("#00A86B"), R.string.text_color_jade),
+        ColorOption(Color.parseColor("#4A192C"), R.string.text_color_purple),
+        ColorOption(Color.parseColor("#D32F2F"), R.string.text_color_crimson),
+        ColorOption(Color.parseColor("#1976D2"), R.string.text_color_blue),
     )
 
     val FONT_SIZE_LIST = listOf(
@@ -45,7 +45,7 @@ object AppConfig {
     )
 
     val WORD_GAP_LIST = listOf(
-        3f to "0", 5f to "2", 8f to "5", 10f to "7", 
+        3f to "0", 5f to "2", 8f to "5", 10f to "7",
         12f to "9", 15f to "12", 18f to "15", 20f to "17",
         22f to "19", 25f to "22", 28f to "25", 30f to "27"
     )
