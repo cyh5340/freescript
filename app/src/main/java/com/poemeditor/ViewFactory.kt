@@ -20,11 +20,15 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
     var toolsCell: LinearLayout? = null
     var docFileNameRef: TextView? = null
     var modeChipContainer: LinearLayout? = null
+    var modeInputSectionRef: LinearLayout? = null
+    var inputFieldCellRef: TextView? = null
+    var inputFieldDividerRef: View? = null
     var fontSpinnerRef: Spinner? = null
     var fontSizeLabelRef: TextView? = null
     var gapValueLabelRef: TextView? = null
     var undoButton: TextView? = null
     var redoButton: TextView? = null
+    var keyboardCell: LinearLayout? = null
     var insertImageContainer: LinearLayout? = null
     var scrollIndicatorContainer: FrameLayout? = null
     var scrollIndicatorThumb: View? = null
@@ -32,6 +36,8 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
     private var isScrollIndicatorDragging = false
     private var scrollIndicatorDragStartX = 0f
     private var scrollIndicatorDragStartScrollX = 0
+    private var scrollIndicatorDragStartY = 0f
+    private var scrollIndicatorDragStartScrollY = 0
 
     interface Callbacks {
         fun provideFontCatalogue(): List<FontEntry>
@@ -63,12 +69,15 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
         fun onUndoAction()
         fun onRedoAction()
         fun onScreenshot()
+        fun onKeyboardToggle()
         fun onInputFieldEdit()
         fun canUndo(): Boolean
         fun canRedo(): Boolean
         fun getNumColumns(): Int
         fun getCurrentCellSize(): Int
         fun getHScrollView(): HorizontalScrollView?
+        fun getMainScrollView(): NestedScrollView
+        fun getCanvasMode(): CanvasMode
     }
 
     // ── Scroll indicator ────────────────────────────────────────���────────
@@ -105,33 +114,56 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
         scrollIndicatorContainer = container
 
         container.setOnTouchListener { v, event ->
-            val s = cb.getHScrollView() ?: return@setOnTouchListener false
             val trackW = v.width
             val thumbW = (scrollIndicatorThumb?.width ?: 0)
             val usable = (trackW - thumbW).coerceAtLeast(1)
-            val contentW = cb.getNumColumns() * cb.getCurrentCellSize()
-            val viewportW = s.width
-            val maxScrollX = (contentW - viewportW).coerceAtLeast(1)
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    isScrollIndicatorDragging = true
-                    scrollIndicatorDragStartX = event.x
-                    scrollIndicatorDragStartScrollX = s.scrollX
-                    true
+            val contentSize = cb.getNumColumns() * cb.getCurrentCellSize()
+            if (cb.getCanvasMode() == CanvasMode.HORIZONTAL) {
+                val sv = cb.getMainScrollView()
+                val viewportH = sv.height
+                val maxScrollY = (contentSize - viewportH).coerceAtLeast(1)
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        isScrollIndicatorDragging = true
+                        scrollIndicatorDragStartX = event.x
+                        scrollIndicatorDragStartScrollY = sv.scrollY
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (!isScrollIndicatorDragging) return@setOnTouchListener false
+                        val dx = event.x - scrollIndicatorDragStartX
+                        val scrollDelta = (dx / usable * maxScrollY).roundToInt()
+                        sv.scrollTo(0, (scrollIndicatorDragStartScrollY + scrollDelta).coerceIn(0, maxScrollY))
+                        true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        isScrollIndicatorDragging = false; true
+                    }
+                    else -> false
                 }
-                MotionEvent.ACTION_MOVE -> {
-                    if (!isScrollIndicatorDragging) return@setOnTouchListener false
-                    val dx = event.x - scrollIndicatorDragStartX
-                    val scrollDelta = (dx / usable * maxScrollX).roundToInt()
-                    val newScrollX = (scrollIndicatorDragStartScrollX + scrollDelta).coerceIn(0, maxScrollX)
-                    s.scrollTo(newScrollX, 0)
-                    true
+            } else {
+                val s = cb.getHScrollView() ?: return@setOnTouchListener false
+                val viewportW = s.width
+                val maxScrollX = (contentSize - viewportW).coerceAtLeast(1)
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        isScrollIndicatorDragging = true
+                        scrollIndicatorDragStartX = event.x
+                        scrollIndicatorDragStartScrollX = s.scrollX
+                        true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (!isScrollIndicatorDragging) return@setOnTouchListener false
+                        val dx = event.x - scrollIndicatorDragStartX
+                        val scrollDelta = (dx / usable * maxScrollX).roundToInt()
+                        s.scrollTo((scrollIndicatorDragStartScrollX + scrollDelta).coerceIn(0, maxScrollX), 0)
+                        true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        isScrollIndicatorDragging = false; true
+                    }
+                    else -> false
                 }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    isScrollIndicatorDragging = false
-                    true
-                }
-                else -> false
             }
         }
 
@@ -139,30 +171,48 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
     }
 
     fun updateScrollIndicator() {
-        val s = cb.getHScrollView() ?: return
         val container = scrollIndicatorContainer ?: return
         val thumb = scrollIndicatorThumb ?: return
-        val viewportW = s.width
-        val contentW = cb.getNumColumns() * cb.getCurrentCellSize()
-        if (viewportW <= 0 || contentW <= viewportW) {
-            container.visibility = View.GONE
-            return
-        }
-        container.visibility = View.VISIBLE
-        container.post {
-            val trackW = container.width
-            if (trackW <= 0) return@post
-            val density = context.resources.displayMetrics.density
-            val ratio = viewportW.toFloat() / contentW
-            val thumbW = (trackW * ratio).roundToInt().coerceAtLeast((24 * density).roundToInt())
-            val usable = (trackW - thumbW).coerceAtLeast(0)
-            val maxScrollX = (contentW - viewportW).coerceAtLeast(1)
-            val thumbLeft = (usable * s.scrollX.toFloat() / maxScrollX).roundToInt()
-            thumb.layoutParams = (thumb.layoutParams as FrameLayout.LayoutParams).apply {
-                width = thumbW
-                leftMargin = thumbLeft
+        val contentSize = cb.getNumColumns() * cb.getCurrentCellSize()
+        val density = context.resources.displayMetrics.density
+        val minThumbPx = (24 * density).roundToInt()
+        if (cb.getCanvasMode() == CanvasMode.HORIZONTAL) {
+            val sv = cb.getMainScrollView()
+            val viewportH = sv.height
+            if (viewportH <= 0 || contentSize <= viewportH) { container.visibility = View.GONE; return }
+            container.visibility = View.VISIBLE
+            container.post {
+                val trackW = container.width
+                if (trackW <= 0) return@post
+                val ratio = viewportH.toFloat() / contentSize
+                val thumbW = (trackW * ratio).roundToInt().coerceAtLeast(minThumbPx)
+                val usable = (trackW - thumbW).coerceAtLeast(0)
+                val maxScrollY = (contentSize - viewportH).coerceAtLeast(1)
+                val thumbLeft = (usable * sv.scrollY.toFloat() / maxScrollY).roundToInt()
+                thumb.layoutParams = (thumb.layoutParams as FrameLayout.LayoutParams).apply {
+                    width = thumbW; leftMargin = thumbLeft
+                }
+                thumb.requestLayout()
             }
-            thumb.requestLayout()
+        } else {
+            if (cb.getCanvasMode() == CanvasMode.FREESTYLE) { container.visibility = View.GONE; return }
+            val s = cb.getHScrollView() ?: return
+            val viewportW = s.width
+            if (viewportW <= 0 || contentSize <= viewportW) { container.visibility = View.GONE; return }
+            container.visibility = View.VISIBLE
+            container.post {
+                val trackW = container.width
+                if (trackW <= 0) return@post
+                val ratio = viewportW.toFloat() / contentSize
+                val thumbW = (trackW * ratio).roundToInt().coerceAtLeast(minThumbPx)
+                val usable = (trackW - thumbW).coerceAtLeast(0)
+                val maxScrollX = (contentSize - viewportW).coerceAtLeast(1)
+                val thumbLeft = (usable * s.scrollX.toFloat() / maxScrollX).roundToInt()
+                thumb.layoutParams = (thumb.layoutParams as FrameLayout.LayoutParams).apply {
+                    width = thumbW; leftMargin = thumbLeft
+                }
+                thumb.requestLayout()
+            }
         }
     }
 
@@ -195,7 +245,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             layoutParams = FrameLayout.LayoutParams(MP, toolbarH)
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(context.getColor(R.color.surface))
 
             val tCell = buildCategoryCell("⚙", toolbarH) { cb.onToolsToggle() }
             toolsCell = tCell
@@ -238,6 +288,22 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
 
             addView(divider(toolbarH, dp))
 
+            val kCell = buildCategoryCell("⌨", toolbarH) { cb.onKeyboardToggle() }
+            keyboardCell = kCell
+            addView(kCell)
+
+            divider(toolbarH, dp).also { inputFieldDividerRef = it; addView(it) }
+
+            addView(TextView(context).apply {
+                text = "⌗"; textSize = 18f; gravity = Gravity.CENTER
+                setTextColor(context.getColor(R.color.text_dark))
+                layoutParams = LinearLayout.LayoutParams(iconW, toolbarH)
+                setOnClickListener { cb.onInputFieldEdit() }
+                inputFieldCellRef = this
+            })
+
+            addView(divider(toolbarH, dp))
+
             addView(TextView(context).apply {
                 text = "⛶"; textSize = 14f; gravity = Gravity.CENTER
                 setTextColor(context.getColor(R.color.text_dark))
@@ -251,7 +317,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             layoutParams = FrameLayout.LayoutParams(MP, toolbarH)
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(context.getColor(R.color.surface))
             visibility = View.GONE
 
             addView(TextView(context).apply {
@@ -275,7 +341,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
 
         return FrameLayout(context).apply {
             layoutParams = LinearLayout.LayoutParams(MP, toolbarH)
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(context.getColor(R.color.surface))
             addView(mainBar)
             addView(punctBar)
         }
@@ -511,7 +577,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             })
             addView(TextView(context).apply {
                 text = context.getString(option.labelRes); textSize = 9f
-                setTextColor(Color.DKGRAY); gravity = Gravity.CENTER
+                setTextColor(context.getColor(R.color.text_medium)); gravity = Gravity.CENTER
                 layoutParams = LinearLayout.LayoutParams(swatchSz, WC)
             })
             setOnClickListener { onClick() }
@@ -641,7 +707,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 val hPad = ((if (compact) 4 else 16) * dp).roundToInt()
                 val vPad = ((if (compact) 2 else 12) * dp).roundToInt()
                 setPadding(hPad, vPad, hPad, vPad)
-                if (!compact) setBackgroundColor(Color.WHITE)
+                if (!compact) setBackgroundColor(context.getColor(R.color.surface))
             }
         }
 
@@ -655,75 +721,61 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 val vPad = (10 * dp).roundToInt()
                 setPadding(hPad, vPad, hPad, vPad)
 
-                addView(TextView(context).apply {
-                    text = context.getString(R.string.btn_input_field); textSize = 13f; gravity = Gravity.CENTER
-                    setTextColor(context.getColor(R.color.text_dark))
-                    background = GradientDrawable().apply {
-                        setColor(Color.TRANSPARENT)
-                        setStroke((1f * dp).roundToInt(), context.getColor(R.color.stroke))
-                        cornerRadius = 20f * dp
-                    }
-                    val hP = (14 * dp).roundToInt(); val vP = (6 * dp).roundToInt()
-                    setPadding(hP, vP, hP, vP)
-                    layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                        it.marginEnd = (8 * dp).roundToInt()
-                    }
-                    setOnClickListener { cb.onInputFieldEdit() }
-                })
-
-                // Thin divider separating the Field chip from the Input Mode label
-                addView(View(context).apply {
-                    layoutParams = LinearLayout.LayoutParams(
-                        (1f * dp).roundToInt(), (24 * dp).roundToInt()
-                    ).also {
-                        it.marginStart = (4 * dp).roundToInt()
-                        it.marginEnd   = (12 * dp).roundToInt()
-                    }
-                    setBackgroundColor(context.getColor(R.color.divider))
-                })
-
-                addView(TextView(context).apply {
-                    text = context.getString(R.string.label_input_mode); textSize = 11f
-                    setTextColor(context.getColor(R.color.text_lighter))
-                    layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                        it.marginEnd = (8 * dp).roundToInt()
-                    }
-                })
-                addView(View(context).apply {
-                    layoutParams = LinearLayout.LayoutParams(0, 0, 1f)
-                })
-
-                val chips = LinearLayout(context).apply {
+                // Right section: Input Mode label + spacer + mode chips
+                // Wrapped so updateModeChipVisibility() can hide it for non-VERTICAL sessions.
+                val inputModeSection = LinearLayout(context).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
-                    layoutParams = LinearLayout.LayoutParams(WC, WC)
-                }
-                modeChipContainer = chips
-                listOf(InputMode.SCATTER to context.getString(R.string.mode_scatter),
-                       InputMode.SEQUENTIAL to context.getString(R.string.mode_sequential))
-                    .forEach { (mode, label) ->
-                        chips.addView(TextView(context).apply {
-                            text = label; textSize = 13f; gravity = Gravity.CENTER
-                            tag = mode
-                            setTextColor(context.getColor(R.color.text_dark))
-                            background = GradientDrawable().apply {
-                                setColor(
-                                    if (cb.getInputMode() == mode) context.getColor(R.color.chip_active)
-                                    else Color.TRANSPARENT
-                                )
-                                setStroke((1f * dp).roundToInt(), context.getColor(R.color.stroke))
-                                cornerRadius = 20f * dp
-                            }
-                            val hP = (14 * dp).roundToInt();
-                            val vP = (6 * dp).roundToInt()
-                            setPadding(hP, vP, hP, vP)
-                            layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                                it.marginEnd = (6 * dp).roundToInt()
-                            }
-                            setOnClickListener { cb.onModeSelected(mode) }
-                        })
+                    layoutParams = LinearLayout.LayoutParams(MP, WC)
+
+                    addView(TextView(context).apply {
+                        text = context.getString(R.string.label_input_mode); textSize = 11f
+                        setSingleLine(); maxLines = 1
+                        setTextColor(context.getColor(R.color.text_lighter))
+                        layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                            it.marginEnd = (8 * dp).roundToInt()
+                        }
+                    })
+                    // Flex spacer: pushes chips to the trailing edge without forcing the label out
+                    addView(View(context).apply {
+                        layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
+                    })
+
+                    val chips = LinearLayout(context).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        layoutParams = LinearLayout.LayoutParams(WC, WC)
                     }
-                addView(chips)
+                    modeChipContainer = chips
+                    listOf(InputMode.SCATTER to context.getString(R.string.mode_scatter),
+                           InputMode.SEQUENTIAL to context.getString(R.string.mode_sequential))
+                        .forEach { (mode, label) ->
+                            chips.addView(TextView(context).apply {
+                                text = label; textSize = 12f; gravity = Gravity.CENTER
+                                setSingleLine(); maxLines = 1
+                                tag = mode
+                                setTextColor(context.getColor(R.color.text_dark))
+                                background = GradientDrawable().apply {
+                                    setColor(
+                                        if (cb.getInputMode() == mode) context.getColor(R.color.chip_active)
+                                        else Color.TRANSPARENT
+                                    )
+                                    setStroke((1f * dp).roundToInt(), context.getColor(R.color.stroke))
+                                    cornerRadius = 20f * dp
+                                }
+                                val hP = (10 * dp).roundToInt()
+                                val vP = (6 * dp).roundToInt()
+                                setPadding(hP, vP, hP, vP)
+                                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                                    it.marginEnd = (6 * dp).roundToInt()
+                                }
+                                setOnClickListener { cb.onModeSelected(mode) }
+                            })
+                        }
+                    addView(chips)
+                }
+                modeInputSectionRef = inputModeSection
+                addView(inputModeSection)
             }
 
         // ── File header row (檔案 section) ────────────────────────────────────
@@ -756,7 +808,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 addView(nameTv)
 
                 addView(TextView(context).apply {
-                    text = context.getString(R.string.btn_all_docs); textSize = 12f; gravity = Gravity.CENTER
+                    text = context.getString(R.string.btn_all_docs)+" →"; textSize = 12f; gravity = Gravity.CENTER
                     setTextColor(context.getColor(R.color.text_dark))
                     background = GradientDrawable().apply {
                         setColor(Color.TRANSPARENT)

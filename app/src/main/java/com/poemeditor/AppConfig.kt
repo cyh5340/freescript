@@ -3,6 +3,9 @@ package com.poemeditor
 import android.graphics.Color
 import android.graphics.Typeface
 
+enum class CanvasMode { VERTICAL, HORIZONTAL, FREESTYLE }
+enum class FreestyleInteractMode { MOVE }
+
 data class ColorOption(val color: Int, val labelRes: Int)
 data class FontEntry(val label: String, val typeface: Typeface)
 

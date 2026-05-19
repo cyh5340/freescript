@@ -8,7 +8,8 @@ object SessionManager {
 
     data class SessionMeta(
         val id: String, val name: String, val lastAccessed: Long,
-        val wordCount: Int = 0, val imageCount: Int = 0
+        val wordCount: Int = 0, val imageCount: Int = 0,
+        val canvasMode: CanvasMode = CanvasMode.VERTICAL
     ) {
         fun formattedDate(): String {
             val cal = java.util.Calendar.getInstance().also { it.timeInMillis = lastAccessed }
@@ -70,6 +71,61 @@ object SessionManager {
     fun loadColumnBreaksFromJson(breaks: org.json.JSONArray): MutableSet<Int> =
         mutableSetOf<Int>().also { s -> for (i in 0 until breaks.length()) s.add(breaks.getInt(i)) }
 
+    // ── TextBox JSON helpers ───────────────────────────────────────────────
+
+    fun textBoxesToJson(textBoxes: List<TextBoxInstance>): org.json.JSONArray {
+        val arr = org.json.JSONArray()
+        textBoxes.forEach { box ->
+            val obj = org.json.JSONObject().apply {
+                put("id", box.id)
+                put("leftPx", box.leftPx.toDouble())
+                put("topPx", box.topPx.toDouble())
+                put("colCount", box.colCount)
+                put("rowCount", box.rowCount)
+                put("columnData", columnDataToJson(box.columnData))
+                put("columnBreaks", columnBreaksToJson(box.columnBreaks))
+                put("fontIndex", box.fontIndex)
+                put("fontSizeSp", box.fontSizeSp.toDouble())
+                put("wordGapDp", box.wordGapDp.toDouble())
+                put("gridTextColor", box.gridTextColor)
+                put("inputMode", box.inputMode.name)
+                put("isHorizontal", box.isHorizontal)
+            }
+            arr.put(obj)
+        }
+        return arr
+    }
+
+    fun parseTextBoxes(json: org.json.JSONArray?): MutableList<TextBoxInstance> {
+        if (json == null) return mutableListOf()
+        val result = mutableListOf<TextBoxInstance>()
+        for (i in 0 until json.length()) {
+            val obj = json.optJSONObject(i) ?: continue
+            val id = obj.optString("id", java.util.UUID.randomUUID().toString())
+            val colData = try { loadColumnDataFromJson(obj.getJSONArray("columnData")) }
+                          catch (_: Exception) { mutableListOf() }
+            val colBreaks = try { loadColumnBreaksFromJson(obj.getJSONArray("columnBreaks")) }
+                            catch (_: Exception) { mutableSetOf() }
+            result.add(TextBoxInstance(
+                id           = id,
+                leftPx       = obj.optDouble("leftPx", 0.0).toFloat(),
+                topPx        = obj.optDouble("topPx", 0.0).toFloat(),
+                colCount     = obj.optInt("colCount", 2),
+                rowCount     = obj.optInt("rowCount", 2),
+                columnData   = colData,
+                columnBreaks = colBreaks,
+                fontIndex    = obj.optInt("fontIndex", 0),
+                fontSizeSp   = obj.optDouble("fontSizeSp", 24.0).toFloat(),
+                wordGapDp    = obj.optDouble("wordGapDp", 3.0).toFloat(),
+                gridTextColor = obj.optInt("gridTextColor", android.graphics.Color.BLACK),
+                inputMode    = try { InputMode.valueOf(obj.optString("inputMode", "SEQUENTIAL")) }
+                               catch (_: Exception) { InputMode.SEQUENTIAL },
+                isHorizontal = obj.optBoolean("isHorizontal", false)
+            ))
+        }
+        return result
+    }
+
     // ── Inserted-image JSON helpers ────────────────────────────────────
 
     fun parseInsertedImages(json: org.json.JSONArray?): MutableList<InsertedImageState> {
@@ -89,18 +145,71 @@ object SessionManager {
         return result
     }
 
-    fun insertedImagesToJsonString(images: List<InsertedImageState>): String {
-        val arr = org.json.JSONArray()
-        images.take(MAX_INSERTED_IMAGES).forEach { image ->
-            val obj = org.json.JSONObject().put("uri", image.uri)
-            image.matrix?.let { values ->
-                val matArr = org.json.JSONArray()
-                values.forEach { matArr.put(it.toDouble()) }
-                obj.put("matrix", matArr)
+    private fun matrixToJson(values: FloatArray): org.json.JSONArray =
+        org.json.JSONArray().also { arr -> values.forEach { arr.put(it.toDouble()) } }
+
+    private fun insertedImagesToJson(images: List<InsertedImageState>): org.json.JSONArray =
+        org.json.JSONArray().also { arr ->
+            images.take(MAX_INSERTED_IMAGES).forEach { image ->
+                val obj = org.json.JSONObject().put("uri", image.uri)
+                image.matrix?.let { obj.put("matrix", matrixToJson(it)) }
+                arr.put(obj)
             }
-            arr.put(obj)
         }
-        return arr.toString()
+
+    fun insertedImagesToJsonString(images: List<InsertedImageState>): String =
+        insertedImagesToJson(images).toString()
+
+    // ── Session JSON → SessionDocument ────────────────────────────────
+
+    fun parseSessionJson(j: org.json.JSONObject): SessionDocument {
+        val colData   = try { loadColumnDataFromJson(j.getJSONArray("columnData")) }
+                        catch (_: Exception) { mutableListOf() }
+        val colBreaks = try { loadColumnBreaksFromJson(j.getJSONArray("columnBreaks")) }
+                        catch (_: Exception) { mutableSetOf() }
+        val canvasModeStr = j.optString("canvasMode", "VERTICAL")
+
+        // Legacy horizontalText migration: populate columnData from plain-text field
+        val legacyHText = j.optString("horizontalText", "")
+        if (canvasModeStr == "HORIZONTAL" && colData.isEmpty() && legacyHText.isNotEmpty()) {
+            legacyHText.split('\n').forEach { line ->
+                colData.add(line.map { it.toString() }.toMutableList())
+            }
+        }
+
+        val matArr    = j.optJSONArray("bgImageMatrix")
+        val matValues = if (matArr != null && matArr.length() == 9)
+            FloatArray(9) { i -> matArr.getDouble(i).toFloat() } else null
+        val loadedImages = parseInsertedImages(j.optJSONArray("insertedImages"))
+        val legacyUri = j.optString("bgImageUri", "").ifEmpty { null }
+        if (loadedImages.isEmpty() && !legacyUri.isNullOrEmpty()) {
+            loadedImages.add(InsertedImageState(legacyUri, matValues))
+        }
+        val activeIdx = j.optInt("activeImageIndex", if (loadedImages.isNotEmpty()) 0 else -1)
+
+        return SessionDocument(
+            id            = j.optString("id", java.util.UUID.randomUUID().toString()),
+            name          = j.optString("name", ""),
+            canvasMode    = canvasModeStr,
+            columnData    = colData,
+            columnBreaks  = colBreaks,
+            fontIndex     = j.optInt("fontIndex", 0),
+            fontSizeSp    = j.optDouble("fontSizeSp", 24.0).toFloat(),
+            wordGapDp     = j.optDouble("wordGapDp",  3.0).toFloat(),
+            gridTextColor = j.optInt("gridTextColor", android.graphics.Color.BLACK),
+            bgColor       = j.optInt("bgColor",       android.graphics.Color.WHITE),
+            bgImageUri    = legacyUri,
+            bgImageMatrix = matValues,
+            inputMode     = j.optString("inputMode", "SEQUENTIAL"),
+            insertedImages     = loadedImages,
+            activeImageIndex   = activeIdx,
+            gridPadTop    = j.optInt("gridPadTop",    0),
+            gridPadBottom = j.optInt("gridPadBottom", 0),
+            gridPadLeft   = j.optInt("gridPadLeft",   0),
+            gridPadRight  = j.optInt("gridPadRight",  0),
+            textBoxes     = parseTextBoxes(j.optJSONArray("textBoxes")),
+            horizontalText = legacyHText
+        )
     }
 
     // ── File I/O ───────────────────────────────────────────────────────
@@ -110,68 +219,53 @@ object SessionManager {
             .mapNotNull { file ->
                 try {
                     val j = org.json.JSONObject(file.readText())
+                    // Use cached counts when present (written by saveSession); fall back to recompute
+                    val cachedWordCount  = j.optInt("wordCount",  -1)
+                    val cachedImageCount = j.optInt("imageCount", -1)
                     SessionMeta(
                         id = j.getString("id"),
                         name = j.getString("name"),
                         lastAccessed = j.getLong("lastAccessed"),
-                        wordCount = countWordsInJson(j),
-                        imageCount = countImagesInJson(j)
+                        wordCount  = if (cachedWordCount  >= 0) cachedWordCount  else countWordsInJson(j),
+                        imageCount = if (cachedImageCount >= 0) cachedImageCount else countImagesInJson(j),
+                        canvasMode = try { CanvasMode.valueOf(j.optString("canvasMode", "VERTICAL")) }
+                                     catch (_: Exception) { CanvasMode.VERTICAL }
                     )
                 } catch (_: Exception) { null }
             }
             .sortedByDescending { it.lastAccessed }
 
-    fun saveSession(
-        filesDir: File, id: String, name: String,
-        columnData: List<List<String>>, columnBreaks: Set<Int>,
-        fontIndex: Int, fontSizeSp: Float, wordGapDp: Float,
-        gridTextColor: Int, bgColor: Int, bgImageUri: String?,
-        bgImageMatrixValues: FloatArray?,
-        inputMode: String,
-        insertedImages: List<InsertedImageState> = emptyList(),
-        activeImageIndex: Int = -1,
-        gridPadTop: Int = 0, gridPadBottom: Int = 0,
-        gridPadLeft: Int = 0, gridPadRight: Int = 0
-    ) {
-        val normalizedImages = insertedImages.take(5)
-        val normalizedActiveIndex = activeImageIndex.coerceIn(-1, normalizedImages.lastIndex)
+    fun saveSession(filesDir: File, doc: SessionDocument) {
+        val normalizedImages = doc.insertedImages.take(MAX_INSERTED_IMAGES)
+        val normalizedActiveIndex = doc.activeImageIndex.coerceIn(-1, normalizedImages.lastIndex)
         val activeImage = normalizedImages.getOrNull(normalizedActiveIndex)
-        val legacyUri = activeImage?.uri ?: bgImageUri
-        val legacyMatrix = activeImage?.matrix ?: bgImageMatrixValues
+        val legacyUri = activeImage?.uri ?: doc.bgImageUri
+        val legacyMatrix = activeImage?.matrix ?: doc.bgImageMatrix
 
         val j = org.json.JSONObject().apply {
-            put("id", id); put("name", name)
+            put("id", doc.id); put("name", doc.name)
             put("lastAccessed", System.currentTimeMillis())
-            put("columnData", columnDataToJson(columnData))
-            put("columnBreaks", columnBreaksToJson(columnBreaks))
-            put("fontIndex", fontIndex); put("fontSizeSp", fontSizeSp.toDouble())
-            put("wordGapDp", wordGapDp.toDouble()); put("gridTextColor", gridTextColor)
-            put("bgColor", bgColor); put("bgImageUri", legacyUri ?: "")
-            if (legacyMatrix != null) {
-                val arr = org.json.JSONArray()
-                legacyMatrix.forEach { arr.put(it.toDouble()) }
-                put("bgImageMatrix", arr)
-            }
-            val imagesArr = org.json.JSONArray()
-            normalizedImages.forEach { img ->
-                val imgObj = org.json.JSONObject()
-                    .put("uri", img.uri)
-                img.matrix?.let { m ->
-                    val mArr = org.json.JSONArray()
-                    m.forEach { mArr.put(it.toDouble()) }
-                    imgObj.put("matrix", mArr)
-                }
-                imagesArr.put(imgObj)
-            }
-            put("insertedImages", imagesArr)
+            put("columnData", columnDataToJson(doc.columnData))
+            put("columnBreaks", columnBreaksToJson(doc.columnBreaks))
+            put("fontIndex", doc.fontIndex); put("fontSizeSp", doc.fontSizeSp.toDouble())
+            put("wordGapDp", doc.wordGapDp.toDouble()); put("gridTextColor", doc.gridTextColor)
+            put("bgColor", doc.bgColor); put("bgImageUri", legacyUri ?: "")
+            if (legacyMatrix != null) put("bgImageMatrix", matrixToJson(legacyMatrix))
+            put("insertedImages", insertedImagesToJson(normalizedImages))
             put("activeImageIndex", normalizedActiveIndex)
-            put("inputMode", inputMode)
-            put("gridPadTop",    gridPadTop)
-            put("gridPadBottom", gridPadBottom)
-            put("gridPadLeft",   gridPadLeft)
-            put("gridPadRight",  gridPadRight)
+            put("inputMode", doc.inputMode)
+            put("gridPadTop",    doc.gridPadTop)
+            put("gridPadBottom", doc.gridPadBottom)
+            put("gridPadLeft",   doc.gridPadLeft)
+            put("gridPadRight",  doc.gridPadRight)
+            put("canvasMode", doc.canvasMode)
+            put("horizontalText", doc.horizontalText)
+            put("textBoxes", textBoxesToJson(doc.textBoxes))
+            // Cache derived counts so listSessions() can read them without re-parsing all content
+            put("wordCount",  countWordsInJson(this))
+            put("imageCount", normalizedImages.size)
         }
-        File(sessionsDir(filesDir), "$id.json").writeText(j.toString())
+        File(sessionsDir(filesDir), "${doc.id}.json").writeText(j.toString())
     }
 
     // Reads session JSON and bumps lastAccessed timestamp on disk. Returns null if missing/corrupt.
@@ -209,23 +303,9 @@ object SessionManager {
         } catch (_: Exception) {}
     }
 
-    fun ensureDefaultSession(
-        filesDir: File, id: String, name: String,
-        columnData: List<List<String>>, columnBreaks: Set<Int>,
-        fontIndex: Int, fontSizeSp: Float, wordGapDp: Float,
-        gridTextColor: Int, bgColor: Int, bgImageUri: String?,
-        bgImageMatrixValues: FloatArray?,
-        inputMode: String,
-        insertedImages: List<InsertedImageState> = emptyList(),
-        activeImageIndex: Int = -1,
-        gridPadTop: Int = 0, gridPadBottom: Int = 0,
-        gridPadLeft: Int = 0, gridPadRight: Int = 0
-    ) {
+    fun ensureDefaultSession(filesDir: File, doc: SessionDocument) {
         if (listSessions(filesDir).isEmpty()) {
-            saveSession(filesDir, id, name, columnData, columnBreaks,
-                fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
-                bgImageMatrixValues, inputMode, insertedImages, activeImageIndex,
-                gridPadTop, gridPadBottom, gridPadLeft, gridPadRight)
+            saveSession(filesDir, doc)
         }
     }
 }

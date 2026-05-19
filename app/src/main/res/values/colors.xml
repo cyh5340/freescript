@@ -9,6 +9,7 @@
     <color name="white">#FFFFFFFF</color>
 
     <!-- UI chrome colours (fixed, not user-configurable) -->
+    <color name="surface">#FFFFFFFF</color>
     <color name="panel_bg">#F7F7F7</color>
     <color name="divider_dark">#DDDDDD</color>
     <color name="divider">#E0E0E0</color>

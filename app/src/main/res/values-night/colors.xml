@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- UI chrome colours — night overrides -->
+    <color name="surface">#FF1C1C1E</color>
+    <color name="panel_bg">#FF2C2C2E</color>
+    <color name="divider_dark">#FF3A3A3C</color>
+    <color name="divider">#FF38383A</color>
+    <color name="stroke">#FF48484A</color>
+    <color name="chip_active">#FF3A3A3C</color>
+    <color name="row_active">#FF2E2E30</color>
+    <color name="text_darkest">#FFEAEAEA</color>
+    <color name="text_darker">#FFD0D0D0</color>
+    <color name="text_dark">#FFBEBEBE</color>
+    <color name="text_medium">#FF9E9E9E</color>
+    <color name="text_light">#FF7A7A7A</color>
+    <color name="text_lighter">#FF6A6A6A</color>
+    <color name="text_hint">#FF555555</color>
+    <color name="selection_highlight">#FF2A4A6A</color>
+</resources>

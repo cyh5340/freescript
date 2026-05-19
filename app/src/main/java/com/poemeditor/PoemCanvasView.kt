@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.os.Handler
@@ -11,27 +12,21 @@ import android.os.Looper
 import android.util.AttributeSet
 import android.view.View
 
-/**
- * Custom canvas-based renderer for the poem grid.
- * Replaces the GridLayout + EditText approach: all characters, cursor, and
- * selection highlights are drawn via Canvas.drawText / Canvas.drawRect.
- *
- * Zero object allocations inside onDraw — all Paint objects and scratch
- * variables are pre-allocated in the init block or as fields.
- */
+enum class FreestyleCornerAction { MOVE, DELETE, TOGGLE_FLOW, RESIZE }
+
 class PoemCanvasView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
 ) : View(context, attrs) {
 
-    // ── Data state ────────────────────────────────────────────────────
+    // ── Data state ────────────────────────────────────────────────
     private var columnData: List<List<String>> = emptyList()
     private var numRowsVal  = 0
     private var maxColsVal  = 50
-    private var cellSizePx  = 0
+    var cellSizePx  = 0
+        private set
 
-    // ── Text rendering ────────────────────────────────────────────────
-    // All Paint objects are pre-allocated; only their fields change.
+    // ── Text rendering ────────────────────────────────────────────
     private val textPaint    = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
     private val previewPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
@@ -48,10 +43,9 @@ class PoemCanvasView @JvmOverloads constructor(
         strokeCap   = Paint.Cap.ROUND
     }
 
-    // Pre-computed once per updateData call; no recomputation in onDraw.
-    private var baselineOffset = 0f   // distance from cell top to text baseline
+    private var baselineOffset = 0f
 
-    // ── Cursor blink ──────────────────────────────────────────────────
+    // ── Cursor blink ──────────────────────────────────────────────
     var cursorIndex          = -1
     var hideLineEndMarkers   = false
     private var cursorVisible = false
@@ -64,14 +58,63 @@ class PoemCanvasView @JvmOverloads constructor(
         }
     }
 
-    // ── Selection ─────────────────────────────────────────────────────
+    // ── Selection ─────────────────────────────────────────────────
     var selectionFrom = -1
     var selectionTo   = -1
 
-    // ── Composing preview overlay ─────────────────────────────────────
-    // Maps cell index → char to render in gray (composing hints from IME).
-    // Independent from columnData so the canonical data is never polluted.
+    // ── Composing preview overlay ─────────────────────────────────
     private var previewOverlay: Map<Int, String> = emptyMap()
+
+    // ── Horizontal mode ───────────────────────────────────────────
+    // col = line index (top→bottom), row = char index within line (left→right)
+    // Canvas: width = numRows * cs, height = numCols * cs
+    var isHorizontalMode = false
+        set(value) { field = value; requestLayout(); invalidate() }
+
+    // ── Freestyle mode ────────────────────────────────────────────
+    // colCount = X dimension (width / cs), rowCount = Y dimension (height / cs)
+    // regardless of the box's isHorizontal direction flag.
+    var isFreestyleMode = false
+        set(value) { field = value; invalidate() }
+    var freestyleMinW = 0
+    var freestyleMinH = 0
+    private var freestyleBoxList: List<TextBoxInstance> = emptyList()
+    private var activeFreestyleBoxId: String? = null
+    var activeBoxOffsetX = 0f
+        private set
+    var activeBoxOffsetY = 0f
+        private set
+    private val boxCellSizeCache = mutableMapOf<String, Int>()
+
+    private val activeBox get() = freestyleBoxList.find { it.id == activeFreestyleBoxId }
+
+    private val boxBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        color = Color.parseColor("#CCCCCC")
+    }
+    private val activeBoxBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.parseColor("#2196F3")
+    }
+    private val inactiveBoxTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        color = Color.DKGRAY
+    }
+    private val cornerFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.WHITE
+    }
+    private val cornerStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        color = Color.parseColor("#2196F3")
+    }
+    private val cornerIconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        color = Color.parseColor("#2196F3")
+    }
 
     init {
         isFocusable          = false
@@ -83,12 +126,8 @@ class PoemCanvasView @JvmOverloads constructor(
         }
     }
 
-    // ── Public API ────────────────────────────────────────────────────
+    // ── Public API ────────────────────────────────────────────────
 
-    /**
-     * Full update: recalculates cell size from font metrics, requests layout,
-     * and redraws. Call when font, size, gap, color, or typeface changes.
-     */
     fun updateData(
         data:       List<List<String>>,
         numRows:    Int,
@@ -111,11 +150,9 @@ class PoemCanvasView @JvmOverloads constructor(
         lineEndPaint.typeface = typeface
         cursorPaint.color     = textColor
 
-        // Mirror the rebuildGrid cell-size formula exactly.
         val charSize  = textPaint.measureText("測").toInt().coerceAtLeast(1)
         cellSizePx    = (charSize + gapPx.toInt()).coerceAtLeast(1)
 
-        // Vertical centering: compute baseline from cell top once.
         val fm = textPaint.fontMetrics
         baselineOffset = (cellSizePx - (fm.descent - fm.ascent)) / 2f - fm.ascent
 
@@ -123,12 +160,15 @@ class PoemCanvasView @JvmOverloads constructor(
         invalidate()
     }
 
-    /**
-     * Lightweight content-only refresh. Does NOT recompute cell size.
-     * Call after columnData mutations (typing, paste, undo, etc.).
-     */
     fun refreshContent(data: List<List<String>>) {
         columnData = data
+        invalidate()
+    }
+
+    fun setMaxColumns(n: Int) {
+        if (maxColsVal == n) return
+        maxColsVal = n
+        requestLayout()
         invalidate()
     }
 
@@ -174,70 +214,197 @@ class PoemCanvasView @JvmOverloads constructor(
         invalidate()
     }
 
-    // ── Coordinate helpers ────────────────────────────────────────────
+    fun updateFreestyleBoxes(
+        boxes: List<TextBoxInstance>,
+        activeId: String?,
+        activeOffX: Float,
+        activeOffY: Float
+    ) {
+        freestyleBoxList = boxes
+        activeFreestyleBoxId = activeId
+        activeBoxOffsetX = activeOffX
+        activeBoxOffsetY = activeOffY
+        boxCellSizeCache.clear()
+        val density = context.resources.displayMetrics.density
+        for (box in boxes) {
+            if (box.id == activeId) {
+                boxCellSizeCache[box.id] = cellSizePx
+            } else {
+                val approxFontPx = box.fontSizeSp * density * 1.4f
+                inactiveBoxTextPaint.textSize = approxFontPx
+                val charSize = inactiveBoxTextPaint.measureText("測").toInt().coerceAtLeast(1)
+                boxCellSizeCache[box.id] = (charSize + box.wordGapDp * density).toInt().coerceAtLeast(1)
+            }
+        }
+        requestLayout()
+        invalidate()
+    }
+
+    /** Returns the box at the canvas touch point, or null. colCount=X, rowCount=Y always. */
+    fun freestyleBoxAtTouch(x: Float, y: Float): TextBoxInstance? {
+        if (!isFreestyleMode) return null
+        for (box in freestyleBoxList.reversed()) {
+            val cs = boxCellSizeCache[box.id] ?: cellSizePx
+            if (x >= box.leftPx && x < box.leftPx + box.colCount * cs &&
+                y >= box.topPx  && y < box.topPx  + box.rowCount * cs) {
+                return box
+            }
+        }
+        return null
+    }
 
     /**
-     * Converts a touch point relative to this View's top-left into a
-     * logical cell index. Returns -1 if outside the valid area.
+     * Returns which corner action icon the touch lands on for the active box, or null.
+     * Top-left=MOVE  Top-right=DELETE  Bottom-left=TOGGLE_FLOW  Bottom-right=RESIZE
      */
+    fun freestyleCornerActionAtTouch(x: Float, y: Float): FreestyleCornerAction? {
+        if (!isFreestyleMode || activeFreestyleBoxId == null) return null
+        val box = activeBox ?: return null
+        val cs = cellSizePx.takeIf { it > 0 } ?: return null
+        val bx = activeBoxOffsetX; val by = activeBoxOffsetY
+        val boxW = box.colCount * cs.toFloat()
+        val boxH = box.rowCount * cs.toFloat()
+        val dp = context.resources.displayMetrics.density
+        val hitSz = dp * CORNER_HIT_DP
+        // Hit areas mirror the visual icons: each is a hitSz square hanging fully outside the box
+        val corners = listOf(
+            (bx - hitSz          to by - hitSz)           to FreestyleCornerAction.MOVE,
+            (bx + boxW           to by - hitSz)            to FreestyleCornerAction.DELETE,
+            (bx - hitSz          to by + boxH)             to FreestyleCornerAction.TOGGLE_FLOW,
+            (bx + boxW           to by + boxH)             to FreestyleCornerAction.RESIZE
+        )
+        return corners.firstOrNull { (pos, _) ->
+            val (hx, hy) = pos
+            x >= hx && x <= hx + hitSz && y >= hy && y <= hy + hitSz
+        }?.second
+    }
+
+    // ── Coordinate helpers ────────────────────────────────────────
+
     fun cellIndexAtTouch(relX: Float, relY: Float): Int {
         val cs = cellSizePx.takeIf { it > 0 } ?: return -1
         val nr = numRowsVal.takeIf { it > 0 } ?: return -1
+        if (isFreestyleMode) {
+            if (activeFreestyleBoxId == null) return -1
+            val localX = relX - activeBoxOffsetX
+            val localY = relY - activeBoxOffsetY
+            return if (activeBox?.isHorizontal == true) {
+                // horizontal: numRows=colCount (chars/line, X), maxColsVal=rowCount (lines, Y)
+                if (localX < 0 || localX >= nr * cs || localY < 0 || localY >= maxColsVal * cs) return -1
+                val col = (localY.toInt() / cs).coerceIn(0, maxColsVal - 1)
+                val row = (localX.toInt() / cs).coerceIn(0, nr - 1)
+                col * nr + row
+            } else {
+                // vertical: numRows=rowCount (chars/col, Y), maxColsVal=colCount (cols, X)
+                val totalW = maxColsVal * cs
+                if (localX < 0 || localX >= totalW || localY < 0 || localY >= nr * cs) return -1
+                val col = (totalW - localX.toInt() - 1) / cs
+                val row = localY.toInt() / cs
+                col.coerceIn(0, maxColsVal - 1) * nr + row.coerceIn(0, nr - 1)
+            }
+        }
+        if (isHorizontalMode) {
+            if (relX < 0 || relX >= nr * cs || relY < 0 || relY >= maxColsVal * cs) return -1
+            val col = (relY.toInt() / cs).coerceIn(0, maxColsVal - 1)
+            val row = (relX.toInt() / cs).coerceIn(0, nr - 1)
+            return col * nr + row
+        }
         val totalW = maxColsVal * cs
         if (relX < 0 || relX >= totalW || relY < 0 || relY >= nr * cs) return -1
-        val col = (totalW - relX.toInt() - 1) / cs    // RTL: col 0 is rightmost
+        val col = (totalW - relX.toInt() - 1) / cs
         val row = relY.toInt() / cs
         return col.coerceIn(0, maxColsVal - 1) * nr + row.coerceIn(0, nr - 1)
     }
 
-    /**
-     * Returns the bounding Rect of a cell (relative to this View), or null
-     * if dimensions are not yet initialised.
-     */
     fun cellRect(index: Int): Rect? {
         val cs = cellSizePx.takeIf { it > 0 } ?: return null
         val nr = numRowsVal.takeIf { it > 0 } ?: return null
         val col = index / nr; val row = index % nr
         if (col >= maxColsVal) return null
+        if (isHorizontalMode) {
+            return Rect(row * cs, col * cs, (row + 1) * cs, (col + 1) * cs)
+        }
+        if (isFreestyleMode) {
+            return if (activeBox?.isHorizontal == true) {
+                // horizontal: col=line(y), row=char(x)
+                Rect(
+                    (row * cs + activeBoxOffsetX).toInt(),
+                    (col * cs + activeBoxOffsetY).toInt(),
+                    ((row + 1) * cs + activeBoxOffsetX).toInt(),
+                    ((col + 1) * cs + activeBoxOffsetY).toInt()
+                )
+            } else {
+                // vertical: col=column(x from right), row=char(y)
+                val totalW = maxColsVal * cs
+                val left = totalW - (col + 1) * cs
+                Rect(
+                    (left + activeBoxOffsetX).toInt(),
+                    (row * cs + activeBoxOffsetY).toInt(),
+                    (left + cs + activeBoxOffsetX).toInt(),
+                    ((row + 1) * cs + activeBoxOffsetY).toInt()
+                )
+            }
+        }
         val totalW = maxColsVal * cs
         val left   = totalW - (col + 1) * cs
         val top    = row * cs
         return Rect(left, top, left + cs, top + cs)
     }
 
-    // ── View overrides ────────────────────────────────────────────────
+    // ── View overrides ────────────────────────────────────────────
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        if (isFreestyleMode) {
+            val cs = cellSizePx.coerceAtLeast(20)
+            val w = if (freestyleMinW > 0) freestyleMinW else cs * 20
+            val h = if (freestyleMinH > 0) freestyleMinH else cs * 30
+            setMeasuredDimension(w, h)
+            return
+        }
         val cs = cellSizePx.coerceAtLeast(1)
+        if (isHorizontalMode) {
+            setMeasuredDimension(numRowsVal.coerceAtLeast(1) * cs, maxColsVal * cs)
+            return
+        }
         setMeasuredDimension(maxColsVal * cs, numRowsVal.coerceAtLeast(1) * cs)
     }
 
     override fun onDraw(canvas: Canvas) {
         val cs = cellSizePx.takeIf { it > 0 } ?: return
         val nr = numRowsVal.takeIf { it > 0 } ?: return
-        val totalW = maxColsVal * cs
 
+        if (isFreestyleMode) {
+            drawFreestyleCanvas(canvas, cs, nr)
+            return
+        }
+        if (isHorizontalMode) {
+            drawHorizontalContent(canvas, cs, nr)
+            return
+        }
+        drawMainContent(canvas, cs, nr)
+    }
+
+    // ── Drawing helpers ───────────────────────────────────────────
+
+    private fun drawMainContent(canvas: Canvas, cs: Int, nr: Int) {
+        val totalW = maxColsVal * cs
         val selFrom = selectionFrom; val selTo = selectionTo
         val hasSelection = selFrom >= 0 && selTo >= 0
-
         var cellL: Float
 
         for (col in 0 until maxColsVal) {
             val colData = columnData.getOrNull(col)
-            // RTL: column 0 is at the far right.
             cellL = (totalW - (col + 1) * cs).toFloat()
-            val textX = cellL + cs / 2f   // center X for Paint.Align.CENTER
+            val textX = cellL + cs / 2f
 
             for (row in 0 until nr) {
                 val index   = col * nr + row
                 val cellTop = (row * cs).toFloat()
 
-                // Selection background.
                 if (hasSelection && index in selFrom..selTo) {
                     canvas.drawRect(cellL, cellTop, cellL + cs, cellTop + cs, selPaint)
                 }
 
-                // Character to draw: preview overlay takes priority over columnData.
                 val previewCh = previewOverlay[index]
                 val dataCh    = colData?.getOrNull(row) ?: ""
 
@@ -246,18 +413,17 @@ class PoemCanvasView @JvmOverloads constructor(
                         canvas.drawText(previewCh, textX, cellTop + baselineOffset, previewPaint)
                     }
                     dataCh == GridLogicHelper.LINE_END_MARKER && !hideLineEndMarkers -> {
-                        // Vertical centre for the smaller line-end glyph.
                         val fm = lineEndPaint.fontMetrics
                         val lbo = (cs - (fm.descent - fm.ascent)) / 2f - fm.ascent
                         canvas.drawText(dataCh, textX, cellTop + lbo, lineEndPaint)
                     }
-                    dataCh.isNotEmpty() && dataCh != GridLogicHelper.FRONTIER_MARKER && dataCh != GridLogicHelper.LINE_END_MARKER -> {
+                    dataCh.isNotEmpty() && dataCh != GridLogicHelper.FRONTIER_MARKER
+                            && dataCh != GridLogicHelper.LINE_END_MARKER -> {
                         canvas.drawText(dataCh, textX, cellTop + baselineOffset, textPaint)
                     }
                 }
             }
 
-            // Cursor — drawn once when we reach the cursor's column.
             if (cursorVisible && cursorIndex >= 0 && nr > 0) {
                 val curCol = cursorIndex / nr
                 val curRow = cursorIndex % nr
@@ -265,9 +431,59 @@ class PoemCanvasView @JvmOverloads constructor(
                     val cellTop  = (curRow * cs).toFloat()
                     val margin   = cs * 0.08f
                     val lineY    = cellTop + 3f
+                    canvas.drawLine(cellL + margin, lineY, cellL + cs - margin, lineY, cursorPaint)
+                }
+            }
+        }
+    }
+
+    // Horizontal mode: col = line (top→bottom), row = char within line (left→right).
+    // Cursor is a vertical bar at the left edge of the cell.
+    private fun drawHorizontalContent(canvas: Canvas, cs: Int, nr: Int) {
+        val selFrom = selectionFrom; val selTo = selectionTo
+        val hasSelection = selFrom >= 0 && selTo >= 0
+
+        for (col in 0 until maxColsVal) {
+            val colData = columnData.getOrNull(col)
+            val lineTop = (col * cs).toFloat()
+
+            for (row in 0 until nr) {
+                val index    = col * nr + row
+                val cellLeft = (row * cs).toFloat()
+                val textX    = cellLeft + cs / 2f
+
+                if (hasSelection && index in selFrom..selTo) {
+                    canvas.drawRect(cellLeft, lineTop, cellLeft + cs, lineTop + cs, selPaint)
+                }
+
+                val previewCh = previewOverlay[index]
+                val dataCh    = colData?.getOrNull(row) ?: ""
+
+                when {
+                    previewCh != null -> {
+                        canvas.drawText(previewCh, textX, lineTop + baselineOffset, previewPaint)
+                    }
+                    dataCh == GridLogicHelper.LINE_END_MARKER && !hideLineEndMarkers -> {
+                        val fm = lineEndPaint.fontMetrics
+                        val lbo = (cs - (fm.descent - fm.ascent)) / 2f - fm.ascent
+                        canvas.drawText(dataCh, textX, lineTop + lbo, lineEndPaint)
+                    }
+                    dataCh.isNotEmpty() && dataCh != GridLogicHelper.FRONTIER_MARKER
+                            && dataCh != GridLogicHelper.LINE_END_MARKER -> {
+                        canvas.drawText(dataCh, textX, lineTop + baselineOffset, textPaint)
+                    }
+                }
+            }
+
+            if (cursorVisible && cursorIndex >= 0) {
+                val curCol = cursorIndex / nr
+                val curRow = cursorIndex % nr
+                if (curCol == col) {
+                    val cellLeft = (curRow * cs).toFloat()
+                    val margin   = cs * 0.08f
                     canvas.drawLine(
-                        cellL + margin, lineY,
-                        cellL + cs - margin, lineY,
+                        cellLeft + margin, lineTop + 3f,
+                        cellLeft + margin, lineTop + cs - 3f,
                         cursorPaint
                     )
                 }
@@ -275,4 +491,155 @@ class PoemCanvasView @JvmOverloads constructor(
         }
     }
 
+    private fun drawFreestyleCanvas(canvas: Canvas, cs: Int, nr: Int) {
+        // Inactive boxes first
+        for (box in freestyleBoxList) {
+            if (box.id == activeFreestyleBoxId) continue
+            val boxCs = boxCellSizeCache[box.id] ?: cs
+            val boxW = box.colCount * boxCs   // colCount = X
+            val boxH = box.rowCount * boxCs   // rowCount = Y
+            canvas.drawRect(box.leftPx, box.topPx, box.leftPx + boxW, box.topPx + boxH, boxBorderPaint)
+            canvas.save()
+            canvas.clipRect(box.leftPx, box.topPx, box.leftPx + boxW, box.topPx + boxH)
+            canvas.translate(box.leftPx, box.topPx)
+            drawInactiveBoxContent(canvas, box, boxCs)
+            canvas.restore()
+        }
+
+        val ab = activeBox ?: return
+        val boxW = ab.colCount * cs.toFloat()   // colCount = X
+        val boxH = ab.rowCount * cs.toFloat()   // rowCount = Y
+        val bx = activeBoxOffsetX; val by = activeBoxOffsetY
+        canvas.drawRect(bx, by, bx + boxW, by + boxH, activeBoxBorderPaint)
+        canvas.save()
+        canvas.clipRect(bx, by, bx + boxW, by + boxH)
+        canvas.translate(bx, by)
+        if (ab.isHorizontal) drawHorizontalContent(canvas, cs, nr)
+        else                  drawMainContent(canvas, cs, nr)
+        canvas.restore()
+
+        // 4 corner action icons
+        val dp    = context.resources.displayMetrics.density
+        val visSz = CORNER_VIS_DP * dp
+        val isZh  = context.resources.configuration.locales[0].language == "zh"
+        val flowLabel = when {
+            ab.isHorizontal && isZh  -> "橫"
+            ab.isHorizontal          -> "H"
+            isZh                     -> "直"
+            else                     -> "V"
+        }
+        // Icons hang outside the box, touching each corner from the exterior
+        val icons = listOf(
+            (bx - visSz          to by - visSz)           to null,      // top-left:     MOVE
+            (bx + boxW           to by - visSz)            to "×",       // top-right:    DELETE
+            (bx - visSz          to by + boxH)             to flowLabel, // bottom-left:  TOGGLE_FLOW
+            (bx + boxW           to by + boxH)             to "◢"        // bottom-right: RESIZE
+        )
+        cornerIconPaint.textSize = visSz * 0.62f
+        for ((pos, label) in icons) {
+            val (hx, hy) = pos
+            canvas.drawRect(hx, hy, hx + visSz, hy + visSz, cornerFillPaint)
+            canvas.drawRect(hx, hy, hx + visSz, hy + visSz, cornerStrokePaint)
+            if (label != null) {
+                canvas.drawText(label, hx + visSz / 2f, hy + visSz * 0.77f, cornerIconPaint)
+            } else {
+                drawMoveArrowIcon(canvas, hx, hy, visSz, cornerIconPaint)
+            }
+        }
+    }
+
+    private fun drawInactiveBoxContent(canvas: Canvas, box: TextBoxInstance, cs: Int) {
+        inactiveBoxTextPaint.textSize = cs * 0.75f
+        val fm = inactiveBoxTextPaint.fontMetrics
+        val baseline = (cs - (fm.descent - fm.ascent)) / 2f - fm.ascent
+
+        if (box.isHorizontal) {
+            // col = line index (0 until rowCount, Y), row = char within line (0 until colCount, X)
+            for (col in 0 until box.rowCount) {
+                val colData = box.columnData.getOrNull(col)
+                val lineTop = (col * cs).toFloat()
+                for (row in 0 until box.colCount) {
+                    val ch = colData?.getOrNull(row) ?: ""
+                    if (ch.isNotEmpty() && ch != GridLogicHelper.FRONTIER_MARKER
+                            && ch != GridLogicHelper.LINE_END_MARKER) {
+                        canvas.drawText(ch, row * cs + cs / 2f, lineTop + baseline, inactiveBoxTextPaint)
+                    }
+                }
+            }
+        } else {
+            // col = column (0 until colCount, X from right), row = char (0 until rowCount, Y)
+            val totalW = box.colCount * cs
+            for (col in 0 until box.colCount) {
+                val colData = box.columnData.getOrNull(col)
+                val cellL = (totalW - (col + 1) * cs).toFloat()
+                val textX = cellL + cs / 2f
+                for (row in 0 until box.rowCount) {
+                    val ch = colData?.getOrNull(row) ?: ""
+                    if (ch.isNotEmpty() && ch != GridLogicHelper.FRONTIER_MARKER
+                            && ch != GridLogicHelper.LINE_END_MARKER) {
+                        canvas.drawText(ch, textX, row * cs + baseline, inactiveBoxTextPaint)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun drawMoveArrowIcon(canvas: Canvas, hx: Float, hy: Float, sz: Float, paint: Paint) {
+        val cx      = hx + sz / 2f
+        val cy      = hy + sz / 2f
+        val tip     = sz * 0.44f  // center → arrowhead tip
+        val headW   = sz * 0.20f  // arrowhead half-width
+        val headLen = sz * 0.22f  // arrowhead depth
+        val stemW   = sz * 0.07f  // cross-arm half-width
+
+        val savedStyle = paint.style
+        paint.style = Paint.Style.FILL
+
+        val path = Path()
+
+        // ↑ arrowhead
+        path.moveTo(cx,          cy - tip)
+        path.lineTo(cx - headW,  cy - tip + headLen)
+        path.lineTo(cx + headW,  cy - tip + headLen)
+        path.close()
+
+        // ↓ arrowhead
+        path.moveTo(cx,          cy + tip)
+        path.lineTo(cx + headW,  cy + tip - headLen)
+        path.lineTo(cx - headW,  cy + tip - headLen)
+        path.close()
+
+        // ← arrowhead
+        path.moveTo(cx - tip,    cy)
+        path.lineTo(cx - tip + headLen, cy + headW)
+        path.lineTo(cx - tip + headLen, cy - headW)
+        path.close()
+
+        // → arrowhead
+        path.moveTo(cx + tip,    cy)
+        path.lineTo(cx + tip - headLen, cy - headW)
+        path.lineTo(cx + tip - headLen, cy + headW)
+        path.close()
+
+        // vertical stem connecting the four arrowheads
+        path.addRect(
+            cx - stemW, cy - tip + headLen,
+            cx + stemW, cy + tip - headLen,
+            Path.Direction.CW
+        )
+        // horizontal stem
+        path.addRect(
+            cx - tip + headLen, cy - stemW,
+            cx + tip - headLen, cy + stemW,
+            Path.Direction.CW
+        )
+
+        canvas.drawPath(path, paint)
+        paint.style = savedStyle
+    }
+
+    companion object {
+        const val CORNER_VIS_DP = 18f   // visual square size
+        const val CORNER_HIT_DP = 24f   // touch hit area
+    }
 }

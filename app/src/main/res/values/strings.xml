@@ -60,6 +60,21 @@
     <!-- Default session name -->
     <string name="default_session_name">Document</string>
 
+    <!-- Entry page -->
+    <string name="entry_new_doc">New Document</string>
+    <string name="entry_recent_docs">Recent</string>
+    <string name="entry_mode_vertical">Vertical</string>
+    <string name="entry_mode_vertical_desc">Traditional column layout</string>
+    <string name="entry_mode_horizontal">Horizontal</string>
+    <string name="entry_mode_horizontal_desc">Left-to-right text flow</string>
+    <string name="entry_mode_freestyle">Freestyle</string>
+    <string name="entry_mode_freestyle_desc">Free-form drag layout</string>
+
+    <!-- Freestyle interact mode (in tools panel) -->
+    <string name="label_interact_mode">Interact</string>
+    <string name="freestyle_bar_move">Move</string>
+    <string name="freestyle_bar_resize">Resize</string>
+
     <!-- Background color labels -->
     <string name="bg_color_white">White</string>
     <string name="bg_color_cream">Cream</string>

@@ -60,6 +60,21 @@
     <!-- Default session name -->
     <string name="default_session_name">文檔</string>
 
+    <!-- Entry page -->
+    <string name="entry_new_doc">新增文檔</string>
+    <string name="entry_recent_docs">最近文檔</string>
+    <string name="entry_mode_vertical">直書</string>
+    <string name="entry_mode_vertical_desc">傳統直排書寫</string>
+    <string name="entry_mode_horizontal">橫書</string>
+    <string name="entry_mode_horizontal_desc">橫排文字書寫</string>
+    <string name="entry_mode_freestyle">自由</string>
+    <string name="entry_mode_freestyle_desc">自由拖拉排版</string>
+
+    <!-- Freestyle interact mode (in tools panel) -->
+    <string name="label_interact_mode">互動</string>
+    <string name="freestyle_bar_move">移動</string>
+    <string name="freestyle_bar_resize">調整大小</string>
+
     <!-- Background color labels -->
     <string name="bg_color_white">白</string>
     <string name="bg_color_cream">米</string>

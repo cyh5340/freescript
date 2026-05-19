@@ -1,12 +1,9 @@
 package com.poemeditor
 
 import android.app.AlertDialog
-import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
@@ -40,7 +37,8 @@ enum class InputMode { SCATTER, SEQUENTIAL }
 
 private typealias SessionMeta = SessionManager.SessionMeta
 
-class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
+class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
+    InsertedImageController.Callbacks, SelectionController.Callbacks, KeyboardToolbarController.Callbacks {
 
     // ── Settings ───────────────────────────────────────────────────────
     private var fontSizeSp       = 24f
@@ -51,12 +49,40 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private var selectedTypeface = Typeface.DEFAULT
     private var wordGapDp        = 3f
     private var inputMode        = InputMode.SEQUENTIAL
+    private var canvasMode       = CanvasMode.VERTICAL
 
     // ── Widget refs for programmatic sync (session load / new) ─────────
     private var fontSpinnerRef: Spinner? = null
     private var fontSizeLabelRef: TextView? = null
     private var gapValueLabelRef: TextView? = null
     private var modeChipContainer: LinearLayout? = null
+    private var modeInputSectionRef: LinearLayout? = null
+
+    // ── Horizontal mode ────────────────────────────────────────────────────
+    // stableMaxWidth is the stable chars-per-line width for horizontal mode;
+    // derived once when the container is measured (IME absent).
+    private var stableMaxWidth = 0
+
+    // ── Freestyle mode state ───────────────────────────────────────────────
+    private val textBoxes = mutableListOf<TextBoxInstance>()
+    private var activeTextBoxId: String? = null
+    private var freestyleDragBox: TextBoxInstance? = null
+    private var freestyleDragTouchOffX = 0f
+    private var freestyleDragTouchOffY = 0f
+    private var freestyleDragMoved = false
+    private var freestyleLongPressHandled = false
+    private var freestyleCreatingBox: TextBoxInstance? = null
+    private var freestyleCreateOriginX = 0f
+    private var freestyleCreateOriginY = 0f
+    private var freestyleResizingBox: TextBoxInstance? = null
+    private var freestyleResizeOriginX = 0f
+    private var freestyleResizeOriginY = 0f
+    private var freestyleResizeOrigCols = 0
+    private var freestyleResizeOrigRows = 0
+    private lateinit var freestyleLongPressDetector: android.view.GestureDetector
+    // Refs to interact row chips exposed by ViewFactory
+    private var inputFieldCellRef: TextView? = null
+    private var inputFieldDividerRef: View? = null
 
     // ── Background image ───────────────────────────────────────────────
     private var bgImageView: ImageView? = null
@@ -97,15 +123,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private var isPreviewing = false
     private var hScroll: HorizontalScrollView? = null
     private val MAX_COLUMNS = 50
+    private val PREVIEW_SCALE = 0.75f
     private val FRONTIER_MARKER get() = GridLogicHelper.FRONTIER_MARKER
     private val LINE_END_MARKER get() = GridLogicHelper.LINE_END_MARKER
     private var currentCellSize = 0
     private var focusedCellIndex = -1  // index of the next insertion point; cursor drawn at top of this cell
     // columnData[col][row] = char at that cell; "" = empty.
-    private val columnData = mutableListOf<MutableList<String>>()
+    private var columnData = mutableListOf<MutableList<String>>()
     // Columns that begin with an explicit '\n' break (vs. auto-wrap).
     // Preserved across reflow so stanza structure survives gap/font changes.
-    private val columnBreaks = mutableSetOf<Int>()
+    private var columnBreaks = mutableSetOf<Int>()
     private var needsReflow = false
     private var stableMaxHeight     = 0    // locked once at startup (IME hidden); used for all numRows calculations
     private var gridPaddingTopPx    = 0
@@ -113,38 +140,36 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private var gridPaddingLeftPx   = 0
     private var gridPaddingRightPx  = 0
     private var lastKeyboardHeight = 0   // last measured IME height; allToolsPanel matches this height
-    private var toolsVisible = false     // true when allToolsPanel is showing instead of keyboard
+    private var toolsVisible = false     // true when allToolsPanel is showing
+    private var imeIsVisible = false     // tracks current IME visibility via insets listener
+    private var keyboardCellRef: LinearLayout? = null
     private val translateHandler by lazy { Handler(Looper.getMainLooper()) }
     private var translateRunnable: Runnable? = null
     private val historyBurstHandler = Handler(Looper.getMainLooper())
     private var historyBurstReset: Runnable? = null
     private var historyBurstActive = false
 
-    // ── Selection state ────────────────────────────────────────────────
-    private var isSelecting      = false
-    private var selectionStart   = -1
-    private var selectionEnd     = -1
+    // ── Selection UI refs (state owned by SelectionController) ────────
     private var selectionOptionsView: LinearLayout? = null
     private var startHandle:     View? = null
     private var endHandle:       View? = null
     private var activeDragHandle: Boolean? = null  // true=start handle, false=end handle
     private var handleDragged    = false           // true once finger moves ≥1 cell while on a handle
     private var handlePasteView: TextView? = null  // mini bubble shown on handle tap (no drag)
-    private var tappedHandleIsStart: Boolean? = null
 
     // ── Selection drag cache (populated once on ACTION_DOWN) ───────────
     private val cachedGridLoc  = IntArray(2)
     private val cachedRootLoc  = IntArray(2)
     private var cachedCellSize = 0
     private var cachedGridW    = 0
-    // Highlight range tracked to diff-update only changed cells
-    private var highlightFrom  = -1
-    private var highlightTo    = -1
-    // Popup dimensions cached after first measure so ACTION_MOVE skips measure()
-    private var cachedPopupW   = -1
-    private var cachedPopupH   = -1
-    // True when a postOnAnimation frame is already scheduled for this drag gesture
+    // Vsync batching: latest drag hit index, consumed inside postOnAnimation
+    private var pendingDragHit = -1
     private var isFrameScheduled = false
+
+    // ── Priority-1 controllers ─────────────────────────────────────────
+    private lateinit var imageCtrl: InsertedImageController
+    private lateinit var selectionCtrl: SelectionController
+    private lateinit var keyboardToolbarCtrl: KeyboardToolbarController
 
     // ── Undo / Redo ────────────────────────────────────────────────────
     private var undoButton: TextView? = null
@@ -161,7 +186,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private var pendingBgImageMatrix: FloatArray? = null
     private var insertImageContainer: LinearLayout? = null
 
-    private fun setColumnChar(col: Int, row: Int, ch: String) =
+    override fun setColumnChar(col: Int, row: Int, ch: String) =
         GridLogicHelper.setColumnChar(columnData, col, row, ch)
 
     private fun clearDocumentContent() {
@@ -192,131 +217,6 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private fun insertedImagesToJsonString(images: List<InsertedImageState>) =
         SessionManager.insertedImagesToJsonString(images)
 
-    private fun updateActiveImageRuntimeState() {
-        if (activeImageIndex !in insertedImages.indices) return
-        val currentUri = bgImageUri ?: return
-        if (insertedImages[activeImageIndex].uri != currentUri) return
-        insertedImages[activeImageIndex] = InsertedImageState(currentUri, getBgImageMatrixValues())
-    }
-
-    private fun loadImageBitmap(uriStr: String): Bitmap? {
-        val uri = try { Uri.parse(uriStr) } catch (_: Exception) { return null }
-        return try {
-            val stream = when (uri.scheme) {
-                "file" -> java.io.FileInputStream(java.io.File(uri.path ?: return null))
-                else   -> contentResolver.openInputStream(uri)
-            } ?: return null
-            stream.use { BitmapFactory.decodeStream(it) }
-        } catch (_: Exception) { null }
-    }
-
-    private fun defaultImageMatrixValues(imgW: Int, imgH: Int, index: Int): FloatArray {
-        val metrics = resources.displayMetrics
-        val viewW = rootFrame.width.toFloat().takeIf { it > 0f } ?: metrics.widthPixels.toFloat()
-        val viewH = mainScrollView.height.toFloat().takeIf { it > 0f } ?: (metrics.heightPixels * 0.7f)
-
-        val pad = 14f * metrics.density
-        val gap = 10f * metrics.density
-        val columns = 3
-        val col = index % columns
-        val row = index / columns
-
-        val slotW = ((viewW - pad * 2f - gap * (columns - 1)) / columns).coerceAtLeast(1f)
-        val slotH = (viewH * 0.32f).coerceAtLeast(1f)
-        val scale = minOf(slotW / imgW, slotH / imgH).coerceAtLeast(0.05f)
-
-        val matrix = Matrix().apply {
-            setScale(scale, scale)
-            postTranslate(pad + col * (slotW + gap), pad + row * (slotH + gap))
-        }
-        return FloatArray(9).also { matrix.getValues(it) }
-    }
-
-    private fun renderInsertedImages() {
-        bgImageViews.forEach { rootFrame.removeView(it) }
-        bgImageViews.clear()
-        bgImageView = null
-        bgImageUri = null
-        bgImageMatrix.reset()
-
-        if (insertedImages.isEmpty()) {
-            activeImageIndex = -1
-            return
-        }
-
-        activeImageIndex = activeImageIndex.coerceIn(0, insertedImages.lastIndex)
-        insertedImages.forEachIndexed { idx, state ->
-            val bmp = loadImageBitmap(state.uri) ?: return@forEachIndexed
-            val view = ImageView(this).apply {
-                layoutParams = FrameLayout.LayoutParams(MP, MP)
-                scaleType = ImageView.ScaleType.MATRIX
-                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-                setImageBitmap(bmp)
-            }
-
-            val matrixValues = cloneMatrix(state.matrix) ?: defaultImageMatrixValues(bmp.width, bmp.height, idx)
-            val matrix = Matrix().apply { setValues(matrixValues) }
-            view.imageMatrix = matrix
-
-            rootFrame.addView(view, bgImageViews.size)
-            bgImageViews.add(view)
-
-            if (state.matrix == null && idx in insertedImages.indices) {
-                insertedImages[idx] = InsertedImageState(state.uri, cloneMatrix(matrixValues))
-            }
-
-            if (idx == activeImageIndex) {
-                bgImageView = view
-                bgImageUri = state.uri
-                bgImageMatrix.setValues(matrixValues)
-            }
-        }
-
-        if (bgImageView == null) {
-            bgImageUri = null
-            bgImageMatrix.reset()
-        }
-    }
-
-    private fun findTouchedImageIndex(rootX: Float, rootY: Float): Int {
-        if (insertedImages.isEmpty() || bgImageViews.isEmpty()) return -1
-        val ordered = bgImageViews.indices.sortedByDescending { idx ->
-            rootFrame.indexOfChild(bgImageViews[idx])
-        }
-        for (idx in ordered) {
-            val view = bgImageViews.getOrNull(idx) ?: continue
-            if (view.visibility != View.VISIBLE) continue
-            val drawable = view.drawable ?: continue
-            val dw = drawable.intrinsicWidth.toFloat().takeIf { it > 0f } ?: continue
-            val dh = drawable.intrinsicHeight.toFloat().takeIf { it > 0f } ?: continue
-            val inverse = Matrix()
-            if (!view.imageMatrix.invert(inverse)) continue
-            val p = floatArrayOf(rootX, rootY)
-            inverse.mapPoints(p)
-            if (p[0] >= 0f && p[0] <= dw && p[1] >= 0f && p[1] <= dh) return idx
-        }
-        return -1
-    }
-
-    private fun activateImageAt(index: Int) {
-        if (index !in insertedImages.indices) return
-        val view = bgImageViews.getOrNull(index) ?: return
-        updateActiveImageRuntimeState()
-        activeImageIndex = index
-        bgImageView = view
-        bgImageUri = insertedImages[index].uri
-        bgImageMatrix.set(view.imageMatrix)
-        // Bring selected image to front among image views (below mainLayout)
-        if (bgImageViews.size > 1) {
-            rootFrame.removeView(view)
-            rootFrame.addView(view, bgImageViews.size - 1)
-        }
-    }
-
-    private fun syncActiveImageFromList() {
-        renderInsertedImages()
-    }
-
     private fun updateToolbarSessionName() {
         docFileNameRef?.text = currentSessionName
     }
@@ -331,6 +231,18 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun scrollToColumn(col: Int) {
+        if (canvasMode == CanvasMode.HORIZONTAL) {
+            // In horizontal mode col = line; scroll mainScrollView vertically to show the line
+            if (currentCellSize <= 0) return
+            val lineTop    = col * currentCellSize
+            val lineBottom = lineTop + currentCellSize
+            val sv = mainScrollView.scrollY; val vp = mainScrollView.height
+            when {
+                lineTop  < sv       -> mainScrollView.smoothScrollTo(0, lineTop)
+                lineBottom > sv + vp -> mainScrollView.smoothScrollTo(0, lineBottom - vp)
+            }
+            return
+        }
         val s = hScroll ?: return
         if (currentCellSize <= 0 || s.width <= 0 || numColumns <= 0) return
         val gw = maxOf(numColumns * currentCellSize, s.width)
@@ -381,7 +293,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     // Sets focusedCellIndex and draws the cursor at the top of that cell.
     // The cursor bar sits between (index-1) and index; typing inserts AT index.
     // showKeyboard: true  = open IME; false = keep IME closed (style rebuilds).
-    private fun focusCell(index: Int, showKeyboard: Boolean = true) {
+    private fun focusCell(index: Int, showKeyboard: Boolean = false) {
         val col = index / numRows.coerceAtLeast(1)
         if (col >= numColumns) return
         focusedCellIndex = index
@@ -492,12 +404,12 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                         val rootLoc = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
                         val midX = (ev.getX(0) + ev.getX(1)) / 2f - rootLoc[0]
                         val midY = (ev.getY(0) + ev.getY(1)) / 2f - rootLoc[1]
-                        val touchedIndex = findTouchedImageIndex(midX, midY)
+                        val touchedIndex = imageCtrl.findTouchedImageIndex(midX, midY)
                         if (touchedIndex < 0) {
                             imageGestureActive = false
                             return super.dispatchTouchEvent(ev)
                         }
-                        activateImageAt(touchedIndex)
+                        imageCtrl.activateImageAt(touchedIndex)
                         imageGestureStartMidX = midX
                         imageGestureStartMidY = midY
                         imageGestureStartDist = Math.hypot(
@@ -541,13 +453,12 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             }
         }
 
-        if (isSelecting && ev.pointerCount == 1) {
+        if (selectionCtrl.isSelecting && ev.pointerCount == 1) {
             val sh = startHandle; val eh = endHandle
             if (sh != null && eh != null && sh.visibility == View.VISIBLE) {
                 when (ev.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         handleDragged = false
-                        handlePasteView?.visibility = View.GONE
                         // Measure once: root offset and touch-in-rootFrame coords
                         rootFrame.getLocationOnScreen(cachedRootLoc)
                         val tx = ev.rawX - cachedRootLoc[0]; val ty = ev.rawY - cachedRootLoc[1]
@@ -560,6 +471,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                             else -> null
                         }
                         if (activeDragHandle != null) {
+                            selectionCtrl.onDragStart(activeDragHandle!!)
                             cachedCellSize = currentCellSize
                             return true  // consume DOWN so cells underneath don't clear selection
                         }
@@ -567,36 +479,17 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                     MotionEvent.ACTION_MOVE -> {
                         val dh = activeDragHandle
                         if (dh != null) {
-                            val hit = fastCellIndexAtPoint(ev.rawX, ev.rawY)
+                            val hit = selectionCtrl.fastCellIndexAtPoint(ev.rawX, ev.rawY)
                             if (hit >= 0) {
-                                val prev = if (dh) selectionStart else selectionEnd
+                                val prev = if (dh) selectionCtrl.selectionStart else selectionCtrl.selectionEnd
                                 if (hit != prev) {
                                     handleDragged = true
-                                    // ── Logic only: update indices, no UI work ──────────
-                                    if (dh) selectionStart = hit else selectionEnd = hit
-                                    // ── Schedule one render per vsync ──────────────────
+                                    pendingDragHit = hit
                                     if (!isFrameScheduled) {
                                         isFrameScheduled = true
                                         rootFrame.postOnAnimation {
-                                            if (isSelecting) {
-                                                val activeDh = activeDragHandle
-                                                val total = (MAX_COLUMNS * numRows - 1).coerceAtLeast(0)
-                                                val newFrom = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
-                                                val newTo   = maxOf(selectionStart, selectionEnd).coerceAtMost(total)
-                                                updateHighlightDiff(newFrom, newTo)
-                                                if (activeDh != null) {
-                                                    val draggedIdx = (if (activeDh) selectionStart else selectionEnd)
-                                                        .coerceIn(0, total)
-                                                    val otherIdx   = (if (activeDh) selectionEnd   else selectionStart)
-                                                        .coerceIn(0, total)
-                                                    positionHandleAt(
-                                                        if (activeDh) startHandle else endHandle,
-                                                        draggedIdx, atTop = (draggedIdx == newFrom))
-                                                    positionHandleAt(
-                                                        if (activeDh) endHandle else startHandle,
-                                                        otherIdx, atTop = (otherIdx == newFrom))
-                                                }
-                                                positionSelectionOptionsView()
+                                            if (selectionCtrl.isSelecting) {
+                                                selectionCtrl.updateDragSelection(pendingDragHit)
                                             }
                                             isFrameScheduled = false
                                         }
@@ -612,11 +505,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                         activeDragHandle = null
                         handleDragged = false
                         if (dh != null) {
-                            // Tap on handle (no real drag) → show paste bubble only if options bar is hidden
-                            if (!dragged && ev.actionMasked == MotionEvent.ACTION_UP
-                                    && selectionOptionsView?.visibility != View.VISIBLE) {
-                                val handle = if (dh) startHandle else endHandle
-                                if (handle != null) showHandlePasteMenu(handle, isStart = dh)
+                            if (!dragged && ev.actionMasked == MotionEvent.ACTION_UP) {
+                                selectionCtrl.showPasteView(dh)
                             }
                             return true  // consume — prevent cell underneath from dismissing selection
                         }
@@ -704,6 +594,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             privateImeOptions = "nm"
             isFocusable = true
             isFocusableInTouchMode = true
+            showSoftInputOnFocus = false  // keyboard only appears via explicit ⌨ toggle
         }
 
         hScroll = HorizontalScrollView(this).apply {
@@ -715,9 +606,12 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             addView(poemCanvas)
         }
         hScroll?.setOnScrollChangeListener { _, _, _, _, _ ->
-            if (isSelecting) repositionHandles()
+            if (selectionCtrl.isSelecting) selectionCtrl.repositionHandles()
             viewFactory.updateScrollIndicator()
         }
+        mainScrollView.setOnScrollChangeListener(NestedScrollView.OnScrollChangeListener { _, _, _, _, _ ->
+            if (canvasMode == CanvasMode.HORIZONTAL) viewFactory.updateScrollIndicator()
+        })
         gridContainer.addView(hScroll)
 
         viewFactory      = ViewFactory(this, this)
@@ -729,10 +623,17 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         fontSpinnerRef    = viewFactory.fontSpinnerRef
         fontSizeLabelRef  = viewFactory.fontSizeLabelRef
         gapValueLabelRef  = viewFactory.gapValueLabelRef
-        modeChipContainer = viewFactory.modeChipContainer
+        modeChipContainer    = viewFactory.modeChipContainer
+        modeInputSectionRef  = viewFactory.modeInputSectionRef
+        inputFieldCellRef        = viewFactory.inputFieldCellRef
+        inputFieldDividerRef     = viewFactory.inputFieldDividerRef
+        keyboardCellRef          = viewFactory.keyboardCell
         undoButton        = viewFactory.undoButton
         redoButton        = viewFactory.redoButton
         insertImageContainer = viewFactory.insertImageContainer
+        imageCtrl            = InsertedImageController(this, this)
+        selectionCtrl        = SelectionController(this, this)
+        keyboardToolbarCtrl  = KeyboardToolbarController(this, this)
         updateToolbarSessionName()
         mainLayout.addView(viewFactory.buildScrollIndicator(dp))
         mainLayout.addView(mainScrollView)
@@ -748,33 +649,60 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         rootFrame.addView(ghostInput)
         setupGhostInput()
         setupCanvasTouchListener()
-        syncActiveImageFromList()
+        imageCtrl.syncActiveImageFromList()
 
         // Track keyboard height and manage scroll padding in sync with IME state.
         ViewCompat.setOnApplyWindowInsetsListener(rootFrame) { _, insets ->
             val imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
             val imeHeight = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
             if (imeVisible && imeHeight > 0) lastKeyboardHeight = imeHeight
+            imeIsVisible = imeVisible
             punctToolbar.visibility = if (imeVisible) View.VISIBLE else View.GONE
             if (imeVisible) {
                 // Keyboard opened — dismiss tools panel and selection if active.
-                if (toolsVisible) {
-                    allToolsPanel.visibility = View.GONE
-                    toolsVisible = false
-                    toolsCell?.setBackgroundColor(Color.TRANSPARENT)
-                }
-                if (isSelecting) clearSelection()
+                if (toolsVisible) keyboardToolbarCtrl.collapseToolsPanel()
+                selectionCtrl.clearSelection()
                 scheduleTranslateForKeyboard()
             } else if (!toolsVisible) {
                 // Keyboard closed and tools not shown — clear scroll padding.
                 mainScrollView.setPadding(0, 0, 0, 0)
                 mainScrollView.smoothScrollTo(0, 0)
             }
+            keyboardToolbarCtrl.updateKeyboardButton()
             insets
         }
 
         loadState()
-        ensureDefaultSession()
+
+        val intentSessionId     = intent.getStringExtra("SESSION_ID")
+        val intentCanvasModeStr = intent.getStringExtra("CANVAS_MODE")
+        when {
+            intentSessionId != null && intentSessionId != currentSessionId -> {
+                val j = editorViewModel.loadSessionJson(intentSessionId)
+                if (j != null) {
+                    applyLoadedSession(SessionManager.parseSessionJson(j))
+                    editorViewModel.clearHistory()
+                }
+            }
+            intentCanvasModeStr != null -> {
+                val newMode = try { CanvasMode.valueOf(intentCanvasModeStr) }
+                             catch (_: Exception) { null }
+                if (newMode != null) {
+                    columnData.clear(); columnBreaks.clear()
+                    textBoxes.clear(); activeTextBoxId = null
+                    currentSessionId = java.util.UUID.randomUUID().toString()
+                    currentSessionName = SessionManager.nextNewSessionName(
+                        filesDir, getString(R.string.default_session_name))
+                    canvasMode = newMode
+                    updateToolbarSessionName()
+                    editorViewModel.clearHistory()
+                }
+            }
+            else -> ensureDefaultSession()
+        }
+        updateModeChipVisibility()
+        applyCanvasModeLayout()
+        updateUndoRedoButtons()
 
         // One-shot: build the grid once the container has real dimensions.
         // Settings changes (font size, gap, etc.) call rebuildGrid() explicitly.
@@ -785,71 +713,48 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                 override fun onGlobalLayout() {
                     val imeVisible = ViewCompat.getRootWindowInsets(rootFrame)
                         ?.isVisible(WindowInsetsCompat.Type.ime()) == true
-                    if (stableMaxHeight == 0 && !imeVisible) {
+                    if (stableMaxHeight == 0 && !imeVisible && canvasMode == CanvasMode.VERTICAL) {
                         val h = mainScrollView.height - gridContainer.paddingTop - gridContainer.paddingBottom
                         if (h > 0) stableMaxHeight = h
                     }
+                    if (stableMaxWidth == 0 && !imeVisible && canvasMode == CanvasMode.HORIZONTAL) {
+                        val w = mainScrollView.width - gridContainer.paddingLeft - gridContainer.paddingRight
+                        if (w > 0) stableMaxWidth = w
+                    }
                     if (mainScrollView.width > 0 && mainScrollView.height > 0 && numRows == 0) {
-                        // Defer one frame so the activity shell is drawn before we allocate
-                        // cells on the UI thread — reduces visible startup lag.
-                        mainScrollView.post { rebuildGrid(isInitialBoot = true, scrollToStart = true) }
+                        mainScrollView.post {
+                            when (canvasMode) {
+                                CanvasMode.VERTICAL -> rebuildGrid(isInitialBoot = true, scrollToStart = true)
+                                CanvasMode.HORIZONTAL -> {
+                                    applyCanvasModeLayout()
+                                    rebuildGrid(isInitialBoot = true, scrollToStart = true)
+                                }
+                                CanvasMode.FREESTYLE -> {
+                                    applyCanvasModeLayout()
+                                    val fontPx = TypedValue.applyDimension(
+                                        TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+                                    val gapPx = wordGapDp * resources.displayMetrics.density
+                                    val charSize = Paint().apply { textSize = fontPx; typeface = selectedTypeface }
+                                        .measureText("測").roundToInt().coerceAtLeast(1)
+                                    currentCellSize = (charSize + gapPx.roundToInt()).coerceAtLeast(1)
+                                    val minW = mainScrollView.width
+                                    val minH = mainScrollView.height.coerceAtLeast(1)
+                                    poemCanvas.freestyleMinW = minW
+                                    poemCanvas.freestyleMinH = minH
+                                    poemCanvas.updateData(
+                                        data = emptyList(), numRows = 10, maxColumns = 20,
+                                        fontPx = fontPx, gapPx = gapPx,
+                                        textColor = gridTextColor, typeface = selectedTypeface
+                                    )
+                                    numRows = 10; numColumns = 20
+                                    poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
+                                }
+                            }
+                        }
                     }
                 }
             }
         )
-    }
-
-
-    private fun showHandlePasteMenu(handle: View, isStart: Boolean) {
-        val pv = handlePasteView ?: return
-        tappedHandleIsStart = isStart
-        pv.measure(
-            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
-            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-        )
-        val pvW = pv.measuredWidth.toFloat()
-        val pvH = pv.measuredHeight.toFloat()
-        val dp = resources.displayMetrics.density
-        val gap = 6f * dp
-        val handleSz = handle.layoutParams.width.toFloat()
-        var pvX = handle.x + handleSz / 2f - pvW / 2f
-        var pvY = handle.y - pvH - gap
-        val rootW = rootFrame.width.toFloat()
-        pvX = pvX.coerceIn(gap, (rootW - pvW - gap).coerceAtLeast(gap))
-        if (pvY < gap) pvY = handle.y + handleSz + gap
-        pv.x = pvX; pv.y = pvY
-        pv.visibility = View.VISIBLE
-    }
-
-    private fun positionSelectionOptionsView() {
-        val pop = selectionOptionsView ?: return
-        if (!isSelecting || !::poemCanvas.isInitialized) return
-        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
-        val cellRect = poemCanvas.cellRect(from) ?: return
-        if (cachedPopupW < 0) {
-            pop.measure(
-                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
-                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-            )
-            cachedPopupW = pop.measuredWidth; cachedPopupH = pop.measuredHeight
-        }
-        val popW = cachedPopupW.toFloat()
-        val dp  = resources.displayMetrics.density
-        val gap = 8f * dp
-
-        val canvasLoc = IntArray(2); poemCanvas.getLocationOnScreen(canvasLoc)
-        val rootLoc   = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
-        val cellLeft = (canvasLoc[0] - rootLoc[0] + cellRect.left).toFloat()
-        val cellTop  = (canvasLoc[1] - rootLoc[1] + cellRect.top).toFloat()
-
-        var popX = cellLeft - popW - gap
-        if (popX < gap) popX = cellLeft + cellRect.width() + gap
-        val rootW = rootFrame.width.toFloat()
-        popX = popX.coerceIn(gap, (rootW - popW - gap).coerceAtLeast(gap))
-        val popY = cellTop.coerceIn(gap, (rootFrame.height - cachedPopupH - gap).coerceAtLeast(gap))
-
-        pop.x = popX; pop.y = popY
-        pop.visibility = View.VISIBLE
     }
 
 
@@ -890,158 +795,21 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     // ── Tools panel toggle ────────────────────────────────────────────
-    private fun hideBottomForOverlay() {
-        if (toolsVisible) allToolsPanel.visibility = View.GONE
-        bottomPanel.visibility = View.GONE
-    }
-
-    private fun switchToTools() {
-        clearSelection()
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
-        currentFocus?.clearFocus()
-        refreshInsertedImagePanel()
-        val h = if (lastKeyboardHeight > 0) lastKeyboardHeight
-                else (280 * resources.displayMetrics.density).roundToInt()
-        val lp = allToolsPanel.layoutParams as FrameLayout.LayoutParams
-        lp.height = h
-        allToolsPanel.layoutParams = lp
-        allToolsPanel.visibility = View.VISIBLE
-        mainScrollView.setPadding(0, 0, 0, h)
-        toolsVisible = true
-        toolsCell?.setBackgroundColor(getColor(R.color.row_active))
-    }
-
-    private fun switchToKeyboard() {
-        allToolsPanel.visibility = View.GONE
-        mainScrollView.setPadding(0, 0, 0, lastKeyboardHeight.coerceAtLeast(0))
-        toolsVisible = false
-        toolsCell?.setBackgroundColor(Color.TRANSPARENT)
-        ghostInput.requestFocus()
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.showSoftInput(ghostInput, InputMethodManager.SHOW_IMPLICIT)
-    }
 
     // ── Selection ──────────────────────────────────────────────────────
 
-    private fun enterSelectionMode(index: Int) {
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
-        currentFocus?.clearFocus()
-        isSelecting = true
-        highlightFrom = -1  // force full repaint on first updateHighlightDiff call
-        selectionStart = index; selectionEnd = index
-        updateSelectionHighlight()
-    }
-
-    private fun clearSelection() {
-        isSelecting = false; selectionStart = -1; selectionEnd = -1
-        if (::poemCanvas.isInitialized) poemCanvas.clearSelectionHighlight()
-        highlightFrom = -1; highlightTo = -1
-        isFrameScheduled = false
-        cachedPopupW = -1; cachedPopupH = -1
-        startHandle?.visibility = View.GONE
-        endHandle?.visibility   = View.GONE
-        selectionOptionsView?.visibility = View.GONE
-        handlePasteView?.visibility = View.GONE
-        tappedHandleIsStart = null
-    }
-
-    private fun updateSelectionHighlight() {
-        if (!isSelecting) return
-        val total = MAX_COLUMNS * numRows
-        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
-        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost((total - 1).coerceAtLeast(0))
-        updateHighlightDiff(from, to)
-        positionHandleAt(startHandle, from, atTop = true)
-        positionHandleAt(endHandle,   to,   atTop = false)
-        positionSelectionOptionsView()
-    }
-
-    private fun updateHighlightDiff(newFrom: Int, newTo: Int) {
-        if (::poemCanvas.isInitialized) poemCanvas.setSelection(newFrom, newTo)
-        highlightFrom = newFrom; highlightTo = newTo
-    }
-
-    private fun repositionHandles() {
-        if (!isSelecting) return
-        val total = MAX_COLUMNS * numRows
-        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
-        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost((total - 1).coerceAtLeast(0))
-        positionHandleAt(startHandle, from, atTop = true)
-        positionHandleAt(endHandle,   to,   atTop = false)
-        positionSelectionOptionsView()
-    }
-
-    private fun positionHandleAt(handle: View?, index: Int, atTop: Boolean) {
-        handle ?: return
-        if (!::poemCanvas.isInitialized) return
-        val cellRect = poemCanvas.cellRect(index) ?: return
-        val canvasLoc = IntArray(2); poemCanvas.getLocationOnScreen(canvasLoc)
-        val rootLoc   = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
-        val sz = handle.layoutParams.width.toFloat()
-        val x  = (canvasLoc[0] - rootLoc[0] + cellRect.left + cellRect.width() / 2f - sz / 2f)
-        val y  = (canvasLoc[1] - rootLoc[1] + if (atTop) cellRect.top.toFloat() - sz else cellRect.bottom.toFloat())
-        if (x == 0f) return
-        handle.x = x; handle.y = y.coerceAtLeast(0f)
-        handle.visibility = View.VISIBLE
-    }
-
-    private fun fastCellIndexAtPoint(rawX: Float, rawY: Float): Int {
-        if (!::poemCanvas.isInitialized) return -1
-        val loc = IntArray(2); poemCanvas.getLocationOnScreen(loc)
-        val raw = poemCanvas.cellIndexAtTouch(rawX - loc[0], rawY - loc[1])
-        if (raw < 0) return raw
-        val nr = numRows.coerceAtLeast(1)
-        val maxActiveCol = columnData.indexOfLast { c -> c.any { it.isNotEmpty() } }.coerceAtLeast(0)
-        val col = (raw / nr).coerceIn(0, maxActiveCol)
-        return col * nr + raw % nr
-    }
-
-    private fun selectedTextToString(): String {
-        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
-        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost((MAX_COLUMNS * numRows - 1).coerceAtLeast(0))
-        val sb = StringBuilder()
-        var prevCol = from / numRows
-        for (i in from..to) {
-            val c = i / numRows; val r = i % numRows
-            if (c != prevCol) { if (columnBreaks.contains(c)) sb.append('\n'); prevCol = c }
-            sb.append(columnData.getOrNull(c)?.getOrNull(r) ?: "")
-        }
-        return sb.toString()
-    }
-
-    private fun copySelectedText() {
-        val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clip.setPrimaryClip(ClipData.newPlainText("poemeditor", selectedTextToString()))
-        Toast.makeText(this, getString(R.string.toast_copied), Toast.LENGTH_SHORT).show()
-        clearSelection()
-    }
-
-    private fun cutSelectedText() {
-        pushHistory()
-        val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clip.setPrimaryClip(ClipData.newPlainText("poemeditor", selectedTextToString()))
-        val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)
-        val to   = maxOf(selectionStart, selectionEnd).coerceAtMost((MAX_COLUMNS * numRows - 1).coerceAtLeast(0))
-        for (i in from..to) { val c = i / numRows; val r = i % numRows; setColumnChar(c, r, "") }
-        val focusTarget = from.coerceAtMost((MAX_COLUMNS * numRows - 1).coerceAtLeast(0))
-        clearSelection()
-        reflowColumnData(numRows)
-        postRefreshFocusColumn(focusTarget)
-        Toast.makeText(this, getString(R.string.toast_cut), Toast.LENGTH_SHORT).show()
-    }
+    private fun cutSelectedText() { pushHistory(); selectionCtrl.cutSelectedText() }
 
     private fun pasteText() {
         pushHistory()
         val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val raw  = clip.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
             ?.ifEmpty { null } ?: return
-        val insertIdx = if (isSelecting && selectionStart >= 0)
-            minOf(selectionStart, selectionEnd).coerceAtLeast(0)
+        val insertIdx = if (selectionCtrl.isSelecting && selectionCtrl.selectionStart >= 0)
+            minOf(selectionCtrl.selectionStart, selectionCtrl.selectionEnd).coerceAtLeast(0)
         else
             focusedCellIndex.coerceAtLeast(0)
-        clearSelection()
+        selectionCtrl.clearSelection()
         val iCol  = insertIdx / numRows
         val iRow  = insertIdx % numRows
         val chars = raw.replace("\r\n", "\n").replace("\r", "\n").filter { it != '\n' }
@@ -1057,7 +825,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val raw  = clip.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
             ?.ifEmpty { null } ?: return
-        clearSelection()
+        selectionCtrl.clearSelection()
         val iCol  = insertIdx / numRows
         val iRow  = insertIdx % numRows
         val chars = raw.replace("\r\n", "\n").replace("\r", "\n").filter { it != '\n' }
@@ -1085,38 +853,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         }
     }
 
-    private fun selectEntireLine() {
-        if (selectionStart < 0) return
-        val total = (MAX_COLUMNS * numRows - 1).coerceAtLeast(0)
-        val col = minOf(selectionStart, selectionEnd).coerceAtLeast(0) / numRows.coerceAtLeast(1)
-        selectionStart = (col * numRows).coerceIn(0, total)
-        selectionEnd   = ((col + 1) * numRows - 1).coerceIn(0, total)
-        updateSelectionHighlight()
-    }
-
-    private fun selectEntireParagraph() {
-        if (selectionStart < 0) return
-        val curCol = minOf(selectionStart, selectionEnd).coerceAtLeast(0) / numRows
-        val breaks = columnBreaks.sorted()
-        // Paragraph start: rightmost break <= curCol (col 0 if none)
-        var paraStartCol = 0
-        for (brk in breaks) { if (brk <= curCol) paraStartCol = brk else break }
-        // Paragraph end: column before the next break after curCol, or last column
-        var paraEndCol = numColumns - 1
-        for (brk in breaks) { if (brk > curCol) { paraEndCol = brk - 1; break } }
-        var first = -1; var last = -1
-        for (col in paraStartCol..paraEndCol) {
-            val cells = columnData.getOrNull(col) ?: continue
-            for (row in cells.indices) {
-                if (cells[row].isNotBlank()) {
-                    val idx = col * numRows + row
-                    if (first < 0) first = idx
-                    last = idx
-                }
-            }
-        }
-        if (first >= 0) { selectionStart = first; selectionEnd = last; updateSelectionHighlight() }
-    }
+    private fun selectEntireLine()      = selectionCtrl.selectEntireLine()
+    private fun selectEntireParagraph() = selectionCtrl.selectEntireParagraph(numColumns)
 
     // ── Reflow ─────────────────────────────────────────────────────────
     private fun reflowColumnData(newNumRows: Int) =
@@ -1128,8 +866,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private fun refreshGrid() {
         placeFrontierMarker()
         clearComposingPreview()
-        if (::poemCanvas.isInitialized) poemCanvas.refreshContent(columnData)
-        if (isSelecting) updateSelectionHighlight()
+        if (::poemCanvas.isInitialized) {
+            if (columnData.size > numColumns) {
+                numColumns = columnData.size
+                poemCanvas.setMaxColumns(numColumns)
+                if (canvasMode == CanvasMode.VERTICAL || canvasMode == CanvasMode.HORIZONTAL)
+                    viewFactory.updateScrollIndicator()
+            }
+            poemCanvas.refreshContent(columnData)
+        }
+        if (selectionCtrl.isSelecting) selectionCtrl.updateSelectionHighlight()
     }
 
     // ── Grid ───────────────────────────────────────────────────────────
@@ -1267,6 +1013,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun rebuildGrid(isInitialBoot: Boolean = false, scrollToStart: Boolean = false) {
+        if (canvasMode == CanvasMode.HORIZONTAL) {
+            applyCanvasModeLayout()
+            rebuildHorizontalGrid(isInitialBoot)
+            return
+        }
+        if (canvasMode == CanvasMode.FREESTYLE) {
+            applyCanvasModeLayout()
+            updateFreestyleCanvas()
+            return
+        }
         val availW = gridContainer.measuredWidth
         val currentH = mainScrollView.height - gridContainer.paddingTop - gridContainer.paddingBottom
         if (availW <= 0 || currentH <= 0) return
@@ -1282,7 +1038,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             (gw - (s.scrollX + viewport)) / cs
         }.coerceIn(0, (numColumns - 1).coerceAtLeast(0))
 
-        clearSelection()
+        selectionCtrl.clearSelection()
         isPreviewing = false
         focusedCellIndex = -1
 
@@ -1310,9 +1066,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
 
         numRows = newNumRows
 
-        // MAX_COLUMNS is the minimum skeleton width. After reflow the data may span more
-        // columns; expand numColumns to match so nothing is visually clipped.
-        numColumns = maxOf(MAX_COLUMNS, columnData.size)
+        // Minimum skeleton = exactly the visible columns; expand only when content demands more.
+        val visibleCols = (availW / cellSize).coerceAtLeast(1)
+        numColumns = maxOf(visibleCols, columnData.size)
 
         currentCellSize = cellSize
 
@@ -1382,7 +1138,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun saveState() {
-        updateActiveImageRuntimeState()
+        imageCtrl.updateActiveImageRuntimeState()
         val matVals = getBgImageMatrixValues()
         val matStr = if (matVals != null) {
             org.json.JSONArray().also { arr -> matVals.forEach { arr.put(it.toDouble()) } }.toString()
@@ -1396,6 +1152,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             .putInt("text_color", gridTextColor)
             .putInt("bg_color", bgColor)
             .putString("input_mode", inputMode.name)
+            .putString("canvas_mode", canvasMode.name)
             .putString("bg_image_uri", bgImageUri)
             .putString("bg_image_matrix", matStr)
             .putString("inserted_images", insertedImagesToJsonString(copyInsertedImagesState()))
@@ -1406,6 +1163,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             .putInt("grid_pad_bottom", gridPaddingBottomPx)
             .putInt("grid_pad_left",   gridPaddingLeftPx)
             .putInt("grid_pad_right",  gridPaddingRightPx)
+            .putString("horizontal_text", "")
+            .putString("text_boxes", SessionManager.textBoxesToJson(textBoxes).toString())
             .apply()
     }
 
@@ -1417,6 +1176,13 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         } catch (_: Exception) {
             clearDocumentContent()
         }
+        try {
+            val tbStr = prefs.getString("text_boxes", null)
+            if (!tbStr.isNullOrEmpty()) {
+                val loaded = SessionManager.parseTextBoxes(org.json.JSONArray(tbStr))
+                textBoxes.clear(); textBoxes.addAll(loaded)
+            }
+        } catch (_: Exception) {}
     }
 
     // ── Ghost input + canvas touch setup ──────────────────────────────
@@ -1614,27 +1380,43 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private var lastCanvasTapTime  = 0L
 
     private fun setupCanvasTouchListener() {
+        freestyleLongPressDetector = android.view.GestureDetector(this,
+            object : android.view.GestureDetector.SimpleOnGestureListener() {
+                override fun onLongPress(e: MotionEvent) {
+                    if (canvasMode != CanvasMode.FREESTYLE) return
+                    if (poemCanvas.freestyleBoxAtTouch(e.x, e.y) == null) {
+                        freestyleLongPressHandled = true
+                        createFreestyleTextBox(e.x, e.y)
+                    }
+                }
+            })
+
         poemCanvas.setOnTouchListener { _, event ->
+            freestyleLongPressDetector.onTouchEvent(event)
+
+            // Dismiss tools panel on any canvas tap regardless of mode
+            if (event.action == MotionEvent.ACTION_DOWN && toolsVisible) keyboardToolbarCtrl.collapseToolsPanel()
+
+            if (canvasMode == CanvasMode.FREESTYLE) {
+                handleFreestyleTouchEvent(event)
+                return@setOnTouchListener true
+            }
+
+            // VERTICAL mode
             if (event.action == MotionEvent.ACTION_UP) {
                 val index = poemCanvas.cellIndexAtTouch(event.x, event.y)
                 if (index >= 0) {
                     val now = System.currentTimeMillis()
-                    if (!isSelecting && lastCanvasTapIndex == index && now - lastCanvasTapTime < 300L) {
+                    if (!selectionCtrl.isSelecting && lastCanvasTapIndex == index && now - lastCanvasTapTime < 300L) {
                         lastCanvasTapTime = 0L; lastCanvasTapIndex = -1
-                        enterSelectionMode(index)
+                        selectionCtrl.enterSelectionMode(index)
                         return@setOnTouchListener true
                     }
-                    if (isSelecting) {
-                        handlePasteView?.visibility = View.GONE
-                        clearSelection()
+                    if (selectionCtrl.isSelecting) {
+                        selectionCtrl.clearSelection()
                     }
                     lastCanvasTapTime = now; lastCanvasTapIndex = index
-                    if (toolsVisible) {
-                        allToolsPanel.visibility = View.GONE
-                        toolsVisible = false
-                        toolsCell?.setBackgroundColor(Color.TRANSPARENT)
-                        if (lastKeyboardHeight > 0) mainScrollView.setPadding(0, 0, 0, lastKeyboardHeight)
-                    }
+                    // toolsVisible already cleared in ACTION_DOWN above
                     val nr = numRows.coerceAtLeast(1)
                     val cellChar = columnData.getOrNull(index / nr)?.getOrNull(index % nr) ?: ""
                     if (inputMode == InputMode.SEQUENTIAL && cellChar.isEmpty()) {
@@ -1645,22 +1427,202 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                             return@setOnTouchListener true
                         }
                     }
-                    // Occupied non-frontier/non-lineend cell: top half → cursor before, bottom half → cursor after.
                     if (cellChar.isNotBlank() && cellChar != FRONTIER_MARKER && cellChar != LINE_END_MARKER) {
                         val cs = currentCellSize.coerceAtLeast(1)
                         val cellTopY = (index % nr) * cs
-                        val tapInTopHalf = event.y < cellTopY + cs / 2f
-                        if (tapInTopHalf) {
-                            focusCell(index)
-                        } else {
-                            focusCell((index + 1).coerceAtMost(MAX_COLUMNS * numRows - 1))
-                        }
+                        if (event.y < cellTopY + cs / 2f) focusCell(index)
+                        else focusCell((index + 1).coerceAtMost(MAX_COLUMNS * numRows - 1))
                     } else {
                         focusCell(index)
                     }
                 }
             }
             true
+        }
+    }
+
+    private fun handleFreestyleTouchEvent(event: MotionEvent) {
+        val x = event.x; val y = event.y
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                freestyleLongPressHandled = false
+                freestyleDragMoved = false
+                freestyleDragBox = null
+                freestyleResizingBox = null
+
+                val activeBox = textBoxes.find { it.id == activeTextBoxId }
+                if (activeBox != null) {
+                    when (poemCanvas.freestyleCornerActionAtTouch(x, y)) {
+                        FreestyleCornerAction.MOVE -> {
+                            freestyleDragBox = activeBox
+                            freestyleDragTouchOffX = x - activeBox.leftPx
+                            freestyleDragTouchOffY = y - activeBox.topPx
+                            poemCanvas.parent?.requestDisallowInterceptTouchEvent(true)
+                            freestyleLongPressDetector.onTouchEvent(
+                                MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL })
+                        }
+                        FreestyleCornerAction.RESIZE -> {
+                            freestyleResizingBox = activeBox
+                            freestyleResizeOriginX = x
+                            freestyleResizeOriginY = y
+                            freestyleResizeOrigCols = activeBox.colCount
+                            freestyleResizeOrigRows = activeBox.rowCount
+                            poemCanvas.parent?.requestDisallowInterceptTouchEvent(true)
+                            freestyleLongPressDetector.onTouchEvent(
+                                MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL })
+                        }
+                        else -> {}
+                    }
+                }
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                val cs = currentCellSize.coerceAtLeast(1)
+                val canvasW = poemCanvas.width.coerceAtLeast(1)
+                val canvasH = poemCanvas.height.coerceAtLeast(1)
+
+                val creatingBox = freestyleCreatingBox
+                if (creatingBox != null) {
+                    val dx = (x - freestyleCreateOriginX).coerceAtLeast(0f)
+                    val dy = (y - freestyleCreateOriginY).coerceAtLeast(0f)
+                    val maxCols = ((canvasW - freestyleCreateOriginX) / cs).toInt().coerceAtLeast(2)
+                    val maxRows = ((canvasH - freestyleCreateOriginY) / cs).toInt().coerceAtLeast(2)
+                    val newCols = (dx / cs).roundToInt().coerceIn(2, maxCols)
+                    val newRows = (dy / cs).roundToInt().coerceIn(2, maxRows)
+                    if (newCols != creatingBox.colCount || newRows != creatingBox.rowCount) {
+                        creatingBox.leftPx = freestyleCreateOriginX
+                        creatingBox.topPx = freestyleCreateOriginY
+                        creatingBox.colCount = newCols
+                        creatingBox.rowCount = newRows
+                        creatingBox.columnData.clear()
+                        for (col in 0 until newCols) creatingBox.columnData.add(MutableList(newRows) { "" })
+                        poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
+                        poemCanvas.requestLayout()
+                    }
+                    freestyleDragMoved = true
+                    return
+                }
+
+                val resizingBox = freestyleResizingBox
+                if (resizingBox != null) {
+                    freestyleDragMoved = true
+                    val dx = x - freestyleResizeOriginX
+                    val dy = y - freestyleResizeOriginY
+                    val maxCols = ((canvasW - resizingBox.leftPx) / cs).toInt().coerceAtLeast(2)
+                    val maxRows = ((canvasH - resizingBox.topPx) / cs).toInt().coerceAtLeast(2)
+                    val newCols = (freestyleResizeOrigCols + dx / cs).roundToInt().coerceIn(2, maxCols)
+                    val newRows = (freestyleResizeOrigRows + dy / cs).roundToInt().coerceIn(2, maxRows)
+                    if (newCols != resizingBox.colCount || newRows != resizingBox.rowCount) {
+                        resizingBox.colCount = newCols
+                        resizingBox.rowCount = newRows
+                        poemCanvas.updateFreestyleBoxes(textBoxes, activeTextBoxId, resizingBox.leftPx, resizingBox.topPx)
+                        poemCanvas.requestLayout()
+                    }
+                    return
+                }
+
+                val dragBox = freestyleDragBox ?: return
+                freestyleDragMoved = true
+                val maxLeft = (canvasW - dragBox.colCount * cs).toFloat().coerceAtLeast(0f)
+                val maxTop  = (canvasH - dragBox.rowCount * cs).toFloat().coerceAtLeast(0f)
+                dragBox.leftPx = (x - freestyleDragTouchOffX).coerceIn(0f, maxLeft)
+                dragBox.topPx  = (y - freestyleDragTouchOffY).coerceIn(0f, maxTop)
+                poemCanvas.updateFreestyleBoxes(textBoxes, activeTextBoxId, dragBox.leftPx, dragBox.topPx)
+                poemCanvas.requestLayout()
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val creatingBox = freestyleCreatingBox
+                if (creatingBox != null) {
+                    freestyleCreatingBox = null
+                    freestyleLongPressHandled = false
+                    freestyleDragMoved = false
+                    if (event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                        textBoxes.remove(creatingBox)
+                        poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
+                        poemCanvas.requestLayout()
+                    } else {
+                        activateFreestyleBox(creatingBox)
+                        persistCurrentState()
+                    }
+                    return
+                }
+
+                val resizingBox = freestyleResizingBox
+                if (resizingBox != null) {
+                    freestyleResizingBox = null
+                    val wasDrag = freestyleDragMoved
+                    freestyleDragMoved = false
+                    if (event.actionMasked != MotionEvent.ACTION_CANCEL) {
+                        if (wasDrag) {
+                            // Reflow live columnData to new row count before saving back to box
+                            val newNumRows = if (resizingBox.isHorizontal)
+                                resizingBox.colCount.coerceAtLeast(2)
+                            else resizingBox.rowCount.coerceAtLeast(2)
+                            if (newNumRows != numRows) reflowColumnData(newNumRows)
+                            numRows = newNumRows
+                            deactivateFreestyleBox()
+                            resizeBoxData(resizingBox, resizingBox.colCount, resizingBox.rowCount)
+                            activateFreestyleBox(resizingBox)
+                            persistCurrentState()
+                        } else {
+                            // Tap on ◢ — corner already confirmed on ACTION_DOWN, skip re-hit-test
+                            showFreestyleBoxEditor(resizingBox)
+                        }
+                    }
+                    return
+                }
+
+                val dragBox = freestyleDragBox
+                val wasDrag = freestyleDragMoved
+                freestyleDragBox = null
+                freestyleDragMoved = false
+
+                if (freestyleLongPressHandled) { freestyleLongPressHandled = false; return }
+                if (dragBox != null && wasDrag) { persistCurrentState(); return }
+
+                // Tap resolution
+                val hitBox = poemCanvas.freestyleBoxAtTouch(x, y)
+                when {
+                    hitBox != null && hitBox.id != activeTextBoxId -> activateFreestyleBox(hitBox)
+                    hitBox != null -> {
+                        when (poemCanvas.freestyleCornerActionAtTouch(x, y)) {
+                            FreestyleCornerAction.RESIZE      -> showFreestyleBoxEditor(hitBox)
+                            FreestyleCornerAction.DELETE      -> deleteFreestyleBox(hitBox)
+                            FreestyleCornerAction.TOGGLE_FLOW -> toggleFreestyleBoxFlow(hitBox)
+                            FreestyleCornerAction.MOVE        -> { /* tap on move grip: no-op */ }
+                            null -> {
+                                val cellIdx = poemCanvas.cellIndexAtTouch(x, y)
+                                if (cellIdx >= 0) {
+                                    if (inputMode == InputMode.SEQUENTIAL) {
+                                        val nr = numRows.coerceAtLeast(1)
+                                        val cellChar = columnData.getOrNull(cellIdx / nr)?.getOrNull(cellIdx % nr) ?: ""
+                                        if (cellChar.isEmpty()) {
+                                            val target = findSequentialTapTarget(cellIdx)
+                                            if (target >= 0 && target != cellIdx) {
+                                                focusCell(target)
+                                                return
+                                            }
+                                        }
+                                    }
+                                    focusCell(cellIdx)
+                                }
+                            }
+                        }
+                    }
+                    activeTextBoxId != null -> {
+                        // hitBox was null — touch may be in a corner that extends past the box boundary
+                        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+                        when (poemCanvas.freestyleCornerActionAtTouch(x, y)) {
+                            FreestyleCornerAction.RESIZE      -> if (activeBox != null) showFreestyleBoxEditor(activeBox)
+                            FreestyleCornerAction.DELETE      -> if (activeBox != null) deleteFreestyleBox(activeBox)
+                            FreestyleCornerAction.TOGGLE_FLOW -> if (activeBox != null) toggleFreestyleBoxFlow(activeBox)
+                            FreestyleCornerAction.MOVE        -> { /* no-op */ }
+                            null -> { deactivateFreestyleBox(); poemCanvas.refreshContent(emptyList()) }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1681,6 +1643,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         bgImageUri  = prefs.getString("bg_image_uri", null)
         inputMode   = when (prefs.getString("input_mode", "SEQUENTIAL")) {
             "SCATTER" -> InputMode.SCATTER; else -> InputMode.SEQUENTIAL }
+        canvasMode  = try { CanvasMode.valueOf(prefs.getString("canvas_mode", "VERTICAL") ?: "VERTICAL") }
+                      catch (_: Exception) { CanvasMode.VERTICAL }
         currentSessionId   = prefs.getString("current_session_id",  null) ?: java.util.UUID.randomUUID().toString()
         currentSessionName = prefs.getString("current_session_name", getString(R.string.default_session_name)) ?: getString(R.string.default_session_name)
 
@@ -1720,96 +1684,20 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         val storedUri = storeInsertedImage(uri) ?: uri.toString()
         insertedImages.add(InsertedImageState(storedUri, null))
         activeImageIndex = insertedImages.lastIndex
-        syncActiveImageFromList()
+        imageCtrl.syncActiveImageFromList()
         refreshInsertedImagePanel()
         persistCurrentState()
     }
 
-    private fun storeInsertedImage(uri: Uri): String? {
-        return try {
-            val dir = java.io.File(filesDir, "backgrounds").also { it.mkdirs() }
-            val file = java.io.File(dir, "${currentSessionId}_${System.currentTimeMillis()}.bg")
-            contentResolver.openInputStream(uri)?.use { input ->
-                file.outputStream().use { output -> input.copyTo(output) }
-            } ?: return null
-            Uri.fromFile(file).toString()
-        } catch (_: Exception) {
-            null
-        }
-    }
+    private fun storeInsertedImage(uri: Uri): String? = imageCtrl.storeInsertedImage(uri)
 
-    private fun selectInsertedImage(index: Int) {
-        if (index !in insertedImages.indices || index == activeImageIndex) return
-        pushHistory()
-        updateActiveImageRuntimeState()
-        activeImageIndex = index
-        syncActiveImageFromList()
-        refreshInsertedImagePanel()
-        persistCurrentState()
-    }
+    private fun selectInsertedImage(index: Int) = imageCtrl.selectInsertedImage(index)
 
-    private fun getBgImageMatrixValues(): FloatArray? {
-        if (bgImageUri == null) return null
-        return FloatArray(9).also { bgImageMatrix.getValues(it) }
-    }
+    private fun getBgImageMatrixValues(): FloatArray? = imageCtrl.getBgImageMatrixValues()
 
-    private fun removeInsertedImage(index: Int = activeImageIndex) {
-        if (index !in insertedImages.indices) return
-        pushHistory()
-        insertedImages.removeAt(index)
-        activeImageIndex = if (insertedImages.isEmpty()) -1 else minOf(index, insertedImages.lastIndex)
-        syncActiveImageFromList()
-        refreshInsertedImagePanel()
-        persistCurrentState()
-    }
+    private fun removeInsertedImage(index: Int = activeImageIndex) = imageCtrl.removeInsertedImage(index)
 
-    private fun refreshInsertedImagePanel() {
-        val container = insertImageContainer ?: return
-        container.removeAllViews()
-        val dp = resources.displayMetrics.density
-        insertedImages.forEachIndexed { idx, img ->
-            container.addView(LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
-                    it.marginEnd = (6 * dp).roundToInt()
-                }
-
-                addView(ImageView(this@MainActivity).apply {
-                    val avatarSize = (22 * dp).roundToInt()
-                    layoutParams = LinearLayout.LayoutParams(avatarSize, avatarSize)
-                    scaleType = ImageView.ScaleType.CENTER_CROP
-                    setImageURI(Uri.parse(img.uri))
-                    background = GradientDrawable().apply {
-                        shape = GradientDrawable.OVAL
-                        setColor(Color.TRANSPARENT)
-                        setStroke(
-                            (if (idx == activeImageIndex) 2f else 1f * dp).roundToInt(),
-                            getColor(if (idx == activeImageIndex) R.color.text_dark else R.color.stroke)
-                        )
-                    }
-                    clipToOutline = true
-                    contentDescription = "已插入圖片 ${idx + 1}"
-                    setOnClickListener { selectInsertedImage(idx) }
-                })
-
-                addView(TextView(this@MainActivity).apply {
-                    text = "×"
-                    textSize = 10f
-                    setTextColor(getColor(R.color.text_dark))
-                    gravity = Gravity.CENTER
-                    layoutParams = LinearLayout.LayoutParams((12 * dp).roundToInt(), (12 * dp).roundToInt())
-                        .also { it.marginStart = (2 * dp).roundToInt() }
-                    setOnClickListener { removeInsertedImage(idx) }
-                })
-            })
-        }
-        container.addView(TextView(this).apply {
-            text = "${insertedImages.size}/$MAX_INSERTED_IMAGES"
-            textSize = 11f
-            setTextColor(getColor(R.color.text_light))
-        })
-    }
+    private fun refreshInsertedImagePanel() = imageCtrl.refreshInsertedImagePanel()
 
     // ── Screenshot ─────────────────────────────────────────────────────
     private val screenshotController: ScreenshotController by lazy {
@@ -1824,7 +1712,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                                                                selectionOptionsView, handlePasteView)
             override fun getAllToolsPanel()           = allToolsPanel as View?
             override fun isToolsVisible()            = toolsVisible
-            override fun hideBottomForOverlay() = this@MainActivity.hideBottomForOverlay()
+            override fun hideBottomForOverlay() = keyboardToolbarCtrl.hideBottomForOverlay()
             override fun getNumRows()                = numRows
             override fun getCurrentCellSize()        = currentCellSize
             override fun onScreenshotRestored() {
@@ -1832,67 +1720,303 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
                 if (::poemCanvas.isInitialized) poemCanvas.startCursorBlink()
                 if (toolsVisible) allToolsPanel.visibility = View.VISIBLE
                 viewFactory.updateScrollIndicator()
-                if (isSelecting) {
-                    startHandle?.visibility = View.VISIBLE
-                    endHandle?.visibility   = View.VISIBLE
-                    positionSelectionOptionsView()
-                }
+                if (selectionCtrl.isSelecting) selectionCtrl.updateSelectionHighlight()
             }
         })
     }
 
     private fun takeScreenshot() = screenshotController.takeScreenshot()
 
+    private fun buildEditorButtonBar(onCancel: () -> Unit, onConfirm: () -> Unit): LinearLayout {
+        val dp = resources.displayMetrics.density
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity     = Gravity.CENTER
+            setBackgroundColor(Color.argb(230, 30, 30, 30))
+            layoutParams = FrameLayout.LayoutParams(MP, (60 * dp).toInt(), Gravity.BOTTOM)
+
+            fun btnView(label: String, bgColor: Int, action: () -> Unit) = TextView(this@MainActivity).apply {
+                text = label
+                textSize = 15f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                background = GradientDrawable().apply {
+                    setColor(bgColor)
+                    cornerRadius = 22f * dp
+                }
+                val hp = (28 * dp).toInt(); val vp = (10 * dp).toInt()
+                setPadding(hp, vp, hp, vp)
+                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                    it.marginEnd = (16 * dp).toInt()
+                }
+                setOnClickListener { action() }
+            }
+
+            addView(btnView(getString(R.string.screenshot_cancel),  Color.argb(200, 80, 80, 80),   onCancel))
+            addView(btnView(getString(R.string.screenshot_confirm), Color.argb(230, 33, 150, 243), onConfirm))
+        }
+    }
+
     private fun showInputFieldEditor() {
         val toolsWereVisible = toolsVisible
-        hideBottomForOverlay()
+        keyboardToolbarCtrl.hideBottomForOverlay()
+
+        mainScrollView.pivotX = rootFrame.width / 2f
+        mainScrollView.pivotY = rootFrame.height / 2f
+        mainScrollView.scaleX = PREVIEW_SCALE
+        mainScrollView.scaleY = PREVIEW_SCALE
+
+        // Hatch background makes the area outside the scaled content clearly distinct
+        // from any document background colour (black, white, grey, etc.).
+        rootFrame.background = HatchDrawable(resources.displayMetrics.density)
+        // Scroll indicator sits above mainScrollView in mainLayout and doesn't scale
+        // with it, so hide it for the duration of adjustment.
+        viewFactory.scrollIndicatorContainer?.visibility = View.GONE
+        // mainScrollView is transparent by default; give it an opaque background so
+        // the rootFrame hatch doesn't bleed through the content area.
+        mainScrollView.setBackgroundColor(bgColor)
+
+        // Visual rect of the scaled mainScrollView in rootFrame coordinates.
+        val hm = (rootFrame.width  / 2f * (1f - PREVIEW_SCALE)).toInt()
+        val vm = (rootFrame.height / 2f * (1f - PREVIEW_SCALE)).toInt()
+        val scaledContentRect = Rect(hm, vm, rootFrame.width - hm, rootFrame.height - vm)
 
         val rootLoc   = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
         val scrollLoc = IntArray(2); mainScrollView.getLocationOnScreen(scrollLoc)
-        val scrollTop = scrollLoc[1] - rootLoc[1]
-
-        val initTop    = scrollTop + gridPaddingTopPx
-        val initBottom = (initTop + numRows * currentCellSize.coerceAtLeast(1))
-            .coerceAtMost(rootFrame.height)
-
-        val editorView = InputFieldEditorView(this, initTop, initBottom)
-        editorView.layoutParams = FrameLayout.LayoutParams(MP, MP)
 
         fun restoreUI() {
+            mainScrollView.animate().scaleX(1f).scaleY(1f).setDuration(180).start()
+            mainScrollView.setBackgroundColor(Color.TRANSPARENT)
+            rootFrame.setBackgroundColor(bgColor)
+            viewFactory.updateScrollIndicator()
             bottomPanel.visibility = View.VISIBLE
-            if (toolsWereVisible) switchToTools()
+            if (toolsWereVisible) keyboardToolbarCtrl.switchToTools()
         }
 
-        editorView.onCancel = {
+        lateinit var editorView: InputFieldEditorView
+        var buttonBar: LinearLayout? = null
+
+        fun dismiss() {
             rootFrame.removeView(editorView)
+            buttonBar?.let { rootFrame.removeView(it) }
             restoreUI()
         }
 
-        editorView.onConfirm = { top, bottom ->
-            rootFrame.removeView(editorView)
-            restoreUI()
-            // Defer one frame so the layout settles with the toolbar visible before
-            // we measure mainScrollView.height for the padding calculation.
-            mainScrollView.post {
-                val sTop = scrollLoc[1] - rootLoc[1]
-                gridPaddingTopPx    = (top    - sTop).coerceAtLeast(0)
-                gridPaddingBottomPx = (mainScrollView.height - (bottom - sTop)).coerceAtLeast(0)
-                gridPaddingLeftPx   = 0
-                gridPaddingRightPx  = 0
-                gridContainer.setPadding(0, gridPaddingTopPx, 0, gridPaddingBottomPx)
-                stableMaxHeight = (mainScrollView.height - gridPaddingTopPx - gridPaddingBottomPx)
-                    .coerceAtLeast(1)
-                rebuildGrid()
-                saveState()
-            }
+        if (canvasMode == CanvasMode.HORIZONTAL) {
+            val scrollLeft = scrollLoc[0] - rootLoc[0]
+            val scrollTop  = scrollLoc[1] - rootLoc[1]
+            val initLeft   = scrollLeft + (gridPaddingLeftPx  * PREVIEW_SCALE).toInt()
+            val initRight  = (scrollLeft + (mainScrollView.width - gridPaddingRightPx) * PREVIEW_SCALE).toInt()
+                .coerceAtMost(rootFrame.width)
+            val initTop    = scrollTop + (gridPaddingTopPx * PREVIEW_SCALE).toInt()
+            val initBottom = (scrollTop + (mainScrollView.height - gridPaddingBottomPx) * PREVIEW_SCALE).toInt()
+                .coerceAtMost(rootFrame.height)
+            editorView = InputFieldEditorView(
+                this, initTop, initBottom, initLeft, initRight,
+                leftRightOnly = true, scaledContentRect = scaledContentRect
+            )
+            editorView.layoutParams = FrameLayout.LayoutParams(MP, MP)
+            buttonBar = buildEditorButtonBar(
+                onCancel  = { dismiss() },
+                onConfirm = {
+                    val left = editorView.selectedLeft; val right = editorView.selectedRight
+                    dismiss()
+                    mainScrollView.post {
+                        val sLeft = scrollLoc[0] - rootLoc[0]
+                        gridPaddingLeftPx  = ((left  - sLeft) / PREVIEW_SCALE).toInt().coerceAtLeast(0)
+                        gridPaddingRightPx = (mainScrollView.width - (right - sLeft) / PREVIEW_SCALE).toInt().coerceAtLeast(0)
+                        gridContainer.setPadding(gridPaddingLeftPx, gridPaddingTopPx, gridPaddingRightPx, gridPaddingBottomPx)
+                        stableMaxWidth = (mainScrollView.width - gridPaddingLeftPx - gridPaddingRightPx).coerceAtLeast(1)
+                        rebuildGrid(); saveState()
+                    }
+                }
+            )
+        } else {
+            val scrollTop  = scrollLoc[1] - rootLoc[1]
+            val initTop    = scrollTop + (gridPaddingTopPx * PREVIEW_SCALE).toInt()
+            val initBottom = (initTop + numRows * currentCellSize.coerceAtLeast(1) * PREVIEW_SCALE).toInt()
+                .coerceAtMost(rootFrame.height)
+            editorView = InputFieldEditorView(
+                this, initTop, initBottom,
+                scaledContentRect = scaledContentRect
+            )
+            editorView.layoutParams = FrameLayout.LayoutParams(MP, MP)
+            buttonBar = buildEditorButtonBar(
+                onCancel  = { dismiss() },
+                onConfirm = {
+                    val top = editorView.selectedTop; val bottom = editorView.selectedBottom
+                    dismiss()
+                    mainScrollView.post {
+                        val sTop = scrollLoc[1] - rootLoc[1]
+                        gridPaddingTopPx    = ((top    - sTop) / PREVIEW_SCALE).toInt().coerceAtLeast(0)
+                        gridPaddingBottomPx = (mainScrollView.height - (bottom - sTop) / PREVIEW_SCALE).toInt().coerceAtLeast(0)
+                        gridPaddingLeftPx   = 0; gridPaddingRightPx = 0
+                        gridContainer.setPadding(0, gridPaddingTopPx, 0, gridPaddingBottomPx)
+                        stableMaxHeight = (mainScrollView.height - gridPaddingTopPx - gridPaddingBottomPx).coerceAtLeast(1)
+                        rebuildGrid(); saveState()
+                    }
+                }
+            )
         }
 
         rootFrame.addView(editorView)
+        rootFrame.addView(buttonBar)
+    }
+
+    private fun showBoxEditor(box: TextBoxInstance) {
+        val toolsWereVisible = toolsVisible
+        keyboardToolbarCtrl.hideBottomForOverlay()
+
+        val canvasLoc = IntArray(2); poemCanvas.getLocationOnScreen(canvasLoc)
+        val rootLoc   = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
+        val cs = poemCanvas.cellSizePx.coerceAtLeast(1)
+
+        val initLeft   = canvasLoc[0] - rootLoc[0] + box.leftPx.toInt()
+        val initTop    = canvasLoc[1] - rootLoc[1] + box.topPx.toInt()
+        val initRight  = initLeft + box.colCount * cs
+        val initBottom = initTop  + box.rowCount * cs
+
+        val editorView = InputFieldEditorView(
+            this, initTop, initBottom, initLeft, initRight, fourEdge = true
+        )
+        editorView.layoutParams = FrameLayout.LayoutParams(MP, MP)
+
+        var buttonBar: LinearLayout? = null
+
+        fun restoreUI() {
+            bottomPanel.visibility = View.VISIBLE
+            if (toolsWereVisible) keyboardToolbarCtrl.switchToTools()
+        }
+
+        fun dismiss() {
+            rootFrame.removeView(editorView)
+            buttonBar?.let { rootFrame.removeView(it) }
+            restoreUI()
+        }
+
+        buttonBar = buildEditorButtonBar(
+            onCancel  = { dismiss() },
+            onConfirm = {
+                val left = editorView.selectedLeft; val top = editorView.selectedTop
+                val right = editorView.selectedRight; val bottom = editorView.selectedBottom
+                dismiss()
+                val cLeft = (left  - (canvasLoc[0] - rootLoc[0])).toFloat().coerceAtLeast(0f)
+                val cTop  = (top   - (canvasLoc[1] - rootLoc[1])).toFloat().coerceAtLeast(0f)
+                val newCols = ((right  - left).coerceAtLeast(cs) / cs).coerceAtLeast(1)
+                val newRows = ((bottom - top ).coerceAtLeast(cs) / cs).coerceAtLeast(1)
+                box.leftPx   = cLeft; box.topPx    = cTop
+                box.colCount = newCols; box.rowCount = newRows
+                val prevNumRows = numRows
+                numRows    = if (box.isHorizontal) box.colCount.coerceAtLeast(2) else box.rowCount.coerceAtLeast(2)
+                numColumns = if (box.isHorizontal) box.rowCount.coerceAtLeast(2) else box.colCount.coerceAtLeast(2)
+                if (numRows != prevNumRows) {
+                    reflowColumnData(numRows)
+                    placeFrontierMarker()
+                }
+                val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+                val gapPx  = wordGapDp * resources.displayMetrics.density
+                poemCanvas.updateData(columnData, numRows, numColumns, fontPx, gapPx, gridTextColor, selectedTypeface)
+                currentCellSize = poemCanvas.cellSizePx.coerceAtLeast(1)
+                poemCanvas.updateFreestyleBoxes(textBoxes, box.id, box.leftPx, box.topPx)
+                persistCurrentState()
+            }
+        )
+
+        rootFrame.addView(editorView)
+        rootFrame.addView(buttonBar)
+    }
+
+    private fun showFreestyleBoxEditor(box: TextBoxInstance) {
+        val toolsWereVisible = toolsVisible
+        keyboardToolbarCtrl.hideBottomForOverlay()
+
+        val canvasLoc = IntArray(2); poemCanvas.getLocationOnScreen(canvasLoc)
+        val rootLoc   = IntArray(2); rootFrame.getLocationOnScreen(rootLoc)
+        val cs = poemCanvas.cellSizePx.coerceAtLeast(1)
+        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+        val gapPx  = wordGapDp * resources.displayMetrics.density
+        val canvasOffX = canvasLoc[0] - rootLoc[0]
+        val canvasOffY = canvasLoc[1] - rootLoc[1]
+
+        // Snapshot original state for cancel
+        val origLeft    = box.leftPx;    val origTop  = box.topPx
+        val origCols    = box.colCount;  val origRows = box.rowCount
+        val origNumRows = numRows;       val origNumCols = numColumns
+        val origData    = columnData.map { it.toMutableList() }.toMutableList()
+
+        val initLeft   = canvasOffX + box.leftPx.toInt()
+        val initTop    = canvasOffY + box.topPx.toInt()
+        val initRight  = initLeft + box.colCount * cs
+        val initBottom = initTop  + box.rowCount * cs
+
+        fun applySize(top: Int, bottom: Int, left: Int, right: Int) {
+            val newLeft = (left  - canvasOffX).toFloat().coerceAtLeast(0f)
+            val newTop  = (top   - canvasOffY).toFloat().coerceAtLeast(0f)
+            val newCols = ((right  - left ).coerceAtLeast(cs) / cs).coerceAtLeast(1)
+            val newRows = ((bottom - top  ).coerceAtLeast(cs) / cs).coerceAtLeast(1)
+            box.leftPx = newLeft;  box.topPx   = newTop
+            box.colCount = newCols; box.rowCount = newRows
+            val prevNR = numRows
+            numRows    = if (box.isHorizontal) newCols.coerceAtLeast(2) else newRows.coerceAtLeast(2)
+            numColumns = if (box.isHorizontal) newRows.coerceAtLeast(2) else newCols.coerceAtLeast(2)
+            if (numRows != prevNR) { reflowColumnData(numRows); placeFrontierMarker() }
+            poemCanvas.updateData(columnData, numRows, numColumns, fontPx, gapPx, gridTextColor, selectedTypeface)
+            currentCellSize = poemCanvas.cellSizePx.coerceAtLeast(1)
+            poemCanvas.updateFreestyleBoxes(textBoxes, box.id, box.leftPx, box.topPx)
+        }
+
+        val editorView = InputFieldEditorView(
+            this, initTop, initBottom, initLeft, initRight, fourEdge = true
+        )
+        editorView.onDrag = { t, b, l, r -> applySize(t, b, l, r) }
+        editorView.layoutParams = FrameLayout.LayoutParams(MP, MP)
+
+        var buttonBar: LinearLayout? = null
+
+        fun restoreUI() {
+            bottomPanel.visibility = View.VISIBLE
+            if (toolsWereVisible) keyboardToolbarCtrl.switchToTools()
+        }
+
+        fun dismiss() {
+            rootFrame.removeView(editorView)
+            buttonBar?.let { rootFrame.removeView(it) }
+            restoreUI()
+        }
+
+        buttonBar = buildEditorButtonBar(
+            onCancel = {
+                dismiss()
+                box.leftPx = origLeft; box.topPx = origTop
+                box.colCount = origCols; box.rowCount = origRows
+                numRows = origNumRows; numColumns = origNumCols
+                columnData.clear(); origData.forEach { col -> columnData.add(col.toMutableList()) }
+                poemCanvas.updateData(columnData, numRows, numColumns, fontPx, gapPx, gridTextColor, selectedTypeface)
+                currentCellSize = poemCanvas.cellSizePx.coerceAtLeast(1)
+                poemCanvas.updateFreestyleBoxes(textBoxes, box.id, box.leftPx, box.topPx)
+                poemCanvas.refreshContent(columnData)
+            },
+            onConfirm = { dismiss(); persistCurrentState() }
+        )
+
+        rootFrame.addView(editorView)
+        rootFrame.addView(buttonBar)
     }
 
     // ── Undo / Redo ────────────────────────────────────────────────────
     private fun snapshotState(): EditorHistoryState {
-        updateActiveImageRuntimeState()
+        imageCtrl.updateActiveImageRuntimeState()
+        val boxSnapshot = textBoxes.map { box ->
+            TextBoxInstance(
+                id = box.id, leftPx = box.leftPx, topPx = box.topPx,
+                colCount = box.colCount, rowCount = box.rowCount,
+                columnData = box.columnData.map { it.toMutableList() }.toMutableList(),
+                columnBreaks = box.columnBreaks.toMutableSet(),
+                fontIndex = box.fontIndex, fontSizeSp = box.fontSizeSp,
+                wordGapDp = box.wordGapDp, gridTextColor = box.gridTextColor,
+                inputMode = box.inputMode, isHorizontal = box.isHorizontal
+            )
+        }
         return EditorHistoryState(
             data = columnData.map { it.toList() },
             breaks = columnBreaks.toSet(),
@@ -1903,7 +2027,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             bgColor = bgColor,
             inputMode = inputMode,
             insertedImages = copyInsertedImagesState(),
-            activeImageIndex = activeImageIndex
+            activeImageIndex = activeImageIndex,
+            textBoxes = boxSnapshot
         )
     }
 
@@ -1945,9 +2070,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     }
 
     private fun restoreHistoryState(state: EditorHistoryState) {
-        columnData.clear()
+        // Detach from any box reference before mutating
+        columnData = mutableListOf()
+        columnBreaks = mutableSetOf()
         state.data.forEach { columnData.add(it.toMutableList()) }
-        columnBreaks.clear()
         columnBreaks.addAll(state.breaks)
 
         insertedImages.clear()
@@ -1967,8 +2093,31 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
             selectedImageIndex = activeImageIndex
         )
 
-        needsReflow = (inputMode != InputMode.SCATTER)
-        rebuildGrid()
+        // Restore mode-specific state
+        textBoxes.clear()
+        state.textBoxes.forEach { box ->
+            textBoxes.add(TextBoxInstance(
+                id = box.id, leftPx = box.leftPx, topPx = box.topPx,
+                colCount = box.colCount, rowCount = box.rowCount,
+                columnData = box.columnData.map { it.toMutableList() }.toMutableList(),
+                columnBreaks = box.columnBreaks.toMutableSet(),
+                fontIndex = box.fontIndex, fontSizeSp = box.fontSizeSp,
+                wordGapDp = box.wordGapDp, gridTextColor = box.gridTextColor,
+                inputMode = box.inputMode, isHorizontal = box.isHorizontal
+            ))
+        }
+        if (canvasMode == CanvasMode.FREESTYLE) {
+            activeTextBoxId = null
+            columnData = mutableListOf()
+            columnBreaks = mutableSetOf()
+            updateFreestyleCanvas()
+        }
+
+        when (canvasMode) {
+            CanvasMode.VERTICAL -> { needsReflow = (inputMode != InputMode.SCATTER); rebuildGrid() }
+            CanvasMode.HORIZONTAL -> { needsReflow = (inputMode != InputMode.SCATTER); rebuildGrid() }
+            else -> {}
+        }
         updateUndoRedoButtons()
     }
 
@@ -2019,73 +2168,330 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         applyTextColor(gridTextColor)
         refreshModeChips()
         rootFrame.setBackgroundColor(bgColor)
-        syncActiveImageFromList()
+        imageCtrl.syncActiveImageFromList()
         refreshInsertedImagePanel()
     }
 
     private fun saveSession() {
-        updateActiveImageRuntimeState()
-        editorViewModel.saveSession(currentSessionId, currentSessionName, columnData, columnBreaks,
-            fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
-            getBgImageMatrixValues(), inputMode.name, copyInsertedImagesState(), activeImageIndex,
-            gridPaddingTopPx, gridPaddingBottomPx, gridPaddingLeftPx, gridPaddingRightPx)
+        if (canvasMode == CanvasMode.FREESTYLE) {
+            val box = textBoxes.find { it.id == activeTextBoxId }
+            if (box != null) {
+                box.fontIndex = fontIndex; box.fontSizeSp = fontSizeSp
+                box.wordGapDp = wordGapDp; box.gridTextColor = gridTextColor
+            }
+        }
+        imageCtrl.updateActiveImageRuntimeState()
+        editorViewModel.saveSession(SessionDocument(
+            id = currentSessionId, name = currentSessionName,
+            canvasMode = canvasMode.name,
+            columnData = columnData, columnBreaks = columnBreaks,
+            fontIndex = fontIndex, fontSizeSp = fontSizeSp, wordGapDp = wordGapDp,
+            gridTextColor = gridTextColor, bgColor = bgColor,
+            bgImageUri = bgImageUri, bgImageMatrix = getBgImageMatrixValues(),
+            inputMode = inputMode.name,
+            insertedImages = copyInsertedImagesState(), activeImageIndex = activeImageIndex,
+            gridPadTop = gridPaddingTopPx, gridPadBottom = gridPaddingBottomPx,
+            gridPadLeft = gridPaddingLeftPx, gridPadRight = gridPaddingRightPx,
+            textBoxes = textBoxes.toList()
+        ))
+    }
+
+    private fun applyLoadedSession(doc: SessionDocument) {
+        columnData   = doc.columnData.map { it.toMutableList() }.toMutableList()
+        columnBreaks = doc.columnBreaks.toMutableSet()
+        currentSessionId   = doc.id
+        currentSessionName = doc.name
+        canvasMode = try { CanvasMode.valueOf(doc.canvasMode) } catch (_: Exception) { CanvasMode.VERTICAL }
+        updateToolbarSessionName()
+        gridPaddingTopPx    = doc.gridPadTop
+        gridPaddingBottomPx = doc.gridPadBottom
+        gridPaddingLeftPx   = doc.gridPadLeft
+        gridPaddingRightPx  = doc.gridPadRight
+        gridContainer.setPadding(gridPaddingLeftPx, gridPaddingTopPx, gridPaddingRightPx, gridPaddingBottomPx)
+        textBoxes.clear()
+        textBoxes.addAll(doc.textBoxes)
+        activeTextBoxId = null
+        val mode = try { InputMode.valueOf(doc.inputMode) } catch (_: Exception) { InputMode.SEQUENTIAL }
+        applySettings(
+            fontIdx            = doc.fontIndex,
+            sizeSp             = doc.fontSizeSp,
+            gapDp              = doc.wordGapDp,
+            textColor          = doc.gridTextColor,
+            bgCol              = doc.bgColor,
+            imgUri             = doc.bgImageUri,
+            imgMatrixValues    = doc.bgImageMatrix,
+            mode               = mode,
+            images             = doc.insertedImages,
+            selectedImageIndex = doc.activeImageIndex
+        )
     }
 
     private fun loadSessionFile(id: String) {
         if (id == currentSessionId) return
         saveSession()
         val j = editorViewModel.loadSessionJson(id) ?: return
-        loadColumnDataFromJson(j.getJSONArray("columnData"))
-        loadColumnBreaksFromJson(j.getJSONArray("columnBreaks"))
-        currentSessionId = id; currentSessionName = j.getString("name")
-        updateToolbarSessionName()
-
-        val matArr = j.optJSONArray("bgImageMatrix")
-        val matValues = if (matArr != null && matArr.length() == 9)
-            FloatArray(9) { i -> matArr.getDouble(i).toFloat() } else null
-
-        val loadedImages = parseInsertedImages(j.optJSONArray("insertedImages"))
-        val legacyUri = j.optString("bgImageUri", "").ifEmpty { null }
-        if (loadedImages.isEmpty() && !legacyUri.isNullOrEmpty()) {
-            loadedImages.add(InsertedImageState(legacyUri, cloneMatrix(matValues)))
-        }
-        val loadedActiveIndex = j.optInt("activeImageIndex", if (loadedImages.isNotEmpty()) 0 else -1)
-
-        applySettings(
-            fontIdx        = j.optInt("fontIndex", fontIndex),
-            sizeSp         = j.optDouble("fontSizeSp", fontSizeSp.toDouble()).toFloat(),
-            gapDp          = j.optDouble("wordGapDp", wordGapDp.toDouble()).toFloat(),
-            textColor      = j.optInt("gridTextColor", gridTextColor),
-            bgCol          = j.optInt("bgColor", bgColor),
-            imgUri         = legacyUri,
-            imgMatrixValues = matValues,
-            mode           = when (j.optString("inputMode", inputMode.name)) {
-                "SCATTER" -> InputMode.SCATTER; else -> InputMode.SEQUENTIAL },
-            images = loadedImages,
-            selectedImageIndex = loadedActiveIndex
-        )
-        val dp = resources.displayMetrics.density
-        gridPaddingTopPx    = j.optInt("gridPadTop",    (16f * dp).roundToInt())
-        gridPaddingBottomPx = j.optInt("gridPadBottom", 0)
-        gridPaddingLeftPx   = j.optInt("gridPadLeft",   0)
-        gridPaddingRightPx  = j.optInt("gridPadRight",  0)
-        gridContainer.setPadding(gridPaddingLeftPx, gridPaddingTopPx,
-            gridPaddingRightPx, gridPaddingBottomPx)
+        applyLoadedSession(SessionManager.parseSessionJson(j))
         if (mainScrollView.height > 0) {
             stableMaxHeight = (mainScrollView.height - gridPaddingTopPx - gridPaddingBottomPx)
                 .coerceAtLeast(1)
         }
-
         editorViewModel.clearHistory(); updateUndoRedoButtons()
-        needsReflow = true; rebuildGrid(scrollToStart = true)
+        updateModeChipVisibility()
+        applyCanvasModeLayout()
+        if (canvasMode == CanvasMode.VERTICAL) {
+            needsReflow = true; rebuildGrid(scrollToStart = true)
+        } else if (canvasMode == CanvasMode.HORIZONTAL) {
+            needsReflow = true; rebuildGrid(scrollToStart = true)
+        } else if (canvasMode == CanvasMode.FREESTYLE) {
+            val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+            val gapPx = wordGapDp * resources.displayMetrics.density
+            val charSize = Paint().apply { textSize = fontPx; typeface = selectedTypeface }
+                .measureText("測").roundToInt().coerceAtLeast(1)
+            currentCellSize = (charSize + gapPx.roundToInt()).coerceAtLeast(1)
+            if (::poemCanvas.isInitialized) {
+                val minW = mainScrollView.width.takeIf { it > 0 } ?: poemCanvas.freestyleMinW
+                val minH = mainScrollView.height.takeIf { it > 0 } ?: poemCanvas.freestyleMinH
+                poemCanvas.freestyleMinW = minW
+                poemCanvas.freestyleMinH = minH
+                poemCanvas.updateData(emptyList(), 10, 20, fontPx, gapPx, gridTextColor, selectedTypeface)
+                numRows = 10; numColumns = 20
+                poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
+            }
+        }
     }
 
     private fun ensureDefaultSession() {
-        editorViewModel.ensureDefaultSession(currentSessionId, currentSessionName,
-            columnData, columnBreaks, fontIndex, fontSizeSp, wordGapDp,
-            gridTextColor, bgColor, bgImageUri, getBgImageMatrixValues(), inputMode.name,
-            copyInsertedImagesState(), activeImageIndex,
-            gridPaddingTopPx, gridPaddingBottomPx, gridPaddingLeftPx, gridPaddingRightPx)
+        editorViewModel.ensureDefaultSession(SessionDocument(
+            id = currentSessionId, name = currentSessionName,
+            canvasMode = canvasMode.name,
+            columnData = columnData, columnBreaks = columnBreaks,
+            fontIndex = fontIndex, fontSizeSp = fontSizeSp, wordGapDp = wordGapDp,
+            gridTextColor = gridTextColor, bgColor = bgColor,
+            bgImageUri = bgImageUri, bgImageMatrix = getBgImageMatrixValues(),
+            inputMode = inputMode.name,
+            insertedImages = copyInsertedImagesState(), activeImageIndex = activeImageIndex,
+            gridPadTop = gridPaddingTopPx, gridPadBottom = gridPaddingBottomPx,
+            gridPadLeft = gridPaddingLeftPx, gridPadRight = gridPaddingRightPx
+        ))
+    }
+
+    private fun updateModeChipVisibility() {
+        val showInput = canvasMode == CanvasMode.VERTICAL ||
+                        canvasMode == CanvasMode.HORIZONTAL ||
+                        (canvasMode == CanvasMode.FREESTYLE && activeTextBoxId != null)
+        modeInputSectionRef?.visibility = if (showInput) View.VISIBLE else View.GONE
+    }
+
+    private fun applyCanvasModeLayout() {
+        when (canvasMode) {
+            CanvasMode.HORIZONTAL -> {
+                hScroll?.visibility = View.VISIBLE
+                hScroll?.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                poemCanvas.isHorizontalMode = true
+                poemCanvas.isFreestyleMode = false
+
+                inputFieldCellRef?.visibility = View.VISIBLE
+                inputFieldDividerRef?.visibility = View.VISIBLE
+            }
+            CanvasMode.FREESTYLE -> {
+                hScroll?.visibility = View.VISIBLE
+                hScroll?.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                poemCanvas.isHorizontalMode = false
+                poemCanvas.isFreestyleMode = true
+                // interact section shown only by activateFreestyleBox
+                inputFieldCellRef?.visibility = View.GONE
+                inputFieldDividerRef?.visibility = View.GONE
+                // FREESTYLE canvas is always full-screen; clear any padding from other modes
+                gridPaddingTopPx = 0; gridPaddingBottomPx = 0
+                gridPaddingLeftPx = 0; gridPaddingRightPx = 0
+                gridContainer.setPadding(0, 0, 0, 0)
+            }
+            else -> {
+                hScroll?.visibility = View.VISIBLE
+                hScroll?.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                poemCanvas.isHorizontalMode = false
+                poemCanvas.isFreestyleMode = false
+
+                inputFieldCellRef?.visibility = View.VISIBLE
+                inputFieldDividerRef?.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    private fun rebuildHorizontalGrid(isInitialBoot: Boolean = false) {
+        val availW = if (stableMaxWidth > 0) stableMaxWidth
+                     else (mainScrollView.width - gridContainer.paddingLeft - gridContainer.paddingRight).coerceAtLeast(1)
+        if (availW <= 0) return
+
+        val fontPx   = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+        val gapPx    = wordGapDp * resources.displayMetrics.density
+        val charSize = Paint().apply { textSize = fontPx; typeface = selectedTypeface }
+            .measureText("測").roundToInt().coerceAtLeast(1)
+        val cellSize = (charSize + gapPx.roundToInt()).coerceAtLeast(1)
+
+        // numRows = chars per line (horizontal), numColumns = line count (grows vertically)
+        val newNumRows = (availW / cellSize).coerceAtLeast(1)
+
+        if (inputMode != InputMode.SCATTER && (needsReflow || (numRows > 0 && newNumRows != numRows))) {
+            reflowColumnData(newNumRows)
+        }
+        needsReflow = false
+        numRows = newNumRows
+        val availH = if (stableMaxHeight > 0) stableMaxHeight
+                     else (mainScrollView.height - gridContainer.paddingTop - gridContainer.paddingBottom).coerceAtLeast(1)
+        val visibleLines = (availH / cellSize).coerceAtLeast(1)
+        numColumns = maxOf(visibleLines, columnData.size)
+        currentCellSize = cellSize
+
+        poemCanvas.updateData(
+            data = columnData, numRows = numRows, maxColumns = numColumns,
+            fontPx = fontPx, gapPx = gapPx, textColor = gridTextColor, typeface = selectedTypeface
+        )
+
+        placeFrontierMarker()
+
+        if (!isInitialBoot) {
+            val imeVisible = ViewCompat.getRootWindowInsets(rootFrame)
+                ?.isVisible(WindowInsetsCompat.Type.ime()) == true
+            val lastRealIdx = (0 until numColumns * numRows).indexOfLast { i ->
+                val c = i / numRows; val r = i % numRows
+                (columnData.getOrNull(c)?.getOrNull(r) ?: "").isNotEmpty()
+            }
+            val focusIdx = if (lastRealIdx < 0) 0
+                else (lastRealIdx + 1).coerceAtMost(numColumns * numRows - 1)
+            poemCanvas.postDelayed({ focusCell(focusIdx, showKeyboard = imeVisible) }, 50)
+        }
+    }
+
+    private fun updateFreestyleCanvas() {
+        if (!::poemCanvas.isInitialized) return
+        poemCanvas.isFreestyleMode = true
+        val w = mainScrollView.width.takeIf { it > 0 }
+        val h = mainScrollView.height.takeIf { it > 0 }
+        if (w != null) poemCanvas.freestyleMinW = w
+        if (h != null) poemCanvas.freestyleMinH = h
+        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        if (activeBox != null && numRows > 0) {
+            val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+            val gapPx = wordGapDp * resources.displayMetrics.density
+            poemCanvas.updateData(
+                data = columnData, numRows = numRows, maxColumns = numColumns,
+                fontPx = fontPx, gapPx = gapPx, textColor = gridTextColor, typeface = selectedTypeface
+            )
+        }
+        poemCanvas.updateFreestyleBoxes(
+            textBoxes, activeTextBoxId,
+            activeBox?.leftPx ?: 0f, activeBox?.topPx ?: 0f
+        )
+    }
+
+    private fun activateFreestyleBox(box: TextBoxInstance) {
+        deactivateFreestyleBox()
+        activeTextBoxId = box.id
+
+        fontIndex = box.fontIndex.coerceIn(0, fontCatalogue.size - 1)
+        selectedTypeface = fontCatalogue[fontIndex].typeface
+        fontSizeSp = box.fontSizeSp
+        wordGapDp = box.wordGapDp
+        gridTextColor = box.gridTextColor
+        inputMode = box.inputMode
+
+        columnData = box.columnData
+        columnBreaks = box.columnBreaks
+
+        val dp = resources.displayMetrics.density
+        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+        val gapPx = wordGapDp * dp
+        numRows    = if (box.isHorizontal) box.colCount.coerceAtLeast(2) else box.rowCount.coerceAtLeast(2)
+        numColumns = if (box.isHorizontal) box.rowCount.coerceAtLeast(2) else box.colCount.coerceAtLeast(2)
+
+        // updateData() computes cellSizePx internally; read it back instead of allocating a new Paint
+        poemCanvas.updateData(
+            data = columnData, numRows = numRows, maxColumns = numColumns,
+            fontPx = fontPx, gapPx = gapPx, textColor = gridTextColor, typeface = selectedTypeface
+        )
+        currentCellSize = poemCanvas.cellSizePx.coerceAtLeast(1)
+
+        poemCanvas.updateFreestyleBoxes(textBoxes, box.id, box.leftPx, box.topPx)
+
+        placeFrontierMarker()
+        poemCanvas.refreshContent(columnData)
+        fontSpinnerRef?.setSelection(fontIndex)
+        refreshModeChips()
+
+        updateModeChipVisibility()
+        poemCanvas.post { focusCell(0) }
+    }
+
+    private fun deactivateFreestyleBox() {
+        val activeId = activeTextBoxId ?: return
+        val box = textBoxes.find { it.id == activeId } ?: run {
+            activeTextBoxId = null; return
+        }
+        box.fontIndex = fontIndex
+        box.fontSizeSp = fontSizeSp
+        box.wordGapDp = wordGapDp
+        box.gridTextColor = gridTextColor
+        box.inputMode = inputMode
+        activeTextBoxId = null
+        columnData = mutableListOf()
+        columnBreaks = mutableSetOf()
+        poemCanvas.stopCursorBlink()
+        poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
+        updateModeChipVisibility()
+    }
+
+    private fun deleteFreestyleBox(box: TextBoxInstance) {
+        deactivateFreestyleBox()
+        textBoxes.removeAll { it.id == box.id }
+        poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
+        poemCanvas.refreshContent(emptyList())
+        persistCurrentState()
+    }
+
+    private fun toggleFreestyleBoxFlow(box: TextBoxInstance) {
+        box.isHorizontal = !box.isHorizontal
+        activateFreestyleBox(box)
+        persistCurrentState()
+    }
+
+    private fun createFreestyleTextBox(x: Float, y: Float) {
+        val cs = currentCellSize.coerceAtLeast(1)
+        val canvasW = if (poemCanvas.width > 0) poemCanvas.width else mainScrollView.width
+        val canvasH = if (poemCanvas.height > 0) poemCanvas.height
+                      else (mainScrollView.height - gridContainer.paddingTop - gridContainer.paddingBottom).coerceAtLeast(1)
+        val box = TextBoxInstance(
+            leftPx = 0f,
+            topPx  = 0f,
+            colCount = (canvasW / cs).coerceAtLeast(2),
+            rowCount = (canvasH / cs).coerceAtLeast(2),
+            fontIndex = fontIndex,
+            fontSizeSp = fontSizeSp,
+            wordGapDp = wordGapDp,
+            gridTextColor = gridTextColor
+        )
+        for (col in 0 until box.colCount) {
+            box.columnData.add(MutableList(box.rowCount) { "" })
+        }
+        textBoxes.add(box)
+        freestyleCreatingBox = box
+        freestyleCreateOriginX = x
+        freestyleCreateOriginY = y
+        freestyleDragMoved = false
+        poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
+        poemCanvas.requestLayout()
+        // Activation deferred to ACTION_UP so the user can drag to resize first.
+    }
+
+    private fun resizeBoxData(box: TextBoxInstance, newCols: Int, newRows: Int) {
+        while (box.columnData.size > newCols) box.columnData.removeAt(box.columnData.size - 1)
+        while (box.columnData.size < newCols) box.columnData.add(MutableList(newRows) { "" })
+        for (col in box.columnData) {
+            while (col.size > newRows) col.removeAt(col.size - 1)
+            while (col.size < newRows) col.add("")
+        }
+        box.colCount = newCols
+        box.rowCount = newRows
     }
 
     private fun refreshModeChips() {
@@ -2110,6 +2516,62 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     private fun findSequentialTapTarget(tappedIndex: Int): Int =
         GridLogicHelper.findSequentialTapTarget(columnData, columnBreaks, numRows, tappedIndex)
 
+    // ── InsertedImageController.Callbacks ────────────────────────────
+    override fun getInsertImageContainer(): LinearLayout? = insertImageContainer
+    override fun getCurrentSessionId(): String = currentSessionId
+    override fun getInsertedImages(): MutableList<InsertedImageState> = insertedImages
+    override fun getActiveImageIndex(): Int = activeImageIndex
+    override fun setActiveImageIndex(index: Int) { activeImageIndex = index }
+    override fun getBgImageUri(): String? = bgImageUri
+    override fun setBgImageUri(uri: String?) { bgImageUri = uri }
+    override fun getBgImageMatrix(): Matrix = bgImageMatrix
+    override fun getBgImageViews(): MutableList<ImageView> = bgImageViews
+    override fun setBgImageView(view: ImageView?) { bgImageView = view }
+    override fun onImageStateChanged() { pushHistory(); persistCurrentState() }
+    override fun getMaxInsertedImages(): Int = SessionManager.MAX_INSERTED_IMAGES
+
+    // ── SelectionController.Callbacks ────────────────────────────────
+    override fun getPoemCanvas(): PoemCanvasView = poemCanvas
+    override fun getStartHandle(): View? = startHandle
+    override fun getEndHandle(): View? = endHandle
+    override fun getSelectionOptionsView(): LinearLayout? = selectionOptionsView
+    override fun getHandlePasteView(): TextView? = handlePasteView
+    override fun getNumRows(): Int = numRows
+    override fun getMaxColumns(): Int = numColumns
+    override fun getColumnData(): List<List<String>> = columnData
+    override fun getColumnBreaks(): Set<Int> = columnBreaks
+    override fun getFocusedCellIndex(): Int = focusedCellIndex
+    override fun focusCell(index: Int) = focusCell(index, false)
+    override fun reflowAfterCut(from: Int) {
+        reflowColumnData(numRows)
+        postRefreshFocusColumn(from)
+    }
+    override fun hideIme() {
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
+        currentFocus?.clearFocus()
+    }
+
+    // ── KeyboardToolbarController.Callbacks ───────────────────────────
+    override fun getAllToolsPanel(): LinearLayout = allToolsPanel
+    override fun getBottomPanel(): LinearLayout = bottomPanel
+    override fun getGhostInput(): EditText = ghostInput
+    override fun getToolsCell(): LinearLayout? = toolsCell
+    override fun getKeyboardCellRef(): LinearLayout? = keyboardCellRef
+    override fun isToolsVisible(): Boolean = toolsVisible
+    override fun setToolsVisible(value: Boolean) { toolsVisible = value }
+    override fun getLastKeyboardHeight(): Int = lastKeyboardHeight
+    override fun isImeVisible(): Boolean = imeIsVisible
+    override fun getColorRowActive(): Int = getColor(R.color.row_active)
+    override fun getColorTextHint(): Int = getColor(R.color.text_hint)
+    override fun onBeforeSwitchToTools() { selectionCtrl.clearSelection(); currentFocus?.clearFocus() }
+    override fun onAfterSwitchToTools() { refreshInsertedImagePanel() }
+
+    // ── Shared callbacks (getRootFrame / getMainScrollView / getCanvasMode) ───────────
+    override fun getRootFrame(): FrameLayout = rootFrame
+    override fun getMainScrollView(): NestedScrollView = mainScrollView
+    override fun getCanvasMode(): CanvasMode = canvasMode
+
     // ── ViewFactory.Callbacks ──────────────────────────────────────────
     override fun provideFontCatalogue(): List<FontEntry> = fontCatalogue
     override fun getFontIndex(): Int = fontIndex
@@ -2125,12 +2587,29 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         val previous = inputMode
         inputMode = mode
         refreshModeChips()
-        if (mode == InputMode.SEQUENTIAL && previous == InputMode.SCATTER) fillGapsForSequentialMode()
+        if (canvasMode == CanvasMode.FREESTYLE) {
+            textBoxes.find { it.id == activeTextBoxId }?.inputMode = mode
+            if (mode == InputMode.SEQUENTIAL && previous == InputMode.SCATTER) {
+                fillGapsForSequentialMode()
+            }
+            placeFrontierMarker()
+            poemCanvas.refreshContent(columnData)
+        } else if (mode == InputMode.SEQUENTIAL && previous == InputMode.SCATTER) {
+            fillGapsForSequentialMode()
+        }
         persistCurrentState()
     }
 
-    override fun onToolsToggle() { if (toolsVisible) switchToKeyboard() else switchToTools() }
-    override fun onCollapsePanel() { switchToKeyboard() }
+    override fun onToolsToggle() { if (toolsVisible) keyboardToolbarCtrl.collapseToolsPanel() else keyboardToolbarCtrl.switchToTools() }
+    override fun onCollapsePanel() { keyboardToolbarCtrl.collapseToolsPanel() }
+    override fun onKeyboardToggle() {
+        if (imeIsVisible) {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
+        } else {
+            keyboardToolbarCtrl.switchToKeyboard()
+        }
+    }
 
     override fun onPunctInsert(punct: String) { insertPunct(punct) }
 
@@ -2139,6 +2618,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         pushHistory()
         fontIndex = pos
         selectedTypeface = fontCatalogue[pos].typeface
+        if (canvasMode == CanvasMode.FREESTYLE) {
+            val box = textBoxes.find { it.id == activeTextBoxId }
+            if (box != null) { box.fontIndex = pos; activateFreestyleBox(box) }
+            persistCurrentState(); return
+        }
         needsReflow = true; rebuildGrid()
     }
 
@@ -2146,6 +2630,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         if (newSize == fontSizeSp) return
         pushHistory()
         fontSizeSp = newSize
+        if (canvasMode == CanvasMode.FREESTYLE) {
+            val box = textBoxes.find { it.id == activeTextBoxId }
+            if (box != null) { box.fontSizeSp = newSize; activateFreestyleBox(box) }
+            persistCurrentState(); return
+        }
         needsReflow = true; rebuildGrid()
     }
 
@@ -2154,6 +2643,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
         if (gap == wordGapDp) return
         pushHistory()
         wordGapDp = gap
+        if (canvasMode == CanvasMode.FREESTYLE) {
+            val box = textBoxes.find { it.id == activeTextBoxId }
+            if (box != null) { box.wordGapDp = gap; activateFreestyleBox(box) }
+            persistCurrentState(); return
+        }
         needsReflow = true; rebuildGrid()
     }
 
@@ -2167,48 +2661,46 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks {
     override fun onTextColorSelected(color: Int) {
         if (color == gridTextColor) return
         pushHistory()
+        gridTextColor = color
+        if (canvasMode == CanvasMode.FREESTYLE) {
+            val box = textBoxes.find { it.id == activeTextBoxId }
+            if (box != null) { box.gridTextColor = color; activateFreestyleBox(box) }
+            else updateFreestyleCanvas()
+            persistCurrentState(); return
+        }
         applyTextColor(color)
         persistCurrentState()
     }
 
-    override fun onCopySelection() { copySelectedText() }
+    override fun onCopySelection() { selectionCtrl.copySelectedText() }
     override fun onCutSelection() { cutSelectedText() }
     override fun onPasteAtSelection() { pasteText() }
     override fun onSelectEntireLine() { selectEntireLine() }
     override fun onSelectEntireParagraph() { selectEntireParagraph() }
-    override fun onSelectAll() {
-        val nr = numRows.coerceAtLeast(1)
-        var first = -1; var last = -1
-        for (col in 0 until MAX_COLUMNS) {
-            val colData = columnData.getOrNull(col) ?: continue
-            for (row in colData.indices) {
-                if (colData[row].isNotEmpty()) {
-                    val i = col * nr + row
-                    if (first < 0) first = i; last = i
-                }
-            }
-        }
-        if (first >= 0) { selectionStart = first; selectionEnd = last; updateSelectionHighlight() }
-    }
+    override fun onSelectAll() = selectionCtrl.selectAll(numColumns)
 
     override fun onHandlePasteClicked() {
-        val isStart = tappedHandleIsStart ?: return
-        val targetIndex = if (isStart) selectionStart else selectionEnd
+        val isStart = selectionCtrl.tappedHandleIsStart ?: return
+        val targetIndex = if (isStart) selectionCtrl.selectionStart else selectionCtrl.selectionEnd
         pasteTextAt(targetIndex)
-        handlePasteView?.visibility = View.GONE
-        tappedHandleIsStart = null
+        selectionCtrl.hidePasteView()
     }
 
     override fun onShowAllSessions() {
         val intent = Intent(this, SessionListActivity::class.java)
             .putExtra("current_session_id", currentSessionId)
+            .putExtra("current_canvas_mode", canvasMode.name)
         sessionListLauncher.launch(intent)
     }
 
     override fun onUndoAction() { performUndo() }
     override fun onRedoAction() { performRedo() }
     override fun onScreenshot() { takeScreenshot() }
-    override fun onInputFieldEdit() { showInputFieldEditor() }
+    override fun onInputFieldEdit() {
+        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        if (canvasMode == CanvasMode.FREESTYLE && activeBox != null) showFreestyleBoxEditor(activeBox)
+        else showInputFieldEditor()
+    }
     override fun canUndo(): Boolean = editorViewModel.canUndo()
     override fun canRedo(): Boolean = editorViewModel.canRedo()
     override fun getNumColumns(): Int = numColumns

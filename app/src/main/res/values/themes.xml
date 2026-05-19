@@ -1,22 +1,27 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
     <style name="Theme.Poemeditor" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <item name="colorPrimary">@color/white</item>
-        <item name="colorPrimaryVariant">@color/white</item>
-        <item name="colorOnPrimary">@color/black</item>
-        <item name="colorSecondary">@color/white</item>
-        <item name="colorSecondaryVariant">@color/white</item>
-        <item name="colorOnSecondary">@color/black</item>
-        <item name="colorAccent">@color/black</item>
-        <item name="colorControlActivated">@color/black</item>
+        <item name="colorPrimary">@color/text_dark</item>
+        <item name="colorPrimaryVariant">@color/text_dark</item>
+        <item name="colorOnPrimary">@color/surface</item>
+        <item name="colorSecondary">@color/text_dark</item>
+        <item name="colorSecondaryVariant">@color/text_dark</item>
+        <item name="colorOnSecondary">@color/surface</item>
+        <item name="colorAccent">@color/text_dark</item>
+        <item name="colorControlActivated">@color/text_dark</item>
+        <item name="colorSurface">@color/surface</item>
+        <item name="colorOnSurface">@color/text_darkest</item>
         <item name="android:statusBarColor">?android:attr/colorBackground</item>
         <item name="android:windowLightStatusBar" tools:targetApi="23">true</item>
         <item name="alertDialogTheme">@style/ThemeOverlay.App.Dialog</item>
         <item name="android:buttonBarButtonStyle">@style/Widget.App.Button.TextButton</item>
     </style>
     <style name="ThemeOverlay.App.Dialog" parent="ThemeOverlay.MaterialComponents.MaterialAlertDialog">
-        <item name="colorAccent">@color/black</item> <item name="colorPrimary">@color/black</item>
+        <item name="colorAccent">@color/text_dark</item>
+        <item name="colorPrimary">@color/text_dark</item>
+        <item name="colorSurface">@color/surface</item>
+        <item name="colorOnSurface">@color/text_darkest</item>
     </style>
     <style name="Widget.App.Button.TextButton" parent="Widget.MaterialComponents.Button.TextButton">
-        <item name="android:textColor">@color/black</item>
+        <item name="android:textColor">@color/text_dark</item>
     </style>
 </resources>

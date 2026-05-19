@@ -51,51 +51,7 @@ class EditorViewModel(
 
     fun loadSessionJson(id: String): org.json.JSONObject? = sessionRepository.loadSession(id)
 
-    fun saveSession(
-        id: String,
-        name: String,
-        columnData: List<List<String>>,
-        columnBreaks: Set<Int>,
-        fontIndex: Int,
-        fontSizeSp: Float,
-        wordGapDp: Float,
-        gridTextColor: Int,
-        bgColor: Int,
-        bgImageUri: String?,
-        bgImageMatrixValues: FloatArray?,
-        inputMode: String,
-        insertedImages: List<InsertedImageState>,
-        activeImageIndex: Int,
-        gridPadTop: Int = 0, gridPadBottom: Int = 0,
-        gridPadLeft: Int = 0, gridPadRight: Int = 0
-    ) = sessionRepository.saveSession(
-        id, name, columnData, columnBreaks,
-        fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
-        bgImageMatrixValues, inputMode, insertedImages, activeImageIndex,
-        gridPadTop, gridPadBottom, gridPadLeft, gridPadRight
-    )
+    fun saveSession(doc: SessionDocument) = sessionRepository.saveSession(doc)
 
-    fun ensureDefaultSession(
-        id: String,
-        name: String,
-        columnData: List<List<String>>,
-        columnBreaks: Set<Int>,
-        fontIndex: Int,
-        fontSizeSp: Float,
-        wordGapDp: Float,
-        gridTextColor: Int,
-        bgColor: Int,
-        bgImageUri: String?,
-        bgImageMatrixValues: FloatArray?,
-        inputMode: String,
-        insertedImages: List<InsertedImageState>,
-        activeImageIndex: Int,
-        gridPadTop: Int = 0, gridPadBottom: Int = 0,
-        gridPadLeft: Int = 0, gridPadRight: Int = 0
-    ) = sessionRepository.ensureDefaultSession(
-        id, name, columnData, columnBreaks,
-        fontIndex, fontSizeSp, wordGapDp, gridTextColor, bgColor, bgImageUri,
-        bgImageMatrixValues, inputMode, insertedImages, activeImageIndex,
-        gridPadTop, gridPadBottom, gridPadLeft, gridPadRight
-    )
+    fun ensureDefaultSession(doc: SessionDocument) = sessionRepository.ensureDefaultSession(doc)
 }
