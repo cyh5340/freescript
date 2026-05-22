@@ -1,4 +1,4 @@
-package com.poemeditor
+package com.freescript
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -283,14 +283,14 @@ class SelectionController(
 
     fun copySelectedText() {
         val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clip.setPrimaryClip(ClipData.newPlainText("poemeditor", selectedTextToString()))
+        clip.setPrimaryClip(ClipData.newPlainText("freescript", selectedTextToString()))
         Toast.makeText(context, context.getString(R.string.toast_copied), Toast.LENGTH_SHORT).show()
         clearSelection()
     }
 
     fun cutSelectedText() {
         val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clip.setPrimaryClip(ClipData.newPlainText("poemeditor", selectedTextToString()))
+        clip.setPrimaryClip(ClipData.newPlainText("freescript", selectedTextToString()))
         val nr   = cb.getNumRows().coerceAtLeast(1)
         val max  = cb.getMaxColumns()
         val from = minOf(selectionStart, selectionEnd).coerceAtLeast(0)

@@ -107,7 +107,7 @@ All resolved or superseded by Phase 5 completion. See Phase 5 below.
 
 `MainActivity` has grown to ~2,800+ lines. Extract cohesive controllers.
 
-**Controller files created** (in `app/src/main/java/com/poemeditor/`):
+**Controller files created** (in `app/src/main/java/com/freescript/`):
 
 | File | Status | Description |
 |---|---|---|

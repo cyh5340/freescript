@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">poemeditor</string>
+    <string name="app_name">FreeScript</string>
 
     <!-- Tools panel -->
     <string name="label_insert">Insert</string>
@@ -10,7 +10,7 @@
     <string name="label_word_gap">Spacing</string>
     <string name="label_input_mode">Input Mode</string>
     <string name="btn_input_field">Field</string>
-    <string name="mode_scatter">Free</string>
+    <string name="mode_scatter">Scatter</string>
     <string name="mode_sequential">Linear</string>
     <string name="label_file">File</string>
     <string name="btn_all_docs">All Files</string>
@@ -60,6 +60,10 @@
     <!-- Default session name -->
     <string name="default_session_name">Document</string>
 
+    <!-- Canvas hints (shown on empty canvas) -->
+    <string name="hint_start_writing">Type</string>
+    <string name="hint_freestyle">Long press to add a text box</string>
+
     <!-- Entry page -->
     <string name="entry_new_doc">New Document</string>
     <string name="entry_recent_docs">Recent</string>
@@ -70,24 +74,37 @@
     <string name="entry_mode_freestyle">Freestyle</string>
     <string name="entry_mode_freestyle_desc">Free-form drag layout</string>
 
-    <!-- Freestyle interact mode (in tools panel) -->
-    <string name="label_interact_mode">Interact</string>
-    <string name="freestyle_bar_move">Move</string>
-    <string name="freestyle_bar_resize">Resize</string>
+    <!-- Box fill color (FREESTYLE per-textbox background) -->
+    <string name="label_box_fill_color">Fill</string>
+    <string name="box_fill_none">None</string>
+    <string name="apply_all_label">All</string>
+
+    <!-- Box border (FREESTYLE per-textbox border) -->
+    <string name="label_box_border">Border</string>
+    <string name="box_border_show">Show</string>
 
     <!-- Background color labels -->
     <string name="bg_color_white">White</string>
     <string name="bg_color_cream">Cream</string>
+    <string name="bg_color_paper">Paper</string>
+    <string name="bg_color_ivory">Ivory</string>
     <string name="bg_color_antique">Antique</string>
+    <string name="bg_color_blush">Blush</string>
+    <string name="bg_color_mist">Mist</string>
     <string name="bg_color_pink">Pink</string>
     <string name="bg_color_orange">Orange</string>
     <string name="bg_color_green">Green</string>
+    <string name="bg_color_mint">Mint</string>
     <string name="bg_color_blue">Blue</string>
+    <string name="bg_color_cyan">Cyan</string>
     <string name="bg_color_purple">Purple</string>
+    <string name="bg_color_lilac">Lilac</string>
     <string name="bg_color_tea">Tea</string>
     <string name="bg_color_brown">Brown</string>
+    <string name="bg_color_slate">Slate</string>
     <string name="bg_color_night">Night</string>
     <string name="bg_color_dark">Dark</string>
+    <string name="bg_color_system">System</string>
     <string name="bg_color_black">Black</string>
 
     <!-- Text color labels -->
@@ -96,10 +113,18 @@
     <string name="text_color_gray">Gray</string>
     <string name="text_color_white">White</string>
     <string name="text_color_indigo">Indigo</string>
-    <string name="text_color_vermilion">Red</string>
-    <string name="text_color_gold">Gold</string>
-    <string name="text_color_jade">Jade</string>
-    <string name="text_color_purple">Purple</string>
-    <string name="text_color_crimson">Crimson</string>
+    <string name="text_color_navy">Navy</string>
     <string name="text_color_blue">Blue</string>
+    <string name="text_color_teal">Teal</string>
+    <string name="text_color_ocean">Ocean</string>
+    <string name="text_color_forest">Forest</string>
+    <string name="text_color_jade">Jade</string>
+    <string name="text_color_brown">Brown</string>
+    <string name="text_color_coffee">Coffee</string>
+    <string name="text_color_purple">Purple</string>
+    <string name="text_color_wine">Wine</string>
+    <string name="text_color_vermilion">Red</string>
+    <string name="text_color_crimson">Crimson</string>
+    <string name="text_color_gold">Gold</string>
+    <string name="text_color_amber">Amber</string>
 </resources>

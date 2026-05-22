@@ -16,4 +16,5 @@
     <color name="text_lighter">#FF6A6A6A</color>
     <color name="text_hint">#FF555555</color>
     <color name="selection_highlight">#FF2A4A6A</color>
+    <color name="logo_bg">#FF000000</color>
 </resources>

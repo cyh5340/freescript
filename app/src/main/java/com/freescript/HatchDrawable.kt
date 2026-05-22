@@ -1,4 +1,4 @@
-package com.poemeditor
+package com.freescript
 
 import android.graphics.*
 import android.graphics.drawable.Drawable

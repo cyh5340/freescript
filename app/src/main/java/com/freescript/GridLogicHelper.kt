@@ -1,9 +1,11 @@
-package com.poemeditor
+package com.freescript
 
 object GridLogicHelper {
 
     const val FRONTIER_MARKER = "​"   // zero-width space; writing-frontier cell in SEQUENTIAL
     const val LINE_END_MARKER = "↵"   // ↵; paragraph-end marker
+
+    fun isLatinWordChar(c: Char) = c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9'
 
     fun setColumnChar(columnData: MutableList<MutableList<String>>, col: Int, row: Int, ch: String) {
         while (columnData.size <= col) columnData.add(mutableListOf())

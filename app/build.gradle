@@ -6,12 +6,12 @@ plugins {
 }
 
 android {
-    namespace 'com.poemeditor'
+    namespace 'com.freescript'
     compileSdk 33
 
 
     defaultConfig {
-        applicationId "com.poemeditor"
+        applicationId "com.freescript"
         minSdk 24
         targetSdk 33
         versionCode 1

@@ -1,4 +1,4 @@
-package com.poemeditor
+package com.freescript
 
 import android.app.AlertDialog
 import android.content.Intent
@@ -422,7 +422,7 @@ class SessionListActivity : AppCompatActivity() {
                         columnBreaks = emptySet(),
                         fontIndex = 0,
                         fontSizeSp = 24f,
-                        wordGapDp = 3f,
+                        wordGapDp = 0f,
                         gridTextColor = android.graphics.Color.BLACK,
                         bgColor = android.graphics.Color.WHITE,
                         bgImageUri = null,

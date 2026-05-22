@@ -1,4 +1,4 @@
-package com.poemeditor
+package com.freescript
 
 import java.io.File
 
@@ -90,6 +90,10 @@ object SessionManager {
                 put("gridTextColor", box.gridTextColor)
                 put("inputMode", box.inputMode.name)
                 put("isHorizontal", box.isHorizontal)
+                put("boxBgColor", box.boxBgColor)
+                put("borderVisible", box.borderVisible)
+                put("borderColor", box.borderColor)
+                put("borderThicknessIdx", box.borderThicknessIdx)
             }
             arr.put(obj)
         }
@@ -116,11 +120,15 @@ object SessionManager {
                 columnBreaks = colBreaks,
                 fontIndex    = obj.optInt("fontIndex", 0),
                 fontSizeSp   = obj.optDouble("fontSizeSp", 24.0).toFloat(),
-                wordGapDp    = obj.optDouble("wordGapDp", 3.0).toFloat(),
+                wordGapDp    = obj.optDouble("wordGapDp", 0.0).toFloat(),
                 gridTextColor = obj.optInt("gridTextColor", android.graphics.Color.BLACK),
                 inputMode    = try { InputMode.valueOf(obj.optString("inputMode", "SEQUENTIAL")) }
                                catch (_: Exception) { InputMode.SEQUENTIAL },
-                isHorizontal = obj.optBoolean("isHorizontal", false)
+                isHorizontal = obj.optBoolean("isHorizontal", false),
+                boxBgColor   = obj.optInt("boxBgColor", android.graphics.Color.TRANSPARENT),
+                borderVisible = obj.optBoolean("borderVisible", true),
+                borderColor   = obj.optInt("borderColor", android.graphics.Color.parseColor("#CCCCCC")),
+                borderThicknessIdx = obj.optInt("borderThicknessIdx", 1)
             ))
         }
         return result
@@ -195,7 +203,7 @@ object SessionManager {
             columnBreaks  = colBreaks,
             fontIndex     = j.optInt("fontIndex", 0),
             fontSizeSp    = j.optDouble("fontSizeSp", 24.0).toFloat(),
-            wordGapDp     = j.optDouble("wordGapDp",  3.0).toFloat(),
+            wordGapDp     = j.optDouble("wordGapDp",  0.0).toFloat(),
             gridTextColor = j.optInt("gridTextColor", android.graphics.Color.BLACK),
             bgColor       = j.optInt("bgColor",       android.graphics.Color.WHITE),
             bgImageUri    = legacyUri,
@@ -208,7 +216,11 @@ object SessionManager {
             gridPadLeft   = j.optInt("gridPadLeft",   0),
             gridPadRight  = j.optInt("gridPadRight",  0),
             textBoxes     = parseTextBoxes(j.optJSONArray("textBoxes")),
-            horizontalText = legacyHText
+            horizontalText = legacyHText,
+            screenshotCropLeft   = if (j.has("cropL")) j.getInt("cropL") else null,
+            screenshotCropTop    = if (j.has("cropT")) j.getInt("cropT") else null,
+            screenshotCropRight  = if (j.has("cropR")) j.getInt("cropR") else null,
+            screenshotCropBottom = if (j.has("cropB")) j.getInt("cropB") else null
         )
     }
 
@@ -261,6 +273,10 @@ object SessionManager {
             put("canvasMode", doc.canvasMode)
             put("horizontalText", doc.horizontalText)
             put("textBoxes", textBoxesToJson(doc.textBoxes))
+            doc.screenshotCropLeft?.let   { put("cropL", it) }
+            doc.screenshotCropTop?.let    { put("cropT", it) }
+            doc.screenshotCropRight?.let  { put("cropR", it) }
+            doc.screenshotCropBottom?.let { put("cropB", it) }
             // Cache derived counts so listSessions() can read them without re-parsing all content
             put("wordCount",  countWordsInJson(this))
             put("imageCount", normalizedImages.size)

@@ -1,4 +1,4 @@
-package com.poemeditor
+package com.freescript
 
 import android.content.ContentValues
 import android.content.Context
@@ -50,6 +50,10 @@ class ScreenshotController(private val context: Context, private val cb: Callbac
         fun getCurrentCellSize(): Int
         /** Restore selection handles, scroll indicator, tools panel, cursor blink. */
         fun onScreenshotRestored()
+        /** Returns the last confirmed crop rect [l, t, r, b] for this session, or null if none. */
+        fun getScreenshotCrop(): IntArray?
+        /** Persist the confirmed crop rect so it can be restored next time. */
+        fun onScreenshotCropSaved(l: Int, t: Int, r: Int, b: Int)
     }
 
     private val MP = ViewGroup.LayoutParams.MATCH_PARENT
@@ -75,7 +79,18 @@ class ScreenshotController(private val context: Context, private val cb: Callbac
             val initBottom = initTop + gap + cb.getNumRows() * cb.getCurrentCellSize() + gap
 
             val poemCanvas = cb.getPoemCanvas()
-            val cropView = ScreenshotCropView(context, 0, initTop, rootFrame.width, initBottom)
+            val savedCrop = cb.getScreenshotCrop()
+            val cropView = if (savedCrop != null) {
+                // Clamp saved rect to current view bounds so stale coords don't produce an invalid crop
+                val w = rootFrame.width; val h = rootFrame.height
+                val cL = savedCrop[0].coerceIn(0, w - 1)
+                val cT = savedCrop[1].coerceIn(0, h - 1)
+                val cR = savedCrop[2].coerceIn(cL + 40, w)
+                val cB = savedCrop[3].coerceIn(cT + 40, h)
+                ScreenshotCropView(context, cL, cT, cR, cB)
+            } else {
+                ScreenshotCropView(context, 0, initTop, rootFrame.width, initBottom)
+            }
             cropView.layoutParams = FrameLayout.LayoutParams(MP, MP)
 
             // Apply initial state (default: show markers)
@@ -88,20 +103,27 @@ class ScreenshotController(private val context: Context, private val cb: Callbac
             }
 
             cropView.onConfirm = { cropL, cropT, cropW, cropH ->
-                cropView.visibility = View.INVISIBLE
+                // GONE (not INVISIBLE) so the hardware layer is fully removed from the draw tree.
+                // Double-post: first pass processes the GONE layout change, second pass captures
+                // after the draw pipeline has flushed the removal.
+                cropView.visibility = View.GONE
                 rootFrame.post {
-                    val bmp = captureView(rootFrame, cropL, cropT, cropW, cropH)
-                    poemCanvas.hideLineEndMarkers = false
-                    rootFrame.removeView(cropView)
-                    if (bmp != null) {
-                        val indicator = createSavingIndicator()
-                        rootFrame.addView(indicator)
-                        saveToGallery(bmp) {
-                            rootFrame.removeView(indicator)
+                    rootFrame.post {
+                        val bmp = captureView(rootFrame, cropL, cropT, cropW, cropH)
+                        poemCanvas.hideLineEndMarkers = false
+                        rootFrame.removeView(cropView)
+                        if (bmp != null) {
+                            // Save crop only when capture succeeded; no blocking I/O on touch thread
+                            cb.onScreenshotCropSaved(cropL, cropT, cropL + cropW, cropT + cropH)
+                            val indicator = createSavingIndicator()
+                            rootFrame.addView(indicator)
+                            saveToGallery(bmp) {
+                                rootFrame.removeView(indicator)
+                                cb.onScreenshotRestored()
+                            }
+                        } else {
                             cb.onScreenshotRestored()
                         }
-                    } else {
-                        cb.onScreenshotRestored()
                     }
                 }
             }
@@ -138,7 +160,7 @@ class ScreenshotController(private val context: Context, private val cb: Callbac
     private fun saveToGallery(bmp: Bitmap, onComplete: () -> Unit) {
         val main = Handler(Looper.getMainLooper())
         try {
-            val name = "poemeditor_${System.currentTimeMillis()}.png"
+            val name = "freescript_${System.currentTimeMillis()}.png"
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                 val cv = ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, name)

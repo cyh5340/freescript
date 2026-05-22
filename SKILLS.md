@@ -1,4 +1,4 @@
-# PoemEditor Fast Rules
+# freescript Fast Rules
 
 Use this as the short operational checklist. `CLAUDE.md` is the fuller project map.
 

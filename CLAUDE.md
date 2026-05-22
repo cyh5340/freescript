@@ -1,4 +1,4 @@
-# poemeditor
+# freescript
 
 Android app composing text in vertical RTL column order. Characters flow top-to-bottom in a column; columns progress right-to-left. All active UI is programmatic — no XML layout changes for editor behavior.
 
@@ -9,7 +9,7 @@ SDK: compile 33, min 24, Java 8, Kotlin 1.7.20.
 ```
 app/src/main/
 |-- assets/fonts/LXGWWenKai-Regular.ttf
-|-- java/com/poemeditor/
+|-- java/com/freescript/
 |   |-- MainActivity.kt          # activity coordinator: TextWatcher, selection, images, keyboard insets
 |   |-- PoemCanvasView.kt        # canvas renderer: characters, cursor, selection, composing preview
 |   |-- ViewFactory.kt           # programmatic UI factory; Callbacks bridge to MainActivity
@@ -47,6 +47,7 @@ app/src/main/
 - **`ghostInput` is IME-only** — never canonical document state. `PoemCanvasView` is the only visible renderer; never reintroduce per-cell `EditText`.
 - **Markers live in `GridLogicHelper`** — `FRONTIER_MARKER`/`LINE_END_MARKER` are `const val` there. Never redefine in `MainActivity` or `PoemCanvasView`.
 - **Pure data logic belongs in `GridLogicHelper`** — `MainActivity` keeps thin wrappers. Scrolling coordination (`scrollToColumn`, `scrollToTopIfCursorInUpperView`) stays in `MainActivity`.
+- **Caret visibility while typing is viewport-based** — `translateForKeyboard()` must keep the focused caret rectangle visible in `mainScrollView` coordinates (`offsetDescendantRectToMyCoords` + `smoothScrollBy`) and may retry during IME animation. Do not gate this path only on IME visibility booleans.
 - **`hideBottomForOverlay()` must not change `toolsVisible`** — screenshot and input-field editor both rely on the flag for restoration.
 - **`insertCharsAt` trims only trailing blanks** — internal blanks (gap-fill spaces) are preserved in position.
 - **`bgImageViews` order never changes** — z-order via `rootFrame.removeView`/`addView` only; list stays 1-to-1 with `insertedImages`.

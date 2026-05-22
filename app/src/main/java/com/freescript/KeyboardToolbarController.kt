@@ -1,4 +1,4 @@
-package com.poemeditor
+package com.freescript
 
 import android.content.Context
 import android.view.View
@@ -40,6 +40,7 @@ class KeyboardToolbarController(
 
         fun getColorRowActive(): Int
         fun getColorTextHint(): Int
+        fun getToolbarStripHeight(): Int  // toolbar + divider height, excluding punctToolbar
 
         // Side-effects triggered by switching
         fun onBeforeSwitchToTools()     // e.g. clearSelection()
@@ -59,6 +60,7 @@ class KeyboardToolbarController(
                 else (280 * context.resources.displayMetrics.density).roundToInt()
         val lp = cb.getAllToolsPanel().layoutParams as FrameLayout.LayoutParams
         lp.height = h
+        lp.bottomMargin = cb.getToolbarStripHeight()
         cb.getAllToolsPanel().layoutParams = lp
         cb.getAllToolsPanel().visibility = View.VISIBLE
 

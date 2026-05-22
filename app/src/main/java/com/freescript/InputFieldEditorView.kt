@@ -1,4 +1,4 @@
-package com.poemeditor
+package com.freescript
 
 import android.content.Context
 import android.graphics.Canvas

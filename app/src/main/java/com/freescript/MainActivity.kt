@@ -1,4 +1,4 @@
-package com.poemeditor
+package com.freescript
 
 import android.app.AlertDialog
 import android.content.ClipboardManager
@@ -38,7 +38,8 @@ enum class InputMode { SCATTER, SEQUENTIAL }
 private typealias SessionMeta = SessionManager.SessionMeta
 
 class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
-    InsertedImageController.Callbacks, SelectionController.Callbacks, KeyboardToolbarController.Callbacks {
+    InsertedImageController.Callbacks, SelectionController.Callbacks, KeyboardToolbarController.Callbacks,
+    ScrollCoordinator.Callbacks {
 
     // ── Settings ───────────────────────────────────────────────────────
     private var fontSizeSp       = 24f
@@ -47,9 +48,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     // it is never auto-derived from bgColor.
     private var gridTextColor    = Color.BLACK
     private var selectedTypeface = Typeface.DEFAULT
-    private var wordGapDp        = 3f
+    private var wordGapDp        = 0f
     private var inputMode        = InputMode.SEQUENTIAL
     private var canvasMode       = CanvasMode.VERTICAL
+
+    private val latinWordBuffer = LatinWordBuffer()
 
     // ── Widget refs for programmatic sync (session load / new) ─────────
     private var fontSpinnerRef: Spinner? = null
@@ -66,6 +69,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     // ── Freestyle mode state ───────────────────────────────────────────────
     private val textBoxes = mutableListOf<TextBoxInstance>()
     private var activeTextBoxId: String? = null
+    private var globalBoxBgColor: Int = android.graphics.Color.TRANSPARENT
+    private var globalBorderVisible: Boolean = true
+    private var globalBorderColor: Int = android.graphics.Color.parseColor("#CCCCCC")
+    private var globalBorderThicknessIdx: Int = 1
     private var freestyleDragBox: TextBoxInstance? = null
     private var freestyleDragTouchOffX = 0f
     private var freestyleDragTouchOffY = 0f
@@ -96,6 +103,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     // ── Document management ────────────────────────────────────────────
     private var currentSessionId: String = java.util.UUID.randomUUID().toString()
     private var currentSessionName: String = "文檔"
+    private var screenshotCropLeft:   Int? = null
+    private var screenshotCropTop:    Int? = null
+    private var screenshotCropRight:  Int? = null
+    private var screenshotCropBottom: Int? = null
     private var docFileNameRef: TextView? = null
 
     // ── UI refs ────────────────────────────────────────────────────────
@@ -143,8 +154,6 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private var toolsVisible = false     // true when allToolsPanel is showing
     private var imeIsVisible = false     // tracks current IME visibility via insets listener
     private var keyboardCellRef: LinearLayout? = null
-    private val translateHandler by lazy { Handler(Looper.getMainLooper()) }
-    private var translateRunnable: Runnable? = null
     private val historyBurstHandler = Handler(Looper.getMainLooper())
     private var historyBurstReset: Runnable? = null
     private var historyBurstActive = false
@@ -170,6 +179,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private lateinit var imageCtrl: InsertedImageController
     private lateinit var selectionCtrl: SelectionController
     private lateinit var keyboardToolbarCtrl: KeyboardToolbarController
+    private lateinit var scrollCoordinator: ScrollCoordinator
 
     // ── Undo / Redo ────────────────────────────────────────────────────
     private var undoButton: TextView? = null
@@ -230,30 +240,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         }
     }
 
-    private fun scrollToColumn(col: Int) {
-        if (canvasMode == CanvasMode.HORIZONTAL) {
-            // In horizontal mode col = line; scroll mainScrollView vertically to show the line
-            if (currentCellSize <= 0) return
-            val lineTop    = col * currentCellSize
-            val lineBottom = lineTop + currentCellSize
-            val sv = mainScrollView.scrollY; val vp = mainScrollView.height
-            when {
-                lineTop  < sv       -> mainScrollView.smoothScrollTo(0, lineTop)
-                lineBottom > sv + vp -> mainScrollView.smoothScrollTo(0, lineBottom - vp)
-            }
-            return
-        }
-        val s = hScroll ?: return
-        if (currentCellSize <= 0 || s.width <= 0 || numColumns <= 0) return
-        val gw = maxOf(numColumns * currentCellSize, s.width)
-        val physLeft  = gw - (col + 1) * currentCellSize
-        val physRight = gw - col * currentCellSize
-        val sx = s.scrollX; val vp = s.width
-        when {
-            physLeft  < sx       -> s.smoothScrollTo(physLeft, 0)
-            physRight > sx + vp  -> s.smoothScrollTo(physRight - vp, 0)
-        }
-    }
+    private fun scrollToColumn(col: Int) = scrollCoordinator.scrollToColumn(col)
 
     private fun persistCurrentState() {
         saveSession()
@@ -271,6 +258,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         scrollToColumn(nextCol)
         if (nextCol != prevCol) mainScrollView.scrollTo(0, 0)
         placeFrontierMarker()
+        scheduleTranslateForKeyboard()
     }
 
     private fun postRefreshFocusColumn(targetIndex: Int, col: Int = targetIndex / numRows) {
@@ -281,14 +269,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         }
     }
 
-    private fun scrollToTopIfCursorInUpperView(index: Int) {
-        if (!::poemCanvas.isInitialized || !::mainScrollView.isInitialized) return
-        val cellRect = poemCanvas.cellRect(index.coerceAtLeast(0)) ?: return
-        val upperViewLimit = mainScrollView.height * 0.35f
-        if (cellRect.top <= upperViewLimit) {
-            mainScrollView.post { mainScrollView.scrollTo(0, 0) }
-        }
-    }
+    private fun scrollToTopIfCursorInUpperView(index: Int) =
+        scrollCoordinator.scrollToTopIfCursorInUpperView(index)
 
     // Sets focusedCellIndex and draws the cursor at the top of that cell.
     // The cursor bar sits between (index-1) and index; typing inserts AT index.
@@ -309,88 +291,40 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         scheduleTranslateForKeyboard()
     }
 
-    // Debounced entry-point for translateForKeyboard.  Cancels any pending call and
-    // reschedules 100 ms out so rapid focus changes don't pile up and the keyboard
-    // animation has time to finish before we measure rect.bottom.
-    private fun scheduleTranslateForKeyboard() {
-        translateRunnable?.let { translateHandler.removeCallbacks(it) }
-        translateRunnable = Runnable { translateForKeyboard() }
-            .also { translateHandler.postDelayed(it, 100) }
-    }
+    // Debounced entry-point for translateForKeyboard. Cancels pending calls so
+    // rapid caret moves don't pile up scroll work.
+    private fun scheduleTranslateForKeyboard() = scrollCoordinator.scheduleTranslateForKeyboard()
 
-    // Scrolls mainScrollView so the focused cell clears the keyboard.
-    // Mechanism: paddingBottom = kbdHeight creates extra scroll room at the bottom
-    // (clipToPadding=false makes it reachable), then smoothScrollBy brings the cell
-    // into view.  No translationY — the window size stays constant (adjustNothing).
-    private fun translateForKeyboard() {
-        val rect = Rect()
-        window.decorView.getWindowVisibleDisplayFrame(rect)
-        val screenHeight = resources.displayMetrics.heightPixels
-        val kbdHeight = screenHeight - rect.bottom
-
-        if (kbdHeight <= 0) {
-            mainScrollView.setPadding(0, 0, 0, 0)
-            return
-        }
-
-        mainScrollView.setPadding(0, 0, 0, kbdHeight)
-
-        val cellRect = poemCanvas.cellRect(focusedCellIndex.coerceAtLeast(0)) ?: return
-        val canvasLoc = IntArray(2); poemCanvas.getLocationOnScreen(canvasLoc)
-        val cellBottom = canvasLoc[1] + cellRect.bottom
-        if (cellBottom > rect.bottom) {
-            val delta = cellBottom - rect.bottom + rect.height() * 0.3f
-            mainScrollView.smoothScrollBy(0, delta.toInt())
-        }
-    }
+    // Scrolls mainScrollView so the focused cell stays visible in the current viewport.
+    // Retries for a few frames because viewport/scroll range can keep changing during keyboard animation.
+    private fun translateForKeyboard(retry: Int = 0) = scrollCoordinator.translateForKeyboard(retry)
 
     private val MP get() = ViewGroup.LayoutParams.MATCH_PARENT
     private val WC get() = ViewGroup.LayoutParams.WRAP_CONTENT
 
     // ── Font catalogue ─────────────────────────────────────────────────
     private fun loadFont(
-        assetNames:   List<String> = emptyList(),
-        systemPaths:  List<String> = emptyList(),
+        assetNames: List<String> = emptyList(),
         fallbackFamily: String,
-        fallbackStyle:  Int = Typeface.NORMAL
+        fallbackStyle: Int = Typeface.NORMAL
     ): Typeface {
         for (name in assetNames) {
             try { return Typeface.createFromAsset(assets, "fonts/$name") } catch (_: Exception) {}
-        }
-        for (path in systemPaths) {
-            try {
-                val f = java.io.File(path)
-                if (f.exists() && f.canRead()) return Typeface.createFromFile(f)
-            } catch (_: Exception) {}
         }
         return Typeface.create(fallbackFamily, fallbackStyle)
     }
 
     private val fontCatalogue: List<FontEntry> by lazy {
-        listOf(
-            FontEntry("黑體", Typeface.create("sans-serif", Typeface.NORMAL)),
-            FontEntry("宋體", Typeface.create("serif",      Typeface.NORMAL)),
-            FontEntry("霞鶩文楷", loadFont(
-                assetNames  = listOf("LXGWWenKai-Regular.ttf"),
-                systemPaths = listOf(
-                    "/system/fonts/DroidSansKaiTi.ttf",
-                    "/system/fonts/FZKTJW.TTF",
-                    "/system/fonts/Kai.ttf",
-                ),
-                fallbackFamily = "serif", fallbackStyle = Typeface.NORMAL
-            )),
-            FontEntry("仿宋", loadFont(
-                assetNames  = listOf("LXGWWenKai-Light.ttf", "ZCOOLXiaoWei-Regular.ttf"),
-                systemPaths = listOf(
-                    "/system/fonts/DroidSansFangSong.ttf",
-                    "/system/fonts/FZFSJW.TTF",
-                    "/system/fonts/FangSong.ttf",
-                ),
-                fallbackFamily = "serif", fallbackStyle = Typeface.ITALIC
-            )),
-            FontEntry("粗黑", Typeface.create("sans-serif", Typeface.BOLD)),
-            FontEntry("等寬", Typeface.create("monospace",  Typeface.NORMAL)),
-        )
+        AppConfig.FONT_OPTIONS.map { option ->
+            FontEntry(
+                option.label,
+                loadFont(
+                    assetNames = option.assetNames,
+                    fallbackFamily = option.fallbackFamily,
+                    fallbackStyle = option.fallbackStyle
+                )
+            )
+        }
     }
     private var fontIndex = 0
 
@@ -555,9 +489,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         }
 
         // Main vertical layout: mainScrollView fills remaining space above bottomPanel.
-        // adjustNothing keeps window size stable when keyboard opens.
-        // translateForKeyboard() adds paddingBottom to mainScrollView equal to keyboard
-        // height, then smoothScrollBy to bring the focused cell above the keyboard.
+        // Keyboard visibility is handled by insets + viewport-aware caret scrolling.
         mainLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = FrameLayout.LayoutParams(MP, MP)
@@ -634,6 +566,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         imageCtrl            = InsertedImageController(this, this)
         selectionCtrl        = SelectionController(this, this)
         keyboardToolbarCtrl  = KeyboardToolbarController(this, this)
+        scrollCoordinator    = ScrollCoordinator(resources, this)
         updateToolbarSessionName()
         mainLayout.addView(viewFactory.buildScrollIndicator(dp))
         mainLayout.addView(mainScrollView)
@@ -662,7 +595,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 // Keyboard opened — dismiss tools panel and selection if active.
                 if (toolsVisible) keyboardToolbarCtrl.collapseToolsPanel()
                 selectionCtrl.clearSelection()
-                scheduleTranslateForKeyboard()
+                // Add IME-height bottom padding so NestedScrollView has scroll range to lift cursor above keyboard.
+                mainScrollView.setPadding(0, 0, 0, imeHeight.coerceAtLeast(lastKeyboardHeight))
+                // Re-run translate after padding is applied in layout.
+                mainScrollView.post { scheduleTranslateForKeyboard() }
             } else if (!toolsVisible) {
                 // Keyboard closed and tools not shown — clear scroll padding.
                 mainScrollView.setPadding(0, 0, 0, 0)
@@ -694,6 +630,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                     currentSessionName = SessionManager.nextNewSessionName(
                         filesDir, getString(R.string.default_session_name))
                     canvasMode = newMode
+                    resetSessionToDefaults()
                     updateToolbarSessionName()
                     editorViewModel.clearHistory()
                 }
@@ -783,6 +720,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private fun applyBackground(color: Int) {
         bgColor = color
         rootFrame.setBackgroundColor(color)
+        viewFactory.syncColorSelectionUI()
         persistCurrentState()
     }
 
@@ -792,6 +730,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private fun applyTextColor(color: Int) {
         gridTextColor = color
         if (::poemCanvas.isInitialized) poemCanvas.updateTextColor(color)
+        viewFactory.syncColorSelectionUI()
     }
 
     // ── Tools panel toggle ────────────────────────────────────────────
@@ -930,12 +869,21 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         val iCol = focusedCellIndex / nr
         val iRow = focusedCellIndex % nr
         val nextCol = (iCol + 1).coerceAtMost(MAX_COLUMNS - 1)
-        if (inputMode == InputMode.SCATTER) {
+
+        if (inputMode == InputMode.SCATTER && canvasMode != CanvasMode.HORIZONTAL) {
+            // VERTICAL SCATTER: split column at cursor row; move tail to same row in next column.
+            while (columnData.size <= iCol) columnData.add(mutableListOf())
+            val colData = columnData[iCol]
+            val tail = (iRow until colData.size).map { colData[it] }.toMutableList()
+            while (colData.size > iRow) colData.removeAt(colData.size - 1)
             setColumnChar(iCol, iRow, LINE_END_MARKER)
             while (columnData.size <= nextCol) columnData.add(mutableListOf())
             columnBreaks.add(nextCol)
+            tail.forEachIndexed { i, ch -> setColumnChar(nextCol, iRow + i, ch) }
+            postRefreshFocusColumn(nextCol * numRows + iRow, nextCol)
         } else {
-            // Extract content from cursor row onwards (the tail that moves to the new column).
+            // SEQUENTIAL (any canvas), or HORIZONTAL+SCATTER:
+            // extract tail from cursor onwards and insert as the next column/line.
             val colData = columnData.getOrNull(iCol)
             val tail = mutableListOf<String>()
             if (colData != null) {
@@ -943,9 +891,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 while (tail.isNotEmpty() && (tail.last().isBlank() || tail.last() == LINE_END_MARKER)) tail.removeLast()
                 while (colData.size > iRow) colData.removeAt(colData.size - 1)
             }
-            // Place ↵ at the split point in the current column.
-            setColumnChar(iCol, iRow, LINE_END_MARKER)
-            // Structural insert: push all columns at/beyond nextCol one slot right.
+            // LINE_END_MARKER renders as a visible glyph in HORIZONTAL mode, so skip it there.
+            if (canvasMode != CanvasMode.HORIZONTAL) setColumnChar(iCol, iRow, LINE_END_MARKER)
             while (columnData.size < nextCol) columnData.add(mutableListOf())
             columnData.add(nextCol, tail)
             val shifted = columnBreaks.mapTo(mutableSetOf()) { if (it >= nextCol) it + 1 else it }
@@ -953,8 +900,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             columnBreaks.clear(); columnBreaks.addAll(shifted)
             while (columnData.size > MAX_COLUMNS) columnData.removeAt(columnData.size - 1)
             columnBreaks.removeAll { it >= MAX_COLUMNS }
+            postRefreshFocusColumn(nextCol * numRows, nextCol)
         }
-        postRefreshFocusColumn(nextCol * numRows, nextCol)
     }
 
     // Backspace on ↵ / at row 0 of a paragraph column: reverse the break.
@@ -1132,6 +1079,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     }
 
     // ── Persistence ────────────────────────────────────────────────────
+    override fun onPause() {
+        super.onPause()
+        persistCurrentState()
+    }
+
     override fun onStop() {
         super.onStop()
         persistCurrentState()
@@ -1181,6 +1133,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             if (!tbStr.isNullOrEmpty()) {
                 val loaded = SessionManager.parseTextBoxes(org.json.JSONArray(tbStr))
                 textBoxes.clear(); textBoxes.addAll(loaded)
+                textBoxes.forEach { it.typeface = fontCatalogue[it.fontIndex.coerceIn(0, fontCatalogue.size - 1)].typeface }
             }
         } catch (_: Exception) {}
     }
@@ -1280,6 +1233,62 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 val cellRow = index % nr
                 val originalChar = columnData.getOrNull(cellCol)?.getOrNull(cellRow) ?: ""
 
+                // ── HORIZONTAL mode: buffer Latin chars into whole words ───────
+                if (canvasMode == CanvasMode.HORIZONTAL && !text.contains('\n')) {
+                    latinWordBuffer.resetIfCellChanged(index)
+                    val cellFree = latinWordBuffer.isActive ||
+                                   originalChar.isBlank() || originalChar == FRONTIER_MARKER
+                    when {
+                        raw.isEmpty() && latinWordBuffer.isActive -> {
+                            val remaining = latinWordBuffer.backspace()
+                            resetGhostSentinel()
+                            setColumnChar(cellCol, cellRow, remaining ?: "")
+                            poemCanvas.refreshContent(columnData)
+                            return
+                        }
+                        text == " " -> {
+                            latinWordBuffer.clear()
+                            maybePushHistoryForTyping()
+                            resetGhostSentinel()
+                            advanceToNextCell(index, totalCells)
+                            return
+                        }
+                        text.length > 1 && text.all { GridLogicHelper.isLatinWordChar(it) } && cellFree -> {
+                            latinWordBuffer.clear()
+                            maybePushHistoryForTyping()
+                            setColumnChar(cellCol, cellRow, text)
+                            poemCanvas.refreshContent(columnData)
+                            resetGhostSentinel()
+                            advanceToNextCell(index, totalCells)
+                            return
+                        }
+                        text.length == 1 && GridLogicHelper.isLatinWordChar(text[0]) && cellFree -> {
+                            val word = latinWordBuffer.append(text[0], index)
+                            maybePushHistoryForTyping()
+                            setColumnChar(cellCol, cellRow, word)
+                            poemCanvas.refreshContent(columnData)
+                            resetGhostSentinel()
+                            return
+                        }
+                        latinWordBuffer.isActive -> {
+                            // Non-Latin after buffering: word done, write new char to next cell
+                            latinWordBuffer.clear()
+                            val nextIdx = (index + 1).coerceAtMost(totalCells - 1)
+                            val nCol = nextIdx / nr; val nRow = nextIdx % nr
+                            maybePushHistoryForTyping()
+                            setColumnChar(nCol, nRow, text)
+                            poemCanvas.refreshContent(columnData)
+                            resetGhostSentinel()
+                            val finalIdx = (nextIdx + 1).coerceAtMost(totalCells - 1)
+                            focusedCellIndex = finalIdx
+                            poemCanvas.setCursor(focusedCellIndex)
+                            scrollToColumn(finalIdx / nr)
+                            return
+                        }
+                    }
+                }
+                // ── end HORIZONTAL Latin buffering ────────────────────────────
+
                 if (raw.isEmpty()) {
                     // Sentinel deleted → backspace
                     pushHistoryBreakingBurst()
@@ -1299,6 +1308,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                             poemCanvas.setCursor(focusedCellIndex)
                             scrollToTopIfCursorInUpperView(focusedCellIndex)
                             scrollToColumn((index - 1) / nr)
+                            scheduleTranslateForKeyboard()
                         }
                     }
                     return
@@ -1337,7 +1347,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                     var lastWrittenIdx = (pCol * nr + pRow).coerceAtMost(totalCells - 1)
                     if (charIdx < text.length) {
                         val maxCol = if (inputMode == InputMode.SCATTER && nr > 0)
-                            (columnData.size - 1).coerceAtLeast(0)
+                            numColumns - 1
                         else MAX_COLUMNS - 1
                         lastWrittenIdx = pCol * nr + pRow
                         setColumnChar(pCol, pRow, text[charIdx].toString())
@@ -1422,7 +1432,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                     if (inputMode == InputMode.SEQUENTIAL && cellChar.isEmpty()) {
                         val target = findSequentialTapTarget(index)
                         if (target >= 0 && target != index) {
-                            focusCell(target)
+                            focusCell(target, showKeyboard = true)
                             scrollToColumn(target / nr)
                             return@setOnTouchListener true
                         }
@@ -1430,10 +1440,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                     if (cellChar.isNotBlank() && cellChar != FRONTIER_MARKER && cellChar != LINE_END_MARKER) {
                         val cs = currentCellSize.coerceAtLeast(1)
                         val cellTopY = (index % nr) * cs
-                        if (event.y < cellTopY + cs / 2f) focusCell(index)
-                        else focusCell((index + 1).coerceAtMost(MAX_COLUMNS * numRows - 1))
+                        if (event.y < cellTopY + cs / 2f) focusCell(index, showKeyboard = true)
+                        else focusCell((index + 1).coerceAtMost(MAX_COLUMNS * numRows - 1), showKeyboard = true)
                     } else {
-                        focusCell(index)
+                        focusCell(index, showKeyboard = true)
                     }
                 }
             }
@@ -1452,14 +1462,14 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
 
                 val activeBox = textBoxes.find { it.id == activeTextBoxId }
                 if (activeBox != null) {
+                    val cancelEvent = MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL }
                     when (poemCanvas.freestyleCornerActionAtTouch(x, y)) {
                         FreestyleCornerAction.MOVE -> {
                             freestyleDragBox = activeBox
                             freestyleDragTouchOffX = x - activeBox.leftPx
                             freestyleDragTouchOffY = y - activeBox.topPx
                             poemCanvas.parent?.requestDisallowInterceptTouchEvent(true)
-                            freestyleLongPressDetector.onTouchEvent(
-                                MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL })
+                            freestyleLongPressDetector.onTouchEvent(cancelEvent)
                         }
                         FreestyleCornerAction.RESIZE -> {
                             freestyleResizingBox = activeBox
@@ -1468,10 +1478,13 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                             freestyleResizeOrigCols = activeBox.colCount
                             freestyleResizeOrigRows = activeBox.rowCount
                             poemCanvas.parent?.requestDisallowInterceptTouchEvent(true)
-                            freestyleLongPressDetector.onTouchEvent(
-                                MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL })
+                            freestyleLongPressDetector.onTouchEvent(cancelEvent)
                         }
-                        else -> {}
+                        else -> {
+                            // DELETE and TOGGLE_FLOW corners sit outside the box; cancel the
+                            // long-press detector so holding them doesn't spawn a new textbox.
+                            freestyleLongPressDetector.onTouchEvent(cancelEvent)
+                        }
                     }
                 }
             }
@@ -1542,7 +1555,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                         poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
                         poemCanvas.requestLayout()
                     } else {
-                        activateFreestyleBox(creatingBox)
+                        activateFreestyleBox(creatingBox, showKeyboard = true)
                         persistCurrentState()
                     }
                     return
@@ -1584,7 +1597,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 // Tap resolution
                 val hitBox = poemCanvas.freestyleBoxAtTouch(x, y)
                 when {
-                    hitBox != null && hitBox.id != activeTextBoxId -> activateFreestyleBox(hitBox)
+                    hitBox != null && hitBox.id != activeTextBoxId -> activateFreestyleBox(hitBox, showKeyboard = true)
                     hitBox != null -> {
                         when (poemCanvas.freestyleCornerActionAtTouch(x, y)) {
                             FreestyleCornerAction.RESIZE      -> showFreestyleBoxEditor(hitBox)
@@ -1600,25 +1613,28 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                                         if (cellChar.isEmpty()) {
                                             val target = findSequentialTapTarget(cellIdx)
                                             if (target >= 0 && target != cellIdx) {
-                                                focusCell(target)
+                                                focusCell(target, showKeyboard = true)
                                                 return
                                             }
                                         }
                                     }
-                                    focusCell(cellIdx)
+                                    focusCell(cellIdx, showKeyboard = true)
                                 }
                             }
                         }
                     }
                     activeTextBoxId != null -> {
-                        // hitBox was null — touch may be in a corner that extends past the box boundary
+                        // hitBox was null — touch is outside all boxes (including outside-box corners).
+                        // RESIZE is intentionally excluded: a tap on ◢ is only valid when ACTION_DOWN
+                        // already confirmed the corner (handled by the freestyleResizingBox path above).
+                        // A finger that drifted onto the RESIZE area by UP without confirming DOWN there
+                        // should deactivate the box, not open the editor.
                         val activeBox = textBoxes.find { it.id == activeTextBoxId }
                         when (poemCanvas.freestyleCornerActionAtTouch(x, y)) {
-                            FreestyleCornerAction.RESIZE      -> if (activeBox != null) showFreestyleBoxEditor(activeBox)
                             FreestyleCornerAction.DELETE      -> if (activeBox != null) deleteFreestyleBox(activeBox)
                             FreestyleCornerAction.TOGGLE_FLOW -> if (activeBox != null) toggleFreestyleBoxFlow(activeBox)
                             FreestyleCornerAction.MOVE        -> { /* no-op */ }
-                            null -> { deactivateFreestyleBox(); poemCanvas.refreshContent(emptyList()) }
+                            else -> { deactivateFreestyleBox(); poemCanvas.refreshContent(emptyList()) }
                         }
                     }
                 }
@@ -1637,7 +1653,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         gridPaddingBottomPx = prefs.getInt("grid_pad_bottom", 0)
         gridPaddingLeftPx   = prefs.getInt("grid_pad_left",   0)
         gridPaddingRightPx  = prefs.getInt("grid_pad_right",  0)
-        wordGapDp   = prefs.getFloat("word_gap_dp", 3f)
+        wordGapDp   = prefs.getFloat("word_gap_dp", 0f)
         gridTextColor = prefs.getInt("text_color", Color.BLACK)
         bgColor     = prefs.getInt("bg_color", Color.WHITE)
         bgImageUri  = prefs.getString("bg_image_uri", null)
@@ -1721,6 +1737,19 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 if (toolsVisible) allToolsPanel.visibility = View.VISIBLE
                 viewFactory.updateScrollIndicator()
                 if (selectionCtrl.isSelecting) selectionCtrl.updateSelectionHighlight()
+            }
+            override fun getScreenshotCrop(): IntArray? {
+                val l = screenshotCropLeft ?: return null
+                val t = screenshotCropTop  ?: return null
+                val r = screenshotCropRight  ?: return null
+                val b = screenshotCropBottom ?: return null
+                return intArrayOf(l, t, r, b)
+            }
+            override fun onScreenshotCropSaved(l: Int, t: Int, r: Int, b: Int) {
+                screenshotCropLeft = l; screenshotCropTop    = t
+                screenshotCropRight = r; screenshotCropBottom = b
+                // No persistCurrentState() here — file I/O on the touch thread blocks the UI.
+                // Persisted naturally by onStop or the next user action that saves state.
             }
         })
     }
@@ -2014,7 +2043,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 columnBreaks = box.columnBreaks.toMutableSet(),
                 fontIndex = box.fontIndex, fontSizeSp = box.fontSizeSp,
                 wordGapDp = box.wordGapDp, gridTextColor = box.gridTextColor,
-                inputMode = box.inputMode, isHorizontal = box.isHorizontal
+                inputMode = box.inputMode, isHorizontal = box.isHorizontal,
+                boxBgColor = box.boxBgColor, borderVisible = box.borderVisible,
+                borderColor = box.borderColor, borderThicknessIdx = box.borderThicknessIdx
             )
         }
         return EditorHistoryState(
@@ -2103,13 +2134,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 columnBreaks = box.columnBreaks.toMutableSet(),
                 fontIndex = box.fontIndex, fontSizeSp = box.fontSizeSp,
                 wordGapDp = box.wordGapDp, gridTextColor = box.gridTextColor,
-                inputMode = box.inputMode, isHorizontal = box.isHorizontal
-            ))
+                inputMode = box.inputMode, isHorizontal = box.isHorizontal,
+                boxBgColor = box.boxBgColor, borderVisible = box.borderVisible,
+                borderColor = box.borderColor, borderThicknessIdx = box.borderThicknessIdx
+            ).also { it.typeface = fontCatalogue[box.fontIndex.coerceIn(0, fontCatalogue.size - 1)].typeface })
         }
         if (canvasMode == CanvasMode.FREESTYLE) {
             activeTextBoxId = null
             columnData = mutableListOf()
             columnBreaks = mutableSetOf()
+            viewFactory.boxFillColorRow?.visibility = View.VISIBLE
             updateFreestyleCanvas()
         }
 
@@ -2192,7 +2226,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             insertedImages = copyInsertedImagesState(), activeImageIndex = activeImageIndex,
             gridPadTop = gridPaddingTopPx, gridPadBottom = gridPaddingBottomPx,
             gridPadLeft = gridPaddingLeftPx, gridPadRight = gridPaddingRightPx,
-            textBoxes = textBoxes.toList()
+            textBoxes = textBoxes.toList(),
+            screenshotCropLeft   = screenshotCropLeft,
+            screenshotCropTop    = screenshotCropTop,
+            screenshotCropRight  = screenshotCropRight,
+            screenshotCropBottom = screenshotCropBottom
         ))
     }
 
@@ -2208,9 +2246,15 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         gridPaddingLeftPx   = doc.gridPadLeft
         gridPaddingRightPx  = doc.gridPadRight
         gridContainer.setPadding(gridPaddingLeftPx, gridPaddingTopPx, gridPaddingRightPx, gridPaddingBottomPx)
+        screenshotCropLeft   = doc.screenshotCropLeft
+        screenshotCropTop    = doc.screenshotCropTop
+        screenshotCropRight  = doc.screenshotCropRight
+        screenshotCropBottom = doc.screenshotCropBottom
         textBoxes.clear()
         textBoxes.addAll(doc.textBoxes)
+        textBoxes.forEach { it.typeface = fontCatalogue[it.fontIndex.coerceIn(0, fontCatalogue.size - 1)].typeface }
         activeTextBoxId = null
+        viewFactory.boxFillColorRow?.visibility = if (canvasMode == CanvasMode.FREESTYLE) View.VISIBLE else View.GONE
         val mode = try { InputMode.valueOf(doc.inputMode) } catch (_: Exception) { InputMode.SEQUENTIAL }
         applySettings(
             fontIdx            = doc.fontIndex,
@@ -2260,6 +2304,26 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         }
     }
 
+    private fun resetSessionToDefaults() {
+        bgImageUri = null
+        applySettings(
+            fontIdx   = AppConfig.DEFAULT_FONT_INDEX,
+            sizeSp    = AppConfig.DEFAULT_FONT_SIZE_SP,
+            gapDp     = AppConfig.DEFAULT_WORD_GAP_DP,
+            textColor = AppConfig.DEFAULT_TEXT_COLOR,
+            bgCol     = AppConfig.DEFAULT_BG_COLOR,
+            imgUri    = null,
+            images    = emptyList(),
+            selectedImageIndex = -1
+        )
+        gridPaddingTopPx = 0; gridPaddingBottomPx = 0
+        gridPaddingLeftPx = 0; gridPaddingRightPx = 0
+        globalBoxBgColor         = AppConfig.DEFAULT_BOX_BG_COLOR
+        globalBorderVisible      = AppConfig.DEFAULT_BORDER_VISIBLE
+        globalBorderColor        = AppConfig.DEFAULT_BORDER_COLOR
+        globalBorderThicknessIdx = AppConfig.DEFAULT_BORDER_IDX
+    }
+
     private fun ensureDefaultSession() {
         editorViewModel.ensureDefaultSession(SessionDocument(
             id = currentSessionId, name = currentSessionName,
@@ -2278,7 +2342,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private fun updateModeChipVisibility() {
         val showInput = canvasMode == CanvasMode.VERTICAL ||
                         canvasMode == CanvasMode.HORIZONTAL ||
-                        (canvasMode == CanvasMode.FREESTYLE && activeTextBoxId != null)
+                        (canvasMode == CanvasMode.FREESTYLE &&
+                            (activeTextBoxId != null || viewFactory.isFreestyleApplyAllActive()))
         modeInputSectionRef?.visibility = if (showInput) View.VISIBLE else View.GONE
     }
 
@@ -2292,6 +2357,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
 
                 inputFieldCellRef?.visibility = View.VISIBLE
                 inputFieldDividerRef?.visibility = View.VISIBLE
+                viewFactory.fontApplyAllCheckbox?.visibility = View.GONE
+                viewFactory.textColorApplyAllCheckbox?.visibility = View.GONE
+                viewFactory.boxFillColorRow?.visibility = View.GONE
             }
             CanvasMode.FREESTYLE -> {
                 hScroll?.visibility = View.VISIBLE
@@ -2305,6 +2373,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 gridPaddingTopPx = 0; gridPaddingBottomPx = 0
                 gridPaddingLeftPx = 0; gridPaddingRightPx = 0
                 gridContainer.setPadding(0, 0, 0, 0)
+                viewFactory.fontApplyAllCheckbox?.visibility = View.VISIBLE
+                viewFactory.textColorApplyAllCheckbox?.visibility = View.VISIBLE
+                viewFactory.boxFillColorRow?.visibility = View.VISIBLE
             }
             else -> {
                 hScroll?.visibility = View.VISIBLE
@@ -2314,6 +2385,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
 
                 inputFieldCellRef?.visibility = View.VISIBLE
                 inputFieldDividerRef?.visibility = View.VISIBLE
+                viewFactory.fontApplyAllCheckbox?.visibility = View.GONE
+                viewFactory.textColorApplyAllCheckbox?.visibility = View.GONE
+                viewFactory.boxFillColorRow?.visibility = View.GONE
             }
         }
     }
@@ -2371,11 +2445,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         if (w != null) poemCanvas.freestyleMinW = w
         if (h != null) poemCanvas.freestyleMinH = h
         val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
+        val gapPx = wordGapDp * resources.displayMetrics.density
         if (activeBox != null && numRows > 0) {
-            val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
-            val gapPx = wordGapDp * resources.displayMetrics.density
             poemCanvas.updateData(
                 data = columnData, numRows = numRows, maxColumns = numColumns,
+                fontPx = fontPx, gapPx = gapPx, textColor = gridTextColor, typeface = selectedTypeface
+            )
+        } else {
+            poemCanvas.updateData(
+                data = emptyList(), numRows = 10, maxColumns = 20,
                 fontPx = fontPx, gapPx = gapPx, textColor = gridTextColor, typeface = selectedTypeface
             )
         }
@@ -2385,12 +2464,13 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         )
     }
 
-    private fun activateFreestyleBox(box: TextBoxInstance) {
+    private fun activateFreestyleBox(box: TextBoxInstance, showKeyboard: Boolean = false) {
         deactivateFreestyleBox()
         activeTextBoxId = box.id
 
         fontIndex = box.fontIndex.coerceIn(0, fontCatalogue.size - 1)
         selectedTypeface = fontCatalogue[fontIndex].typeface
+        box.typeface = selectedTypeface
         fontSizeSp = box.fontSizeSp
         wordGapDp = box.wordGapDp
         gridTextColor = box.gridTextColor
@@ -2420,7 +2500,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         refreshModeChips()
 
         updateModeChipVisibility()
-        poemCanvas.post { focusCell(0) }
+        viewFactory.syncBoxBorderUI(box)
+        poemCanvas.post { focusCell(0, showKeyboard = showKeyboard) }
     }
 
     private fun deactivateFreestyleBox() {
@@ -2439,6 +2520,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         poemCanvas.stopCursorBlink()
         poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
         updateModeChipVisibility()
+        viewFactory.syncBoxBorderUI(null)
     }
 
     private fun deleteFreestyleBox(box: TextBoxInstance) {
@@ -2456,20 +2538,20 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     }
 
     private fun createFreestyleTextBox(x: Float, y: Float) {
-        val cs = currentCellSize.coerceAtLeast(1)
-        val canvasW = if (poemCanvas.width > 0) poemCanvas.width else mainScrollView.width
-        val canvasH = if (poemCanvas.height > 0) poemCanvas.height
-                      else (mainScrollView.height - gridContainer.paddingTop - gridContainer.paddingBottom).coerceAtLeast(1)
         val box = TextBoxInstance(
-            leftPx = 0f,
-            topPx  = 0f,
-            colCount = (canvasW / cs).coerceAtLeast(2),
-            rowCount = (canvasH / cs).coerceAtLeast(2),
+            leftPx = x,
+            topPx  = y,
+            colCount = 2,
+            rowCount = 2,
             fontIndex = fontIndex,
             fontSizeSp = fontSizeSp,
             wordGapDp = wordGapDp,
-            gridTextColor = gridTextColor
-        )
+            gridTextColor = gridTextColor,
+            boxBgColor = globalBoxBgColor,
+            borderVisible = globalBorderVisible,
+            borderColor = globalBorderColor,
+            borderThicknessIdx = globalBorderThicknessIdx
+        ).also { it.typeface = selectedTypeface }
         for (col in 0 until box.colCount) {
             box.columnData.add(MutableList(box.rowCount) { "" })
         }
@@ -2564,6 +2646,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     override fun isImeVisible(): Boolean = imeIsVisible
     override fun getColorRowActive(): Int = getColor(R.color.row_active)
     override fun getColorTextHint(): Int = getColor(R.color.text_hint)
+    override fun getToolbarStripHeight(): Int =
+        bottomPanel.height - if (punctToolbar.visibility == android.view.View.VISIBLE) punctToolbar.height else 0
     override fun onBeforeSwitchToTools() { selectionCtrl.clearSelection(); currentFocus?.clearFocus() }
     override fun onAfterSwitchToTools() { refreshInsertedImagePanel() }
 
@@ -2580,6 +2664,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     override fun getSelectedTypeface(): Typeface = selectedTypeface
     override fun getInputMode(): InputMode = inputMode
     override fun getCurrentSessionName(): String = currentSessionName
+    override fun getSelectedTextColor(): Int = gridTextColor
+    override fun getSelectedBgColor(): Int = bgColor
+    override fun getSelectedBoxFillColor(): Int =
+        textBoxes.find { it.id == activeTextBoxId }?.boxBgColor ?: globalBoxBgColor
+    override fun getSelectedBoxBorderColor(): Int =
+        textBoxes.find { it.id == activeTextBoxId }?.borderColor ?: globalBorderColor
+    override fun getSelectedBoxBorderVisible(): Boolean =
+        textBoxes.find { it.id == activeTextBoxId }?.borderVisible ?: globalBorderVisible
+    override fun getSelectedBoxBorderThicknessIndex(): Int =
+        textBoxes.find { it.id == activeTextBoxId }?.borderThicknessIdx ?: globalBorderThicknessIdx
 
     override fun onModeSelected(mode: InputMode) {
         if (mode == inputMode) return
@@ -2603,8 +2697,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     override fun onToolsToggle() { if (toolsVisible) keyboardToolbarCtrl.collapseToolsPanel() else keyboardToolbarCtrl.switchToTools() }
     override fun onCollapsePanel() { keyboardToolbarCtrl.collapseToolsPanel() }
     override fun onKeyboardToggle() {
-        if (imeIsVisible) {
-            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        val imeUp = imeIsVisible ||
+            ViewCompat.getRootWindowInsets(rootFrame)?.isVisible(WindowInsetsCompat.Type.ime()) == true
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        if (imeUp) {
             imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
         } else {
             keyboardToolbarCtrl.switchToKeyboard()
@@ -2613,42 +2709,58 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
 
     override fun onPunctInsert(punct: String) { insertPunct(punct) }
 
-    override fun onFontSelected(pos: Int) {
+    override fun onFontSelected(pos: Int, applyAll: Boolean) {
         if (pos == fontIndex && numRows > 0) return
         pushHistory()
         fontIndex = pos
         selectedTypeface = fontCatalogue[pos].typeface
         if (canvasMode == CanvasMode.FREESTYLE) {
+            if (applyAll) textBoxes.forEach { it.fontIndex = pos; it.typeface = selectedTypeface }
             val box = textBoxes.find { it.id == activeTextBoxId }
-            if (box != null) { box.fontIndex = pos; activateFreestyleBox(box) }
+            if (box != null) { box.fontIndex = pos; box.typeface = selectedTypeface; activateFreestyleBox(box) }
+            else poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
             persistCurrentState(); return
         }
         needsReflow = true; rebuildGrid()
     }
 
-    override fun onFontSizeChanged(newSize: Float) {
+    override fun onFontSizeChanged(newSize: Float, applyAll: Boolean) {
         if (newSize == fontSizeSp) return
         pushHistory()
         fontSizeSp = newSize
         if (canvasMode == CanvasMode.FREESTYLE) {
+            if (applyAll) textBoxes.forEach { it.fontSizeSp = newSize }
             val box = textBoxes.find { it.id == activeTextBoxId }
             if (box != null) { box.fontSizeSp = newSize; activateFreestyleBox(box) }
+            else poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
             persistCurrentState(); return
         }
         needsReflow = true; rebuildGrid()
     }
 
-    override fun onWordGapChanged(newGap: Int) {
+    override fun onWordGapChanged(newGap: Int, applyAll: Boolean) {
         val gap = newGap.toFloat()
         if (gap == wordGapDp) return
         pushHistory()
         wordGapDp = gap
         if (canvasMode == CanvasMode.FREESTYLE) {
+            if (applyAll) textBoxes.forEach { it.wordGapDp = gap }
             val box = textBoxes.find { it.id == activeTextBoxId }
             if (box != null) { box.wordGapDp = gap; activateFreestyleBox(box) }
+            else poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
             persistCurrentState(); return
         }
         needsReflow = true; rebuildGrid()
+    }
+
+    override fun onFontApplyAllToggled(checked: Boolean) {
+        if (!checked) return
+        pushHistory()
+        textBoxes.forEach { it.fontIndex = fontIndex; it.fontSizeSp = fontSizeSp; it.wordGapDp = wordGapDp; it.typeface = selectedTypeface }
+        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        if (activeBox != null) activateFreestyleBox(activeBox)
+        else poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
+        persistCurrentState()
     }
 
     override fun onBgColorSelected(color: Int) {
@@ -2656,19 +2768,130 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         pushHistory()
         applyBackground(color)
     }
+    override fun onBoxBgColorSelected(color: Int, applyAll: Boolean) {
+        pushHistory()
+        globalBoxBgColor = color  // always update default for newly created boxes
+        if (applyAll) {
+            textBoxes.forEach { it.boxBgColor = color }
+            val activeBox = textBoxes.find { it.id == activeTextBoxId }
+            poemCanvas.updateFreestyleBoxes(textBoxes, activeTextBoxId,
+                activeBox?.leftPx ?: 0f, activeBox?.topPx ?: 0f)
+        } else {
+            val box = textBoxes.find { it.id == activeTextBoxId } ?: return
+            if (color == box.boxBgColor) return
+            box.boxBgColor = color
+            poemCanvas.updateFreestyleBoxes(textBoxes, activeTextBoxId, box.leftPx, box.topPx)
+        }
+        viewFactory.syncColorSelectionUI()
+        persistCurrentState()
+    }
+
+    override fun onBoxFillApplyAllToggled(checked: Boolean) {
+        updateModeChipVisibility()
+        if (!checked) return
+        val box = textBoxes.find { it.id == activeTextBoxId } ?: return
+        pushHistory()
+        globalBoxBgColor = box.boxBgColor
+        textBoxes.forEach { it.boxBgColor = box.boxBgColor }
+        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        poemCanvas.updateFreestyleBoxes(textBoxes, activeTextBoxId,
+            activeBox?.leftPx ?: 0f, activeBox?.topPx ?: 0f)
+        persistCurrentState()
+        viewFactory.syncColorSelectionUI()
+    }
+
+    override fun onBoxBorderVisibilityChanged(visible: Boolean, applyAll: Boolean) {
+        pushHistory()
+        globalBorderVisible = visible  // always update default for newly created boxes
+        if (applyAll) {
+            textBoxes.forEach { it.borderVisible = visible }
+        } else {
+            val box = textBoxes.find { it.id == activeTextBoxId } ?: return
+            box.borderVisible = visible
+        }
+        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        poemCanvas.updateFreestyleBoxes(textBoxes, activeTextBoxId,
+            activeBox?.leftPx ?: 0f, activeBox?.topPx ?: 0f)
+        viewFactory.syncBoxBorderUI(activeBox)
+        persistCurrentState()
+    }
+
+    override fun onBoxBorderColorChanged(color: Int, applyAll: Boolean) {
+        pushHistory()
+        globalBorderColor = color  // always update default for newly created boxes
+        if (applyAll) {
+            textBoxes.forEach { it.borderColor = color }
+        } else {
+            val box = textBoxes.find { it.id == activeTextBoxId } ?: return
+            box.borderColor = color
+        }
+        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        poemCanvas.updateFreestyleBoxes(textBoxes, activeTextBoxId,
+            activeBox?.leftPx ?: 0f, activeBox?.topPx ?: 0f)
+        viewFactory.syncBoxBorderUI(activeBox)
+        persistCurrentState()
+    }
+
+    override fun onBoxBorderThicknessChanged(idx: Int, applyAll: Boolean) {
+        pushHistory()
+        globalBorderThicknessIdx = idx  // always update default for newly created boxes
+        if (applyAll) {
+            textBoxes.forEach { it.borderThicknessIdx = idx }
+        } else {
+            val box = textBoxes.find { it.id == activeTextBoxId } ?: return
+            box.borderThicknessIdx = idx
+        }
+        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        poemCanvas.updateFreestyleBoxes(textBoxes, activeTextBoxId,
+            activeBox?.leftPx ?: 0f, activeBox?.topPx ?: 0f)
+        viewFactory.syncBoxBorderUI(activeBox)
+        persistCurrentState()
+    }
+
+    override fun onBoxBorderApplyAllToggled(checked: Boolean) {
+        updateModeChipVisibility()
+        if (!checked) return
+        val box = textBoxes.find { it.id == activeTextBoxId } ?: return
+        pushHistory()
+        globalBorderVisible = box.borderVisible
+        globalBorderColor = box.borderColor
+        globalBorderThicknessIdx = box.borderThicknessIdx
+        textBoxes.forEach {
+            it.borderVisible = box.borderVisible
+            it.borderColor = box.borderColor
+            it.borderThicknessIdx = box.borderThicknessIdx
+        }
+        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        poemCanvas.updateFreestyleBoxes(textBoxes, activeTextBoxId,
+            activeBox?.leftPx ?: 0f, activeBox?.topPx ?: 0f)
+        viewFactory.syncBoxBorderUI(activeBox)
+        persistCurrentState()
+    }
     override fun onInsertImageRequested() { imagePickerLauncher.launch(arrayOf("image/*")) }
     override fun onRemoveInsertedImage() { removeInsertedImage() }
-    override fun onTextColorSelected(color: Int) {
+    override fun onTextColorSelected(color: Int, applyAll: Boolean) {
         if (color == gridTextColor) return
         pushHistory()
         gridTextColor = color
         if (canvasMode == CanvasMode.FREESTYLE) {
+            if (applyAll) textBoxes.forEach { it.gridTextColor = color }
             val box = textBoxes.find { it.id == activeTextBoxId }
             if (box != null) { box.gridTextColor = color; activateFreestyleBox(box) }
             else updateFreestyleCanvas()
+            viewFactory.syncColorSelectionUI()
             persistCurrentState(); return
         }
         applyTextColor(color)
+        persistCurrentState()
+    }
+
+    override fun onTextColorApplyAllToggled(checked: Boolean) {
+        if (!checked) return
+        pushHistory()
+        textBoxes.forEach { it.gridTextColor = gridTextColor }
+        val activeBox = textBoxes.find { it.id == activeTextBoxId }
+        if (activeBox != null) activateFreestyleBox(activeBox)
+        else poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
         persistCurrentState()
     }
 

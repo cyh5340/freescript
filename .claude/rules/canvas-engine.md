@@ -36,7 +36,9 @@ FrameLayout rootFrame
 `-- EditText ghostInput                      ← 1x1 invisible IME target
 ```
 
-**Keyboard/tools mutual exclusion:** `toolsVisible` flag; `switchToTools()` hides IME shows panel; `switchToKeyboard()` hides panel shows IME. Both paths pre-set `mainScrollView.paddingBottom`.
+**Keyboard/tools mutual exclusion:** `toolsVisible` flag; `switchToTools()` hides IME shows panel; `switchToKeyboard()` hides panel shows IME. Insets listener keeps `mainScrollView.paddingBottom` in sync with current IME height while keyboard is visible.
+
+**Caret auto-visibility while typing:** `scheduleTranslateForKeyboard()` debounces caret translation, then `translateForKeyboard()` computes the focused cell rectangle, converts it into `mainScrollView` coordinates via `offsetDescendantRectToMyCoords`, and uses `smoothScrollBy` so the caret stays inside the currently visible viewport. A short retry window during IME animation is intentional.
 
 **`hideBottomForOverlay()`:** hides `allToolsPanel` + `bottomPanel` without touching `toolsVisible`. Used by `showInputFieldEditor()`, `showBoxEditor()`, and `ScreenshotController`.
 

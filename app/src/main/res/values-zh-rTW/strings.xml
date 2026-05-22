@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">直書</string>
+    <string name="app_name">亂書</string>
 
     <!-- Tools panel -->
     <string name="label_insert">插入</string>
@@ -60,6 +60,10 @@
     <!-- Default session name -->
     <string name="default_session_name">文檔</string>
 
+    <!-- Canvas hints (shown on empty canvas) -->
+    <string name="hint_start_writing">開始書寫</string>
+    <string name="hint_freestyle">長按插入文字框</string>
+
     <!-- Entry page -->
     <string name="entry_new_doc">新增文檔</string>
     <string name="entry_recent_docs">最近文檔</string>
@@ -70,24 +74,37 @@
     <string name="entry_mode_freestyle">自由</string>
     <string name="entry_mode_freestyle_desc">自由拖拉排版</string>
 
-    <!-- Freestyle interact mode (in tools panel) -->
-    <string name="label_interact_mode">互動</string>
-    <string name="freestyle_bar_move">移動</string>
-    <string name="freestyle_bar_resize">調整大小</string>
+    <!-- Box fill color (FREESTYLE per-textbox background) -->
+    <string name="label_box_fill_color">填色</string>
+    <string name="box_fill_none">無</string>
+    <string name="apply_all_label">全</string>
+
+    <!-- Box border (FREESTYLE per-textbox border) -->
+    <string name="label_box_border">框線</string>
+    <string name="box_border_show">顯示</string>
 
     <!-- Background color labels -->
     <string name="bg_color_white">白</string>
     <string name="bg_color_cream">米</string>
+    <string name="bg_color_paper">紙</string>
+    <string name="bg_color_ivory">象牙</string>
     <string name="bg_color_antique">古</string>
+    <string name="bg_color_blush">霞粉</string>
+    <string name="bg_color_mist">霧</string>
     <string name="bg_color_pink">粉</string>
     <string name="bg_color_orange">橙</string>
     <string name="bg_color_green">草</string>
+    <string name="bg_color_mint">薄荷</string>
     <string name="bg_color_blue">藍</string>
+    <string name="bg_color_cyan">青藍</string>
     <string name="bg_color_purple">紫</string>
+    <string name="bg_color_lilac">丁香</string>
     <string name="bg_color_tea">茶</string>
     <string name="bg_color_brown">棕</string>
+    <string name="bg_color_slate">岩灰</string>
     <string name="bg_color_night">夜</string>
     <string name="bg_color_dark">深</string>
+    <string name="bg_color_system">系統</string>
     <string name="bg_color_black">黑</string>
 
     <!-- Text color labels -->
@@ -96,10 +113,18 @@
     <string name="text_color_gray">灰</string>
     <string name="text_color_white">白</string>
     <string name="text_color_indigo">藍墨</string>
-    <string name="text_color_vermilion">硃</string>
-    <string name="text_color_gold">金</string>
-    <string name="text_color_jade">翠</string>
-    <string name="text_color_purple">紫</string>
-    <string name="text_color_crimson">赤</string>
+    <string name="text_color_navy">藏藍</string>
     <string name="text_color_blue">藍</string>
+    <string name="text_color_teal">青</string>
+    <string name="text_color_ocean">海藍</string>
+    <string name="text_color_forest">松綠</string>
+    <string name="text_color_jade">翠</string>
+    <string name="text_color_brown">褐</string>
+    <string name="text_color_coffee">咖啡</string>
+    <string name="text_color_purple">紫</string>
+    <string name="text_color_wine">酒紅</string>
+    <string name="text_color_vermilion">硃</string>
+    <string name="text_color_crimson">赤</string>
+    <string name="text_color_gold">金</string>
+    <string name="text_color_amber">琥珀</string>
 </resources>

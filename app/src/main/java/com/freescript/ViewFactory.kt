@@ -1,4 +1,4 @@
-package com.poemeditor
+package com.freescript
 
 import android.content.Context
 import android.graphics.Color
@@ -32,6 +32,68 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
     var insertImageContainer: LinearLayout? = null
     var scrollIndicatorContainer: FrameLayout? = null
     var scrollIndicatorThumb: View? = null
+    var boxFillColorRow: View? = null
+    var boxBorderVisibleCheckbox: android.widget.CheckBox? = null
+    var fontApplyAllCheckbox: android.widget.CheckBox? = null
+    var textColorApplyAllCheckbox: android.widget.CheckBox? = null
+
+    private var boxFillApplyAllCheckbox: android.widget.CheckBox? = null
+    private var boxBorderApplyAllCheckbox: android.widget.CheckBox? = null
+    private val borderThicknessChips = mutableListOf<TextView>()
+
+    private val textColorSwatches = mutableListOf<Pair<Int, View>>()
+    private val bgColorSwatches = mutableListOf<Pair<Int, View>>()
+    private val boxFillColorSwatches = mutableListOf<Pair<Int, View>>()
+    private var boxFillNoneContainer: LinearLayout? = null
+    private val boxBorderColorSwatches = mutableListOf<Pair<Int, View>>()
+
+    fun isFreestyleApplyAllActive(): Boolean =
+        (boxFillApplyAllCheckbox?.isChecked == true) || (boxBorderApplyAllCheckbox?.isChecked == true)
+
+    fun syncColorSelectionUI() {
+        val dp = context.resources.displayMetrics.density
+        val textSelected = cb.getSelectedTextColor()
+        val bgSelected = cb.getSelectedBgColor()
+        val boxFillSelected = cb.getSelectedBoxFillColor()
+        val boxBorderSelected = cb.getSelectedBoxBorderColor()
+
+        textColorSwatches.forEach { (color, swatch) ->
+            swatch.background = swatchDrawable(color, dp, color == textSelected)
+        }
+        bgColorSwatches.forEach { (color, swatch) ->
+            swatch.background = swatchDrawable(color, dp, color == bgSelected)
+        }
+        boxFillColorSwatches.forEach { (color, swatch) ->
+            swatch.background = swatchDrawable(color, dp, color == boxFillSelected)
+        }
+        boxBorderColorSwatches.forEach { (color, swatch) ->
+            swatch.background = swatchDrawable(color, dp, color == boxBorderSelected)
+        }
+
+        boxFillNoneContainer?.background = if (boxFillSelected == Color.TRANSPARENT) {
+            GradientDrawable().apply {
+                setColor(Color.TRANSPARENT)
+                setStroke((2.2f * dp).roundToInt(), context.getColor(R.color.row_active))
+                cornerRadius = 6f * dp
+            }
+        } else null
+    }
+
+    fun syncBoxBorderUI(box: TextBoxInstance?) {
+        val check = boxBorderVisibleCheckbox ?: return
+        check.setOnCheckedChangeListener(null)
+        check.isChecked = box?.borderVisible ?: cb.getSelectedBoxBorderVisible()
+        val applyAllRef = boxBorderApplyAllCheckbox
+        check.setOnCheckedChangeListener { _, isChecked ->
+            cb.onBoxBorderVisibilityChanged(isChecked, applyAllRef?.isChecked == true)
+        }
+        val selIdx = box?.borderThicknessIdx ?: cb.getSelectedBoxBorderThicknessIndex()
+        borderThicknessChips.forEachIndexed { i, chip ->
+            (chip.background as? android.graphics.drawable.GradientDrawable)?.setColor(
+                if (i == selIdx) context.getColor(R.color.chip_active) else Color.TRANSPARENT)
+        }
+        syncColorSelectionUI()
+    }
 
     private var isScrollIndicatorDragging = false
     private var scrollIndicatorDragStartX = 0f
@@ -49,13 +111,27 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
         fun getCurrentSessionName(): String
         fun onToolsToggle()
         fun onPunctInsert(punct: String)
-        fun onFontSelected(pos: Int)
-        fun onFontSizeChanged(newSize: Float)
-        fun onWordGapChanged(newGap: Int)
+        fun onFontSelected(pos: Int, applyAll: Boolean)
+        fun onFontSizeChanged(newSize: Float, applyAll: Boolean)
+        fun onWordGapChanged(newGap: Int, applyAll: Boolean)
+        fun onFontApplyAllToggled(checked: Boolean)
         fun onBgColorSelected(color: Int)
+        fun onBoxBgColorSelected(color: Int, applyAll: Boolean)
+        fun onBoxFillApplyAllToggled(checked: Boolean)
+        fun onBoxBorderVisibilityChanged(visible: Boolean, applyAll: Boolean)
+        fun onBoxBorderColorChanged(color: Int, applyAll: Boolean)
+        fun onBoxBorderThicknessChanged(idx: Int, applyAll: Boolean)
+        fun onBoxBorderApplyAllToggled(checked: Boolean)
+        fun getSelectedTextColor(): Int
+        fun getSelectedBgColor(): Int
+        fun getSelectedBoxFillColor(): Int
+        fun getSelectedBoxBorderColor(): Int
+        fun getSelectedBoxBorderVisible(): Boolean
+        fun getSelectedBoxBorderThicknessIndex(): Int
         fun onInsertImageRequested()
         fun onRemoveInsertedImage()
-        fun onTextColorSelected(color: Int)
+        fun onTextColorSelected(color: Int, applyAll: Boolean)
+        fun onTextColorApplyAllToggled(checked: Boolean)
         fun onModeSelected(mode: InputMode)
         fun onCopySelection()
         fun onCutSelection()
@@ -398,26 +474,51 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
 
     // ── All-tools panel ───────────────────────────────────────────────────
     fun buildAllToolsPanel(dp: Float): LinearLayout {
-        val hscroll = { inner: LinearLayout ->
-            HorizontalScrollView(context).apply {
-                isHorizontalScrollBarEnabled = false
-                overScrollMode = View.OVER_SCROLL_NEVER
-                layoutParams = LinearLayout.LayoutParams(MP, WC)
-                addView(inner.also { it.layoutParams = LinearLayout.LayoutParams(WC, WC) })
-            }
-        }
-
         val scrollContent = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(MP, WC)
 
             addView(buildFontRow(dp))
             addView(subDivider(dp))
-            addView(hscroll(buildTextColorPanel(dp)))
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(MP, WC)
+                addView(HorizontalScrollView(context).apply {
+                    isHorizontalScrollBarEnabled = false
+                    overScrollMode = View.OVER_SCROLL_NEVER
+                    layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
+                    addView(buildTextColorPanel(dp).also {
+                        it.layoutParams = LinearLayout.LayoutParams(WC, WC)
+                    })
+                })
+                addView(android.widget.CheckBox(context).apply {
+                    text = context.getString(R.string.apply_all_label); textSize = 10f
+                    setTextColor(context.getColor(R.color.text_lighter))
+                    layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                        it.setMargins((4 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0)
+                    }
+                    visibility = View.GONE
+                    setOnCheckedChangeListener { _, isChecked ->
+                        cb.onTextColorApplyAllToggled(isChecked)
+                    }
+                    textColorApplyAllCheckbox = this
+                })
+            })
             addView(subDivider(dp))
 
             addView(buildBgColorHeaderRow(dp))
             addView(subDivider(dp))
+
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(MP, WC)
+                visibility = View.GONE
+                addView(buildBoxFillColorRow(dp))
+                addView(subDivider(dp))
+                addView(buildBoxBorderRow(dp))
+                addView(subDivider(dp))
+            }.also { boxFillColorRow = it })
 
             addView(buildInsertPanel(dp))
             addView(subDivider(dp))
@@ -453,6 +554,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 setBackgroundColor(context.getColor(R.color.stroke))
             })
             addView(scrollView)
+            post { syncColorSelectionUI() }
         }
     }
 
@@ -505,11 +607,19 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
     }
 
     // ── Colour panels ─────────────────────────────────────────────────────
-    fun buildTextColorPanel(dp: Float) = buildColorSwatchRow(dp, AppConfig.TEXT_COLORS) {
-        cb.onTextColorSelected(it.color)
+    fun buildTextColorPanel(dp: Float) = buildColorSwatchRow(
+        dp = dp,
+        colors = AppConfig.TEXT_COLORS,
+        registry = textColorSwatches
+    ) {
+        cb.onTextColorSelected(it.color, textColorApplyAllCheckbox?.isChecked == true)
     }
 
-    fun buildBgColorPanel(dp: Float) = buildColorSwatchRow(dp, AppConfig.BG_COLORS) {
+    fun buildBgColorPanel(dp: Float) = buildColorSwatchRow(
+        dp = dp,
+        colors = AppConfig.BG_COLORS,
+        registry = bgColorSwatches
+    ) {
         cb.onBgColorSelected(it.color)
     }
 
@@ -538,12 +648,225 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             })
         }
 
+    // Box fill-color row — shown only when a FREESTYLE textbox is active.
+    // The "◼填色" icon title mirrors the fill-bucket convention used in drawing apps.
+    private fun buildBoxFillColorRow(dp: Float): View =
+        LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(MP, WC)
+            setPadding((12 * dp).roundToInt(), 0, 0, 0)
+
+            addView(TextView(context).apply {
+                text = context.getString(R.string.label_box_fill_color); textSize = 11f
+                setTextColor(context.getColor(R.color.text_lighter))
+                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                    it.marginEnd = (8 * dp).roundToInt()
+                }
+            })
+
+            val swatchSz = (38 * dp).roundToInt()
+            val swatchRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(WC, WC)
+                val vPad = (10 * dp).roundToInt()
+                setPadding(0, vPad, (8 * dp).roundToInt(), vPad)
+
+                // "No fill" swatch — white square with a red diagonal slash
+                addView(LinearLayout(context).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER
+                    layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                        it.marginEnd = (6 * dp).roundToInt()
+                    }
+                    boxFillNoneContainer = this
+                    addView(object : android.view.View(context) {
+                        private val strokePx = (1f * dp)
+                        private val slashPx  = (1.5f * dp)
+                        private val borderPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                            color = context.getColor(R.color.stroke); style = android.graphics.Paint.Style.STROKE; strokeWidth = strokePx
+                        }
+                        private val slashPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                            color = Color.RED; style = android.graphics.Paint.Style.STROKE; strokeWidth = slashPx
+                        }
+                        init { setBackgroundColor(Color.WHITE); layoutParams = LinearLayout.LayoutParams(swatchSz, swatchSz) }
+                        override fun onDraw(c: android.graphics.Canvas) {
+                            super.onDraw(c)
+                            val w = width.toFloat(); val h = height.toFloat()
+                            c.drawRect(strokePx/2, strokePx/2, w - strokePx/2, h - strokePx/2, borderPaint)
+                            c.drawLine(w, 0f, 0f, h, slashPaint)
+                        }
+                    })
+                    addView(TextView(context).apply {
+                        text = context.getString(R.string.box_fill_none); textSize = 9f
+                        setTextColor(context.getColor(R.color.text_medium)); gravity = Gravity.CENTER
+                        layoutParams = LinearLayout.LayoutParams(swatchSz, WC)
+                    })
+                    setOnClickListener {
+                        cb.onBoxBgColorSelected(Color.TRANSPARENT, boxFillApplyAllCheckbox?.isChecked == true)
+                    }
+                })
+
+                // Color swatches (reuse BG_COLORS)
+                boxFillColorSwatches.clear()
+                AppConfig.BG_COLORS.forEach { option ->
+                    addView(buildSwatchItem(
+                        option = option,
+                        swatchSz = swatchSz,
+                        dp = dp,
+                        registry = boxFillColorSwatches
+                    ) {
+                        cb.onBoxBgColorSelected(option.color, boxFillApplyAllCheckbox?.isChecked == true)
+                    })
+                }
+            }
+
+            addView(HorizontalScrollView(context).apply {
+                isHorizontalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
+                addView(swatchRow)
+            })
+
+            addView(android.widget.CheckBox(context).apply {
+                text = context.getString(R.string.apply_all_label); textSize = 10f
+                setTextColor(context.getColor(R.color.text_lighter))
+                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                    it.setMargins((4 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0)
+                }
+                setOnCheckedChangeListener { _, isChecked ->
+                    cb.onBoxFillApplyAllToggled(isChecked)
+                    syncColorSelectionUI()
+                }
+                boxFillApplyAllCheckbox = this
+            })
+        }
+
+    private fun buildBoxBorderRow(dp: Float): View =
+        LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(MP, WC)
+            setPadding((12 * dp).roundToInt(), 0, 0, 0)
+
+            addView(TextView(context).apply {
+                text = context.getString(R.string.label_box_border); textSize = 11f
+                setTextColor(context.getColor(R.color.text_lighter))
+                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                    it.marginEnd = (6 * dp).roundToInt()
+                }
+            })
+
+            // Visibility checkbox
+            addView(android.widget.CheckBox(context).apply {
+                text = context.getString(R.string.box_border_show); textSize = 10f
+                isChecked = true
+                setTextColor(context.getColor(R.color.text_dark))
+                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                    it.marginEnd = (6 * dp).roundToInt()
+                }
+                val applyAllRef = boxBorderApplyAllCheckbox
+                setOnCheckedChangeListener { _, isChecked ->
+                    cb.onBoxBorderVisibilityChanged(isChecked, applyAllRef?.isChecked == true)
+                }
+                boxBorderVisibleCheckbox = this
+            })
+
+            // Scrollable area: thickness chips + color swatches
+            val scrollContent = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(WC, WC)
+                val vPad = (10 * dp).roundToInt()
+                setPadding(0, vPad, (8 * dp).roundToInt(), vPad)
+
+                // Thickness chips
+                borderThicknessChips.clear()
+                AppConfig.BORDER_THICKNESS_LIST.forEachIndexed { idx, (_, label) ->
+                    addView(TextView(context).apply {
+                        text = label; textSize = 11f; gravity = Gravity.CENTER
+                        setTextColor(context.getColor(R.color.text_dark))
+                        val bg = GradientDrawable().apply {
+                            setColor(if (idx == 1) context.getColor(R.color.chip_active) else Color.TRANSPARENT)
+                            cornerRadius = 4f * dp
+                        }
+                        background = bg
+                        val hP = (8 * dp).roundToInt(); val vP = (5 * dp).roundToInt()
+                        setPadding(hP, vP, hP, vP)
+                        layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                            it.marginEnd = (4 * dp).roundToInt()
+                        }
+                        borderThicknessChips.add(this)
+                        val localIdx = idx
+                        setOnClickListener {
+                            borderThicknessChips.forEachIndexed { i, chip ->
+                                (chip.background as? GradientDrawable)?.setColor(
+                                    if (i == localIdx) context.getColor(R.color.chip_active) else Color.TRANSPARENT)
+                            }
+                            cb.onBoxBorderThicknessChanged(localIdx, boxBorderApplyAllCheckbox?.isChecked == true)
+                        }
+                    })
+                }
+
+                // Thin divider between thickness and color
+                addView(View(context).apply {
+                    layoutParams = LinearLayout.LayoutParams((1 * dp).roundToInt(), (24 * dp).roundToInt()).also {
+                        it.setMargins((4 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0)
+                    }
+                    setBackgroundColor(context.getColor(R.color.divider))
+                })
+
+                // Border color swatches
+                val swatchSz = (38 * dp).roundToInt()
+                boxBorderColorSwatches.clear()
+                AppConfig.BORDER_COLORS.forEach { option ->
+                    addView(buildSwatchItem(
+                        option = option,
+                        swatchSz = swatchSz,
+                        dp = dp,
+                        registry = boxBorderColorSwatches
+                    ) {
+                        cb.onBoxBorderColorChanged(option.color, boxBorderApplyAllCheckbox?.isChecked == true)
+                    })
+                }
+            }
+
+            addView(HorizontalScrollView(context).apply {
+                isHorizontalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
+                addView(scrollContent)
+            })
+
+            addView(android.widget.CheckBox(context).apply {
+                text = context.getString(R.string.apply_all_label); textSize = 10f
+                setTextColor(context.getColor(R.color.text_lighter))
+                layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                    it.setMargins((4 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0)
+                }
+                boxBorderApplyAllCheckbox = this
+                val visCheck = boxBorderVisibleCheckbox
+                val applyAllSelf = this
+                // Re-wire the visibility checkbox so it can read the now-available apply-all ref
+                visCheck?.setOnCheckedChangeListener { _, isChecked ->
+                    cb.onBoxBorderVisibilityChanged(isChecked, applyAllSelf.isChecked)
+                }
+                setOnCheckedChangeListener { _, isChecked ->
+                    cb.onBoxBorderApplyAllToggled(isChecked)
+                    syncColorSelectionUI()
+                }
+            })
+        }
+
     private fun buildColorSwatchRow(
         dp: Float,
         colors: List<ColorOption>,
+        registry: MutableList<Pair<Int, View>>,
         onClick: (ColorOption) -> Unit
     ): LinearLayout {
         val swatchSz = (38 * dp).roundToInt()
+        registry.clear()
         return LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -553,17 +876,23 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 (8 * dp).roundToInt(), (10 * dp).roundToInt()
             )
             colors.forEach { option ->
-                addView(buildSwatchItem(option, swatchSz, dp) {
-                    onClick(
-                        option
-                    )
+                addView(buildSwatchItem(
+                    option = option,
+                    swatchSz = swatchSz,
+                    dp = dp,
+                    registry = registry
+                ) {
+                    onClick(option)
                 })
             }
         }
     }
 
     private fun buildSwatchItem(
-        option: ColorOption, swatchSz: Int, dp: Float,
+        option: ColorOption,
+        swatchSz: Int,
+        dp: Float,
+        registry: MutableList<Pair<Int, View>>,
         onClick: () -> Unit
     ): LinearLayout =
         LinearLayout(context).apply {
@@ -571,10 +900,12 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             gravity = Gravity.CENTER
             layoutParams =
                 LinearLayout.LayoutParams(WC, WC).also { it.marginEnd = (6 * dp).roundToInt() }
-            addView(View(context).apply {
-                background = swatchDrawable(option.color, dp)
+            val swatchView = View(context).apply {
+                background = swatchDrawable(option.color, dp, selected = false)
                 layoutParams = LinearLayout.LayoutParams(swatchSz, swatchSz)
-            })
+            }
+            registry.add(option.color to swatchView)
+            addView(swatchView)
             addView(TextView(context).apply {
                 text = context.getString(option.labelRes); textSize = 9f
                 setTextColor(context.getColor(R.color.text_medium)); gravity = Gravity.CENTER
@@ -638,7 +969,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 val newSize = AppConfig.FONT_SIZE_LIST[p].first
                 if (newSize != cb.getFontSizeSp()) {
                     fontSizeLabelRef?.text = newSize.toInt().toString()
-                    cb.onFontSizeChanged(newSize)
+                    cb.onFontSizeChanged(newSize, fontApplyAllCheckbox?.isChecked == true)
                 }
             }
         }
@@ -662,11 +993,23 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 val newGap = AppConfig.WORD_GAP_LIST[p].first
                 if (newGap != cb.getWordGapDp()) {
                     gapValueLabelRef?.text = AppConfig.WORD_GAP_LIST[p].second
-                    cb.onWordGapChanged(newGap.toInt())
+                    cb.onWordGapChanged(newGap.toInt(), fontApplyAllCheckbox?.isChecked == true)
                 }
             }
         }
         addView(gapChip)
+        addView(android.widget.CheckBox(context).apply {
+            text = context.getString(R.string.apply_all_label); textSize = 10f
+            setTextColor(context.getColor(R.color.text_lighter))
+            layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                it.setMargins((4 * dp).roundToInt(), 0, (8 * dp).roundToInt(), 0)
+            }
+            visibility = View.GONE
+            setOnCheckedChangeListener { _, isChecked ->
+                cb.onFontApplyAllToggled(isChecked)
+            }
+            fontApplyAllCheckbox = this
+        })
     }
 
         private fun buildFontSpinner(dp: Float): Spinner {
@@ -688,7 +1031,7 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 fontSpinnerRef = this
                 onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                     override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                        cb.onFontSelected(pos)
+                        cb.onFontSelected(pos, fontApplyAllCheckbox?.isChecked == true)
                     }
 
                     override fun onNothingSelected(p: AdapterView<*>?) {}
@@ -927,9 +1270,12 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             setBackgroundColor(context.getColor(R.color.divider))
         }
 
-        private fun swatchDrawable(color: Int, dp: Float) = GradientDrawable().apply {
+        private fun swatchDrawable(color: Int, dp: Float, selected: Boolean) = GradientDrawable().apply {
             setColor(color)
-            setStroke((1.5f * dp).roundToInt(), context.getColor(R.color.text_hint))
+            setStroke(
+                if (selected) (3.6f * dp).roundToInt() else (1.5f * dp).roundToInt(),
+                if (selected) Color.parseColor("#2196F3") else context.getColor(R.color.text_hint)
+            )
             cornerRadius = 5f * dp
         }
 

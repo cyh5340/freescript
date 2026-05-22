@@ -1,0 +1,349 @@
+package com.freescript
+
+import android.content.Intent
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.os.Bundle
+import android.text.TextUtils
+import android.view.*
+import android.widget.*
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import kotlin.math.roundToInt
+import kotlin.math.sqrt
+
+class EntryPageActivity : AppCompatActivity() {
+
+    private val MP = ViewGroup.LayoutParams.MATCH_PARENT
+    private val WC = ViewGroup.LayoutParams.WRAP_CONTENT
+
+    private lateinit var recentSessionsContainer: LinearLayout
+    private lateinit var sessionListLauncher: ActivityResultLauncher<Intent>
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        supportActionBar?.hide()
+
+        sessionListLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK) {
+                val data = result.data ?: return@registerForActivityResult
+                val sessionId  = data.getStringExtra("session_id")
+                val canvasMode = data.getStringExtra("canvas_mode")
+                val intent = Intent(this, MainActivity::class.java).apply {
+                    if (sessionId  != null) putExtra("SESSION_ID",  sessionId)
+                    if (canvasMode != null) putExtra("CANVAS_MODE", canvasMode)
+                }
+                startActivity(intent)
+            }
+        }
+
+        setContentView(buildRoot())
+    }
+
+    override fun onResume() {
+        super.onResume()
+        populateRecentSessions()
+    }
+
+    // ── Root ───────────────────────────────────────────────────────────────
+    //
+    //  ┌──────────────────┬──────────┐
+    //  │  自  fS×fS       │          │  top row height = vH = avail
+    //  ├──────────────────┤  直 vW×vH│
+    //  │  recent (×3)     │          │  ← flex area in left-column gap
+    //  │  All Files →     │          │
+    //  └──────────────────┴──────────┘
+    //  ┌──────────────────────────────┐  ← gapV = gapH
+    //  │       橫  avail×hH           │
+    //  └──────────────────────────────┘
+
+    private fun buildRoot(): View {
+        val dm   = resources.displayMetrics
+        val dp   = dm.density
+        val pad  = (16 * dp).roundToInt()
+        val avail = dm.widthPixels - 2 * pad
+
+        val gapH = (20 * dp).roundToInt()   // gap between freestyle and vertical, also used vertically
+        val gapV = gapH
+        val u    = (avail - gapH).toDouble()
+        // Solve fS² = vW×avail where fS = avail-gapH-vW → (u-vW)² = vW×avail
+        val vW       = ((2*u + avail - sqrt(avail * (4*u + avail))) / 2.0).roundToInt()
+        val leftColW = avail - gapH - vW
+        val fS       = leftColW
+        val vH       = avail
+        val hH       = vW
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(getColor(R.color.surface))
+            layoutParams = ViewGroup.LayoutParams(MP, MP)
+            setPadding(pad, pad, pad, pad)
+
+            // Top row
+            addView(LinearLayout(this@EntryPageActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutParams = LinearLayout.LayoutParams(MP, vH)
+
+                // Left column: freestyle card + recent files + all files link
+                addView(LinearLayout(this@EntryPageActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(leftColW, MP)
+
+                    addView(buildModeCard(CanvasMode.FREESTYLE, dp), LinearLayout.LayoutParams(fS, fS))
+
+                    addView(vGap(gapV))
+
+                    recentSessionsContainer = LinearLayout(this@EntryPageActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
+                    }
+                    addView(recentSessionsContainer)
+
+                    addView(buildAllFilesRow(dp))
+                })
+
+                addView(hGap(gapH))
+
+                // Right column: vertical card (full row height)
+                addView(buildModeCard(CanvasMode.VERTICAL, dp), LinearLayout.LayoutParams(vW, vH))
+            })
+
+            addView(vGap(gapV))
+
+            // Horizontal card (full width)
+            addView(buildModeCard(CanvasMode.HORIZONTAL, dp, horizontal = true),
+                LinearLayout.LayoutParams(avail, hH))
+
+            addView(vGap(gapV))
+            addView(android.widget.ImageView(this@EntryPageActivity).apply {
+                setImageResource(R.drawable.poemeditor_logo)
+                scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                setBackgroundColor(getColor(R.color.surface))
+                layoutParams = LinearLayout.LayoutParams(MP, WC)
+            })
+        }
+    }
+
+    // ── Mode cards (clean buttons, no embedded sessions) ───────────────────
+
+    private fun buildModeCard(mode: CanvasMode, dp: Float, horizontal: Boolean = false): View {
+        val icon = when (mode) {
+            CanvasMode.VERTICAL   -> "直"
+            CanvasMode.HORIZONTAL -> "橫"
+            CanvasMode.FREESTYLE  -> "自"
+        }
+        val label = when (mode) {
+            CanvasMode.VERTICAL   -> getString(R.string.entry_mode_vertical)
+            CanvasMode.HORIZONTAL -> getString(R.string.entry_mode_horizontal)
+            CanvasMode.FREESTYLE  -> getString(R.string.entry_mode_freestyle)
+        }
+        val desc = when (mode) {
+            CanvasMode.VERTICAL   -> getString(R.string.entry_mode_vertical_desc)
+            CanvasMode.HORIZONTAL -> getString(R.string.entry_mode_horizontal_desc)
+            CanvasMode.FREESTYLE  -> getString(R.string.entry_mode_freestyle_desc)
+        }
+        val pad = (14 * dp).roundToInt()
+
+        return LinearLayout(this).apply {
+            orientation = if (horizontal) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+            gravity     = if (horizontal) Gravity.CENTER_VERTICAL else Gravity.CENTER
+            background  = cardBg(dp)
+            setPadding(pad, pad, pad, pad)
+            setOnClickListener { launchMode(mode) }
+
+            val iconView = cardIcon(icon, dp).also {
+                it.layoutParams = if (horizontal)
+                    LinearLayout.LayoutParams(WC, WC).also { lp -> lp.marginEnd = (14 * dp).roundToInt() }
+                else
+                    LinearLayout.LayoutParams(MP, WC)
+            }
+            addView(iconView)
+
+            if (horizontal) {
+                addView(LinearLayout(this@EntryPageActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(WC, WC)
+                    addView(cardLabel(label, dp))
+                    addView(cardDesc(desc, dp))
+                })
+            } else if (mode == CanvasMode.VERTICAL) {
+                // Two vertical text columns side-by-side below the icon.
+                // Right column = label, left column = description (traditional RTL column order).
+                addView(LinearLayout(this@EntryPageActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
+                    layoutParams = LinearLayout.LayoutParams(MP, WC).also {
+                        it.topMargin = (6 * dp).roundToInt()
+                    }
+                    // desc on the left
+                    addView(TextView(this@EntryPageActivity).apply {
+                        text = desc.map { it.toString() }.joinToString("\n")
+                        textSize = 9f
+                        gravity = Gravity.CENTER
+                        setTextColor(getColor(R.color.text_hint))
+                        layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                            it.marginEnd = (8 * dp).roundToInt()
+                        }
+                    })
+                    // label on the right
+                    addView(TextView(this@EntryPageActivity).apply {
+                        text = label.map { it.toString() }.joinToString("\n")
+                        textSize = 13f
+                        gravity = Gravity.CENTER
+                        setTextColor(getColor(R.color.text_dark))
+                        layoutParams = LinearLayout.LayoutParams(WC, WC)
+                    })
+                })
+            } else {
+                addView(cardLabel(label, dp))
+                addView(cardDesc(desc, dp))
+            }
+        }
+    }
+
+    private fun buildAllFilesRow(dp: Float): View =
+        FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(MP, WC)
+            val vPad = (10 * dp).roundToInt()
+            setPadding(0, vPad, 0, vPad)
+            addView(TextView(this@EntryPageActivity).apply {
+                text = "${getString(R.string.btn_all_docs)} →"
+                textSize = 12f
+                setTextColor(getColor(R.color.text_medium))
+                layoutParams = FrameLayout.LayoutParams(WC, WC, Gravity.END or Gravity.CENTER_VERTICAL)
+                setOnClickListener { openSessionList() }
+            })
+        }
+
+    // ── Recent sessions (squeezed in left-column gap) ──────────────────────
+
+    private fun populateRecentSessions() {
+        val dp = resources.displayMetrics.density
+        recentSessionsContainer.removeAllViews()
+        val sessions = SessionManager.listSessions(filesDir).take(3)
+        sessions.forEachIndexed { i, meta ->
+            if (i > 0) recentSessionsContainer.addView(
+                hDivider().also { it.layoutParams = LinearLayout.LayoutParams(MP, 1) }
+            )
+            recentSessionsContainer.addView(buildSessionRow(meta, dp))
+        }
+    }
+
+    private fun buildSessionRow(meta: SessionManager.SessionMeta, dp: Float): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(MP, WC)
+            val vPad = (7 * dp).roundToInt()
+            setPadding(0, vPad, 0, vPad)
+            isClickable = true
+            isFocusable = true
+
+            // Mode chip + name on one line
+            addView(LinearLayout(this@EntryPageActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity     = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(MP, WC)
+
+                addView(TextView(this@EntryPageActivity).apply {
+                    text = when (meta.canvasMode) {
+                        CanvasMode.HORIZONTAL -> "橫"
+                        CanvasMode.FREESTYLE  -> "自"
+                        else                  -> "直"
+                    }
+                    textSize = 9f
+                    gravity  = Gravity.CENTER
+                    setTextColor(getColor(R.color.text_light))
+                    background = GradientDrawable().apply {
+                        setColor(getColor(R.color.chip_active))
+                        cornerRadius = 3f * dp
+                    }
+                    val bPad = (3 * dp).roundToInt()
+                    setPadding(bPad, bPad, bPad, bPad)
+                    layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                        it.marginEnd = (6 * dp).roundToInt()
+                    }
+                })
+
+                addView(TextView(this@EntryPageActivity).apply {
+                    text = meta.name
+                    textSize = 12f
+                    isSingleLine = true
+                    ellipsize = TextUtils.TruncateAt.END
+                    setTextColor(getColor(R.color.text_darkest))
+                    layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
+                })
+            })
+
+            // Timestamp below name
+            addView(TextView(this@EntryPageActivity).apply {
+                text = meta.formattedDate()
+                textSize = 9f
+                setTextColor(getColor(R.color.text_hint))
+                layoutParams = LinearLayout.LayoutParams(MP, WC).also {
+                    it.topMargin = (2 * dp).roundToInt()
+                }
+            })
+
+            setOnClickListener {
+                startActivity(
+                    Intent(this@EntryPageActivity, MainActivity::class.java)
+                        .putExtra("SESSION_ID", meta.id)
+                )
+            }
+        }
+
+    // ── Navigation ─────────────────────────────────────────────────────────
+
+    private fun launchMode(mode: CanvasMode) {
+        startActivity(Intent(this, MainActivity::class.java).putExtra("CANVAS_MODE", mode.name))
+    }
+
+    private fun openSessionList() {
+        sessionListLauncher.launch(
+            Intent(this, SessionListActivity::class.java)
+                .putExtra("current_session_id", "")
+                .putExtra("current_canvas_mode", "VERTICAL")
+        )
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    private fun cardIcon(text: String, dp: Float) = TextView(this).apply {
+        this.text = text
+        textSize  = 36f
+        gravity   = Gravity.CENTER
+        typeface  = Typeface.DEFAULT_BOLD
+        setTextColor(getColor(R.color.text_darkest))
+    }
+
+    private fun cardLabel(text: String, dp: Float) = TextView(this).apply {
+        this.text = text
+        textSize  = 13f
+        gravity   = Gravity.CENTER
+        setTextColor(getColor(R.color.text_dark))
+        layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+            it.topMargin = (4 * dp).roundToInt()
+        }
+    }
+
+    private fun cardDesc(text: String, dp: Float) = TextView(this).apply {
+        this.text = text
+        textSize  = 9f
+        gravity   = Gravity.CENTER
+        setTextColor(getColor(R.color.text_hint))
+        layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+            it.topMargin = (2 * dp).roundToInt()
+        }
+    }
+
+    private fun cardBg(dp: Float) = GradientDrawable().apply {
+        setColor(getColor(R.color.panel_bg))
+        cornerRadius = 12f * dp
+        setStroke((1f * dp).roundToInt(), getColor(R.color.divider))
+    }
+
+    private fun hDivider() = View(this).apply { setBackgroundColor(getColor(R.color.divider)) }
+    private fun hGap(px: Int) = View(this).apply { layoutParams = LinearLayout.LayoutParams(px, MP) }
+    private fun vGap(px: Int) = View(this).apply { layoutParams = LinearLayout.LayoutParams(MP, px) }
+}
