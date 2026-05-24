@@ -35,7 +35,9 @@ An Android app for composing vertical Chinese poetry. Characters flow top-to-bot
 
 ```
 app/src/main/
-├── assets/fonts/LXGWWenKai-Regular.ttf
+├── assets/fonts/
+│   ├── LXGWWenKai-Regular.ttf
+│   └── OFL.txt                 # SIL Open Font License 1.1
 └── java/com/freescript/
     ├── MainActivity.kt          # activity coordinator
     ├── PoemCanvasView.kt        # canvas renderer
@@ -54,3 +56,14 @@ app/src/main/
     ├── LocaleHelper.kt          # locale and night-mode persistence
     └── AppConfig.kt             # palettes, font sizes, punctuation
 ```
+
+## Acknowledgements
+
+The bundled CJK font is **LXGW WenKai (霞鶩文楷)** by **Lxgw (高翔)**,
+included unmodified at `app/src/main/assets/fonts/LXGWWenKai-Regular.ttf`.
+
+- Source repository: <https://github.com/lxgw/LxgwWenKai>
+- License: [SIL Open Font License 1.1](app/src/main/assets/fonts/OFL.txt)
+
+Many thanks to Lxgw for releasing such a beautiful font under an open
+license.
