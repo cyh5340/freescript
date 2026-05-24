@@ -35,6 +35,9 @@
             android:name="com.freescript.SessionListActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name="com.freescript.AboutActivity"
+            android:exported="false" />
     </application>
 
 </manifest>

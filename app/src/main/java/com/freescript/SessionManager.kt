@@ -9,7 +9,9 @@ object SessionManager {
     data class SessionMeta(
         val id: String, val name: String, val lastAccessed: Long,
         val wordCount: Int = 0, val imageCount: Int = 0,
-        val canvasMode: CanvasMode = CanvasMode.VERTICAL
+        val canvasMode: CanvasMode = CanvasMode.VERTICAL,
+        /** Folder path relative to poems/ (empty string = root). */
+        val folder: String = ""
     ) {
         fun formattedDate(): String {
             val cal = java.util.Calendar.getInstance().also { it.timeInMillis = lastAccessed }
@@ -27,6 +29,97 @@ object SessionManager {
 
     fun sessionsDir(filesDir: File): File =
         File(filesDir, "poems").also { it.mkdirs() }
+
+    // ── Folder helpers ────────────────────────────────────────────────────
+
+    /** Recursively yields every {id}.json file under poems/. */
+    private fun walkSessionFiles(root: File): Sequence<File> = sequence {
+        val files = root.listFiles() ?: return@sequence
+        for (f in files) {
+            if (f.isDirectory) yieldAll(walkSessionFiles(f))
+            else if (f.extension == "json") yield(f)
+        }
+    }
+
+    /** Returns the folder path of [file] relative to [poemsDir] (empty = root). */
+    private fun folderOf(file: File, poemsDir: File): String {
+        val parent = file.parentFile ?: return ""
+        val poemsPath = poemsDir.absolutePath
+        val parentPath = parent.absolutePath
+        if (parentPath == poemsPath) return ""
+        return parentPath.removePrefix("$poemsPath/").removePrefix("$poemsPath\\")
+            .replace('\\', '/')
+    }
+
+    /** Find the JSON file for a session id, anywhere under poems/. Null if missing. */
+    fun findSessionFile(filesDir: File, id: String): File? {
+        val poems = sessionsDir(filesDir)
+        if (!poems.exists()) return null
+        return walkSessionFiles(poems).firstOrNull { it.nameWithoutExtension == id }
+    }
+
+    /** All folder paths (relative to poems/), depth-first. Empty list = no folders. */
+    fun listFolders(filesDir: File): List<String> {
+        val poems = sessionsDir(filesDir)
+        val out = mutableListOf<String>()
+        fun walk(dir: File, prefix: String) {
+            val files = dir.listFiles() ?: return
+            for (f in files) {
+                if (!f.isDirectory) continue
+                val name = if (prefix.isEmpty()) f.name else "$prefix/${f.name}"
+                out.add(name)
+                walk(f, name)
+            }
+        }
+        walk(poems, "")
+        return out
+    }
+
+    /** Create an empty folder under poems/. Idempotent. */
+    fun createFolder(filesDir: File, folderPath: String): Boolean {
+        if (folderPath.isBlank()) return false
+        return File(sessionsDir(filesDir), folderPath).mkdirs()
+    }
+
+    /** Delete a folder and every session inside it. */
+    fun deleteFolder(filesDir: File, folderPath: String): Boolean {
+        val dir = File(sessionsDir(filesDir), folderPath)
+        if (!dir.exists() || !dir.isDirectory) return false
+        return dir.deleteRecursively()
+    }
+
+    /** Rename a folder. Fails if the target already exists. Sessions inside follow the
+     *  rename via their directory move, so SessionMeta.folder reflects the new name on
+     *  the next listSessions(). */
+    fun renameFolder(filesDir: File, oldPath: String, newPath: String): Boolean {
+        if (oldPath.isBlank() || newPath.isBlank() || oldPath == newPath) return false
+        val poems = sessionsDir(filesDir)
+        val src = File(poems, oldPath)
+        if (!src.exists() || !src.isDirectory) return false
+        val dst = File(poems, newPath)
+        if (dst.exists()) return false
+        return src.renameTo(dst)
+    }
+
+    /** Move a session to a new folder (empty = root). Returns true on success. */
+    fun moveSession(filesDir: File, id: String, targetFolder: String): Boolean {
+        val src = findSessionFile(filesDir, id) ?: return false
+        val poems = sessionsDir(filesDir)
+        val targetDir = if (targetFolder.isEmpty()) poems
+                        else File(poems, targetFolder).also { it.mkdirs() }
+        val dst = File(targetDir, src.name)
+        if (src.absolutePath == dst.absolutePath) return true
+        return src.renameTo(dst)
+    }
+
+    /** Returns a folder name that doesn't already exist under poems/, based on [baseName]. */
+    fun nextNewFolderName(filesDir: File, baseName: String): String {
+        val existing = listFolders(filesDir).toSet()
+        if (!existing.contains(baseName)) return baseName
+        var i = 2
+        while (existing.contains("$baseName $i")) i++
+        return "$baseName $i"
+    }
 
     private fun countWordsInJson(j: org.json.JSONObject): Int {
         val cols = j.optJSONArray("columnData") ?: return 0
@@ -226,33 +319,51 @@ object SessionManager {
 
     // ── File I/O ───────────────────────────────────────────────────────
 
-    fun listSessions(filesDir: File): List<SessionMeta> =
-        (sessionsDir(filesDir).listFiles { f -> f.extension == "json" } ?: emptyArray())
-            .mapNotNull { file ->
-                try {
-                    val j = org.json.JSONObject(file.readText())
-                    // Use cached counts when present (written by saveSession); fall back to recompute
-                    val cachedWordCount  = j.optInt("wordCount",  -1)
-                    val cachedImageCount = j.optInt("imageCount", -1)
-                    SessionMeta(
-                        id = j.getString("id"),
-                        name = j.getString("name"),
-                        lastAccessed = j.getLong("lastAccessed"),
-                        wordCount  = if (cachedWordCount  >= 0) cachedWordCount  else countWordsInJson(j),
-                        imageCount = if (cachedImageCount >= 0) cachedImageCount else countImagesInJson(j),
-                        canvasMode = try { CanvasMode.valueOf(j.optString("canvasMode", "VERTICAL")) }
-                                     catch (_: Exception) { CanvasMode.VERTICAL }
-                    )
-                } catch (_: Exception) { null }
-            }
-            .sortedByDescending { it.lastAccessed }
+    fun listSessions(filesDir: File): List<SessionMeta> {
+        val poems = sessionsDir(filesDir)
+        return walkSessionFiles(poems).mapNotNull { file ->
+            try {
+                val j = org.json.JSONObject(file.readText())
+                val cachedWordCount  = j.optInt("wordCount",  -1)
+                val cachedImageCount = j.optInt("imageCount", -1)
+                SessionMeta(
+                    id = j.getString("id"),
+                    name = j.getString("name"),
+                    lastAccessed = j.getLong("lastAccessed"),
+                    wordCount  = if (cachedWordCount  >= 0) cachedWordCount  else countWordsInJson(j),
+                    imageCount = if (cachedImageCount >= 0) cachedImageCount else countImagesInJson(j),
+                    canvasMode = try { CanvasMode.valueOf(j.optString("canvasMode", "VERTICAL")) }
+                                 catch (_: Exception) { CanvasMode.VERTICAL },
+                    folder = folderOf(file, poems)
+                )
+            } catch (_: Exception) { null }
+        }.toList().sortedByDescending { it.lastAccessed }
+    }
 
-    fun saveSession(filesDir: File, doc: SessionDocument) {
+    /**
+     * Save a session. When [folder] is null, an existing session is rewritten in place
+     * (keeping its current subdirectory). For new sessions [folder] selects the target
+     * directory ("" = root). Passing a non-null [folder] for an existing session moves
+     * the file to that folder.
+     */
+    fun saveSession(filesDir: File, doc: SessionDocument, folder: String? = null) {
         val normalizedImages = doc.insertedImages.take(MAX_INSERTED_IMAGES)
         val normalizedActiveIndex = doc.activeImageIndex.coerceIn(-1, normalizedImages.lastIndex)
         val activeImage = normalizedImages.getOrNull(normalizedActiveIndex)
         val legacyUri = activeImage?.uri ?: doc.bgImageUri
         val legacyMatrix = activeImage?.matrix ?: doc.bgImageMatrix
+
+        val poems = sessionsDir(filesDir)
+        val existing = findSessionFile(filesDir, doc.id)
+        val resolvedFolder = folder ?: existing?.let { folderOf(it, poems) } ?: ""
+        val targetDir = if (resolvedFolder.isEmpty()) poems
+                        else File(poems, resolvedFolder).also { it.mkdirs() }
+        val targetFile = File(targetDir, "${doc.id}.json")
+        // If the session was previously stored in a different folder, drop the old file
+        // before writing the new one so we don't end up with two copies.
+        if (existing != null && existing.absolutePath != targetFile.absolutePath) {
+            existing.delete()
+        }
 
         val j = org.json.JSONObject().apply {
             put("id", doc.id); put("name", doc.name)
@@ -281,13 +392,12 @@ object SessionManager {
             put("wordCount",  countWordsInJson(this))
             put("imageCount", normalizedImages.size)
         }
-        File(sessionsDir(filesDir), "${doc.id}.json").writeText(j.toString())
+        targetFile.writeText(j.toString())
     }
 
     // Reads session JSON and bumps lastAccessed timestamp on disk. Returns null if missing/corrupt.
     fun loadSession(filesDir: File, id: String): org.json.JSONObject? {
-        val file = File(sessionsDir(filesDir), "$id.json")
-        if (!file.exists()) return null
+        val file = findSessionFile(filesDir, id) ?: return null
         return try {
             val j = org.json.JSONObject(file.readText())
             j.put("lastAccessed", System.currentTimeMillis())
@@ -297,7 +407,7 @@ object SessionManager {
     }
 
     fun deleteSession(filesDir: File, id: String) {
-        File(sessionsDir(filesDir), "$id.json").delete()
+        findSessionFile(filesDir, id)?.delete()
     }
 
     fun nextNewSessionName(filesDir: File, baseName: String): String {
@@ -309,8 +419,7 @@ object SessionManager {
     }
 
     fun renameSession(filesDir: File, id: String, newName: String) {
-        val file = File(sessionsDir(filesDir), "$id.json")
-        if (!file.exists()) return
+        val file = findSessionFile(filesDir, id) ?: return
         try {
             val j = org.json.JSONObject(file.readText())
             j.put("name", newName)

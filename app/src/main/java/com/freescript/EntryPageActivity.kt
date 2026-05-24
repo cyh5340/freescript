@@ -21,7 +21,12 @@ class EntryPageActivity : AppCompatActivity() {
     private lateinit var recentSessionsContainer: LinearLayout
     private lateinit var sessionListLauncher: ActivityResultLauncher<Intent>
 
+    override fun attachBaseContext(base: android.content.Context) {
+        super.attachBaseContext(LocaleHelper.wrap(base))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        LocaleHelper.applyNightMode(this)
         super.onCreate(savedInstanceState)
         supportActionBar?.hide()
 
@@ -116,11 +121,35 @@ class EntryPageActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams(avail, hH))
 
             addView(vGap(gapV))
-            addView(android.widget.ImageView(this@EntryPageActivity).apply {
-                setImageResource(R.drawable.poemeditor_logo)
-                scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+            addView(android.widget.FrameLayout(this@EntryPageActivity).apply {
                 setBackgroundColor(getColor(R.color.surface))
                 layoutParams = LinearLayout.LayoutParams(MP, WC)
+                addView(android.widget.ImageView(this@EntryPageActivity).apply {
+                    setImageResource(R.drawable.poemeditor_logo)
+                    scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                    layoutParams = android.widget.FrameLayout.LayoutParams(MP, WC)
+                })
+                addView(LinearLayout(this@EntryPageActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    layoutParams = android.widget.FrameLayout.LayoutParams(WC, WC,
+                        Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).also {
+                        it.bottomMargin = (20 * dp).roundToInt()
+                    }
+                    addView(android.widget.TextView(this@EntryPageActivity).apply {
+                        text = "2026"
+                        textSize = 10f
+                        setTextColor(getColor(R.color.text_hint))
+                    })
+                    addView(android.widget.TextView(this@EntryPageActivity).apply {
+                        text = "  ⚙"
+                        textSize = 13f
+                        setTextColor(getColor(R.color.text_hint))
+                        setOnClickListener {
+                            startActivity(Intent(this@EntryPageActivity, AboutActivity::class.java))
+                        }
+                    })
+                })
             })
         }
     }
@@ -147,7 +176,11 @@ class EntryPageActivity : AppCompatActivity() {
 
         return LinearLayout(this).apply {
             orientation = if (horizontal) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
-            gravity     = if (horizontal) Gravity.CENTER_VERTICAL else Gravity.CENTER
+            gravity     = when {
+                horizontal -> Gravity.CENTER_VERTICAL
+                mode == CanvasMode.VERTICAL -> Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                else -> Gravity.CENTER
+            }
             background  = cardBg(dp)
             setPadding(pad, pad, pad, pad)
             setOnClickListener { launchMode(mode) }
@@ -172,17 +205,18 @@ class EntryPageActivity : AppCompatActivity() {
                 // Right column = label, left column = description (traditional RTL column order).
                 addView(LinearLayout(this@EntryPageActivity).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
-                    layoutParams = LinearLayout.LayoutParams(MP, WC).also {
+                    gravity = Gravity.CENTER
+                    // weight=1 fills remaining card height after the icon → text never overflows
+                    layoutParams = LinearLayout.LayoutParams(MP, 0, 1f).also {
                         it.topMargin = (6 * dp).roundToInt()
                     }
-                    // desc on the left
+                    // desc on the left — MP height so gravity=CENTER vertically centers the text
                     addView(TextView(this@EntryPageActivity).apply {
                         text = desc.map { it.toString() }.joinToString("\n")
                         textSize = 9f
                         gravity = Gravity.CENTER
                         setTextColor(getColor(R.color.text_hint))
-                        layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                        layoutParams = LinearLayout.LayoutParams(WC, MP).also {
                             it.marginEnd = (8 * dp).roundToInt()
                         }
                     })
@@ -192,7 +226,7 @@ class EntryPageActivity : AppCompatActivity() {
                         textSize = 13f
                         gravity = Gravity.CENTER
                         setTextColor(getColor(R.color.text_dark))
-                        layoutParams = LinearLayout.LayoutParams(WC, WC)
+                        layoutParams = LinearLayout.LayoutParams(WC, MP)
                     })
                 })
             } else {
@@ -303,7 +337,6 @@ class EntryPageActivity : AppCompatActivity() {
         sessionListLauncher.launch(
             Intent(this, SessionListActivity::class.java)
                 .putExtra("current_session_id", "")
-                .putExtra("current_canvas_mode", "VERTICAL")
         )
     }
 

@@ -105,38 +105,40 @@ All resolved or superseded by Phase 5 completion. See Phase 5 below.
 
 ### Phase 6 — `MainActivity` Responsibility Split
 
-`MainActivity` has grown to ~2,800+ lines. Extract cohesive controllers.
+Cohesive controllers have been extracted; `MainActivity` is now a coordinator that implements each controller's `Callbacks` interface and delegates.
 
-**Controller files created** (in `app/src/main/java/com/freescript/`):
+**Controllers wired** (all instantiated and used in `MainActivity`):
 
 | File | Status | Description |
 |---|---|---|
-| `InsertedImageController.kt` | **Skeleton ready** — full `Callbacks` interface + method bodies extracted | Image lifecycle, z-ordering, avatar panel |
-| `SelectionController.kt` | **Skeleton ready** — full `Callbacks` interface + method bodies extracted | Handles, drag, copy/cut/paste, highlight diff |
-| `KeyboardToolbarController.kt` | **Skeleton ready** — full `Callbacks` interface + method bodies extracted | `switchToTools`, `switchToKeyboard`, `hideBottomForOverlay` |
-| `FreestyleController.kt` | **Interface stub** — `Callbacks` defined; method bodies need active-field model first | Touch, box create/activate/deactivate, `showBoxEditor` |
-| `TextInputController.kt` | **Interface stub** — `Callbacks` defined; hot path, move last | `ghostInput` setup, composing preview, typing orchestration |
-| `InputFieldEditController.kt` | **Interface stub** — `Callbacks` defined | `showInputFieldEditor`/`showBoxEditor` coordinate math |
-| `CanvasModeController.kt` | **Interface stub** — `Callbacks` defined | `applyCanvasModeLayout`, `rebuildHorizontalGrid`, `updateModeChipVisibility` |
+| `InsertedImageController.kt` | **Wired** (`imageCtrl`) | Image lifecycle, z-ordering, two-finger pinch/pan, active-image swap |
+| `SelectionController.kt` | **Wired** (`selectionCtrl`) | `isSelecting` state, handles, drag, copy/cut/paste, line/para/all selectors, selection-options popup placement (uses `visualXForCell` so it tracks horizontal word-per-cell layout) |
+| `KeyboardToolbarController.kt` | **Wired** (`keyboardToolbarCtrl`) | `toolsVisible`, IME ⇄ tools-panel mutual exclusion, insets, panel collapse, `hideBottomForOverlay` |
+| `ScrollCoordinator.kt` | **Wired** (`scrollCoordinator`, new — not in earlier plan) | `scrollToColumn`, `scrollToTopIfCursorInUpperView`, debounced `translateForKeyboard` with IME-animation retry |
+| `LiveHorizontalEditorController.kt` | **Wired** (`liveEditorCtrl`, new — not in earlier plan) | Visible `EditText` overlay for HORIZONTAL canvas and FREESTYLE-horizontal boxes; word-per-cell commit, pre-commit visual-X wrap, action-mode "Select All" intercept |
+| `ScreenshotController.kt` | **Wired** (`by lazy`) | Crop view + capture + gallery save |
 
-**`SessionDocument` DTO** added to `EditorStateModels.kt` — replaces the long parameter chain across `MainActivity`/`EditorViewModel`/`SessionRepository`/`SessionManager`.
+**`SessionDocument` DTO** lives in `EditorStateModels.kt` and is the consolidated session-state object used by `MainActivity` / `EditorViewModel` / `SessionRepository` / `SessionManager`.
 
-**Extraction rules:**
+**Files in earlier plan that did not ship:**
+`FreestyleController.kt`, `TextInputController.kt`, `InputFieldEditController.kt`, `CanvasModeController.kt` — extraction deferred. The functionality stayed in `MainActivity` because the freestyle/text-input/canvas-mode paths are tightly coupled to the IME/TextWatcher hot path and to per-frame rendering, and the cost of marshalling state through extra callback interfaces outweighed the readability win.
+
+**Extraction rules (still hold):**
 - Keep `onCreate`, `onStop`, `dispatchTouchEvent` in `MainActivity` (delegate work from them).
 - Keep per-frame rendering inside `PoemCanvasView.kt`.
 - Keep pure grid/text algorithms in `GridLogicHelper.kt`.
 - Use callback interfaces or state DTOs for controllers; avoid per-keystroke / per-frame allocations.
 
-**Remaining wiring steps (require compile verification):**
-
-1. **Wire Priority-1 controllers**: have `MainActivity` implement `InsertedImageController.Callbacks`, `SelectionController.Callbacks`, `KeyboardToolbarController.Callbacks`. Replace existing private method bodies with controller delegation calls.
-2. **Introduce active-field model**: add `InputFieldState` / `EditableFieldRef` to `EditorStateModels.kt`. Migrate VERTICAL/HORIZONTAL to one-field documents.
-3. **Wire `FreestyleController`**: remove `activateFreestyleBox`/`deactivateFreestyleBox` global `columnData` mirroring; replace with active-field reference.
-4. **Wire `InputFieldEditController`** and **`CanvasModeController`**.
-5. **Wire `TextInputController`** last — hot path, requires zero allocations in `afterTextChanged`.
-6. **Wire `SessionDocument` DTO** through all four session layers; replace long parameter chains.
-
 **Do not extract:**
 - `dispatchTouchEvent` itself (keep in `MainActivity`; delegate specific handling).
 - `PoemCanvasView` drawing loops (refactor internally, never move out).
 - Per-cell `EditText` patterns (legacy; do not revive).
+
+### Phase 7 — Cross-cutting (in progress)
+
+- [x] **Folders for sessions** — `SessionManager.{listFolders, createFolder, deleteFolder, renameFolder, moveSession}`; `SessionMeta.folder`; `SessionListActivity` cross-mode browsing with per-row mode chip, folder rename/delete (delete dialog enumerates contents), New Document defaults to the currently drilled-in folder.
+- [x] **Mode chip per session row** — `直 / 橫 / 自` chip rendered in front of every session name; replaces the previous mode-tab filter (sessions of all modes now share one list).
+- [x] **HORIZONTAL visual-width reflow** — `reflowColumnDataHorizontalVisual(newNumRows, cellSize)`: Latin word cells use `Paint.measureText`, CJK/markers/empty take `cellSize`; wraps when cumulative visual-X overflows the line's pixel width.
+- [x] **HORIZONTAL pre-commit wrap fix** — `LiveHorizontalEditorController.maybeWrapToNextLine` measures only the leading Latin run; CJK / mixed-leading skip pre-wrap and rely on per-character cell-count advancement.
+- [x] **About / Locale / Theme** — `AboutActivity` + `LocaleHelper.attachBaseContext`/`applyNightMode`. EntryPage exposes a ⚙ link to About; About has language toggle, dark/light toggle, "2026" + GitHub link.
+- [ ] **HORIZONTAL selection / live-editor conflict** — known issue. `liveHorizontalEditor.customSelectionActionModeCallback` returns `true`, so Android's native selection toolbar can appear before canvas selection takes over. See `.claude/rules/canvas-engine.md` "Text Selection → Known HORIZONTAL gotchas".

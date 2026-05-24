@@ -18,7 +18,6 @@ import android.text.Editable
 import android.text.InputType
 import android.text.Spanned
 import android.text.TextWatcher
-import android.util.Log
 import android.util.TypedValue
 import android.view.*
 import android.view.inputmethod.EditorInfo
@@ -39,7 +38,7 @@ private typealias SessionMeta = SessionManager.SessionMeta
 
 class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     InsertedImageController.Callbacks, SelectionController.Callbacks, KeyboardToolbarController.Callbacks,
-    ScrollCoordinator.Callbacks {
+    ScrollCoordinator.Callbacks, LiveHorizontalEditorController.Callbacks {
 
     // ── Settings ───────────────────────────────────────────────────────
     private var fontSizeSp       = 24f
@@ -51,8 +50,6 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private var wordGapDp        = 0f
     private var inputMode        = InputMode.SEQUENTIAL
     private var canvasMode       = CanvasMode.VERTICAL
-
-    private val latinWordBuffer = LatinWordBuffer()
 
     // ── Widget refs for programmatic sync (session load / new) ─────────
     private var fontSpinnerRef: Spinner? = null
@@ -127,7 +124,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     // ── Grid state ─────────────────────────────────────────────────────
     private lateinit var poemCanvas: PoemCanvasView
     private lateinit var ghostInput: EditText
-    private val GHOST_SENTINEL = "‌"   // zero-width non-joiner; invisible sentinel in ghost EditText
+    // HORIZONTAL canvas + FREESTYLE-horizontal boxes route IME through this controller; it
+    // owns the live EditText overlay and the surrounding word-per-cell commit logic.
+    // VERTICAL and SCATTER modes continue to use ghostInput.
+    private lateinit var liveEditorCtrl: LiveHorizontalEditorController
+    // ASCII space sentinel: keeps ghostInput non-empty so KEYCODE_DEL dispatches via TextWatcher
+    // (Gboard calls deleteSurroundingText on the sentinel when the cell is empty), and gives the
+    // suggestion strip getTextBeforeCursor context (" hello" → Gboard recognises the word).
+    // Empty sentinel was tried in Attempt 13 — it broke both the strip and word-per-cell layout
+    // because Gboard does not enter composing mode just because the field is empty.
+    private val GHOST_SENTINEL = " "
     private var numRows     = 0
     private var numColumns  = 0
     private var isRestoring  = false
@@ -167,10 +173,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private var handlePasteView: TextView? = null  // mini bubble shown on handle tap (no drag)
 
     // ── Selection drag cache (populated once on ACTION_DOWN) ───────────
-    private val cachedGridLoc  = IntArray(2)
     private val cachedRootLoc  = IntArray(2)
     private var cachedCellSize = 0
-    private var cachedGridW    = 0
     // Vsync batching: latest drag hit index, consumed inside postOnAnimation
     private var pendingDragHit = -1
     private var isFrameScheduled = false
@@ -247,7 +251,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         saveState()
     }
 
-    private fun advanceToNextCell(index: Int, total: Int) {
+    override fun advanceToNextCell(index: Int, total: Int) {
         val nr = numRows.coerceAtLeast(1)
         val nextIdx = (index + 1).coerceAtMost(total - 1)
         val prevCol = index / nr
@@ -282,11 +286,21 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         poemCanvas.setCursor(index)
         scrollToTopIfCursorInUpperView(index)
         poemCanvas.startCursorBlink()
-        ghostInput.requestFocus()
+        // In HORIZONTAL mode, route the IME to the visible live editor overlaid on the
+        // focused cell — Gboard composes / autocorrects natively for it. In VERTICAL and
+        // SCATTER modes, fall back to ghostInput.
+        val target: EditText = if (liveEditorActive && ::liveEditorCtrl.isInitialized) {
+            liveEditorCtrl.updatePosition()
+            liveEditorCtrl.editor
+        } else {
+            if (::liveEditorCtrl.isInitialized) liveEditorCtrl.editor.visibility = View.GONE
+            ghostInput
+        }
+        target.requestFocus()
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         if (showKeyboard) {
-            imm.showSoftInput(ghostInput, InputMethodManager.SHOW_IMPLICIT)
-            ghostInput.postDelayed({ imm.restartInput(ghostInput) }, 100)
+            imm.restartInput(target)
+            imm.showSoftInput(target, InputMethodManager.SHOW_IMPLICIT)
         }
         scheduleTranslateForKeyboard()
     }
@@ -451,7 +465,12 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         return super.dispatchTouchEvent(ev)
     }
 
+    override fun attachBaseContext(base: android.content.Context) {
+        super.attachBaseContext(LocaleHelper.wrap(base))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        LocaleHelper.applyNightMode(this)
         super.onCreate(savedInstanceState)
         val dp = resources.displayMetrics.density
 
@@ -515,10 +534,19 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         // ── Canvas + ghost input ────────────────────────────────────────
         poemCanvas = PoemCanvasView(this)
         ghostInput = EditText(this).apply {
-            layoutParams = FrameLayout.LayoutParams(1, 1)
-            alpha = 0f
+            // Full-width, 48dp-tall field so Gboard/Samsung Keyboard treats it as a real
+            // interactive target and enables the suggestion/autocomplete strip. alpha=0 and 1×1px
+            // both cause modern IME accessibility layers to classify the view as a hidden utility
+            // field and suppress dictionary predictions. Text/hint are Color.TRANSPARENT so the
+            // field is visually invisible while remaining fully "visible" to the IME layer.
+            // isClickable=false + touch listener returning false ensures the field never consumes
+            // touch events destined for the canvas or toolbar below it in the view hierarchy.
+            layoutParams = FrameLayout.LayoutParams(MP, (48 * dp).toInt())
+            setTextColor(android.graphics.Color.TRANSPARENT)
+            setHintTextColor(android.graphics.Color.TRANSPARENT)
             background = null
             isCursorVisible = false
+            isClickable = false
             inputType = InputType.TYPE_CLASS_TEXT or
                     InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                     InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -528,6 +556,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             isFocusableInTouchMode = true
             showSoftInputOnFocus = false  // keyboard only appears via explicit ⌨ toggle
         }
+        ghostInput.setOnTouchListener { _, _ -> false }  // pass all touches through to canvas/toolbar
 
         hScroll = HorizontalScrollView(this).apply {
             isFillViewport = true
@@ -540,9 +569,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         hScroll?.setOnScrollChangeListener { _, _, _, _, _ ->
             if (selectionCtrl.isSelecting) selectionCtrl.repositionHandles()
             viewFactory.updateScrollIndicator()
+            if (liveEditorActive && ::liveEditorCtrl.isInitialized) liveEditorCtrl.updatePosition()
         }
         mainScrollView.setOnScrollChangeListener(NestedScrollView.OnScrollChangeListener { _, _, _, _, _ ->
             if (canvasMode == CanvasMode.HORIZONTAL) viewFactory.updateScrollIndicator()
+            if (liveEditorActive && ::liveEditorCtrl.isInitialized) liveEditorCtrl.updatePosition()
         })
         gridContainer.addView(hScroll)
 
@@ -579,9 +610,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         endHandle   = viewFactory.buildSelectionHandle(dp0).also { rootFrame.addView(it) }
         selectionOptionsView = viewFactory.buildSelectionOptionsView(dp0).also { rootFrame.addView(it) }
         handlePasteView = viewFactory.buildHandlePasteView(dp0).also { rootFrame.addView(it) }
-        rootFrame.addView(ghostInput)
+        rootFrame.addView(ghostInput)  // z-top: IME requires the target not be occluded; isClickable=false prevents touch interception
         setupGhostInput()
         setupCanvasTouchListener()
+
+        // Live horizontal editor: the visible EditText that overlays the focused cell in
+        // HORIZONTAL canvas mode and FREESTYLE-horizontal boxes. Its lifecycle, listeners,
+        // and word-per-cell commit logic live in LiveHorizontalEditorController.
+        liveEditorCtrl = LiveHorizontalEditorController(this, this)
+        liveEditorCtrl.attach(rootFrame)
+        liveEditorCtrl.setupListeners()
         imageCtrl.syncActiveImageFromList()
 
         // Track keyboard height and manage scroll padding in sync with IME state.
@@ -671,9 +709,6 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                                     val fontPx = TypedValue.applyDimension(
                                         TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
                                     val gapPx = wordGapDp * resources.displayMetrics.density
-                                    val charSize = Paint().apply { textSize = fontPx; typeface = selectedTypeface }
-                                        .measureText("測").roundToInt().coerceAtLeast(1)
-                                    currentCellSize = (charSize + gapPx.roundToInt()).coerceAtLeast(1)
                                     val minW = mainScrollView.width
                                     val minH = mainScrollView.height.coerceAtLeast(1)
                                     poemCanvas.freestyleMinW = minW
@@ -683,6 +718,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                                         fontPx = fontPx, gapPx = gapPx,
                                         textColor = gridTextColor, typeface = selectedTypeface
                                     )
+                                    // Mirror PoemCanvasView's computed cellSize so the create/resize
+                                    // drag math agrees with the rendered cell grid (was differing by
+                                    // up to 1px because MainActivity rounded and the renderer floored).
+                                    currentCellSize = poemCanvas.cellSizePx.coerceAtLeast(1)
                                     numRows = 10; numColumns = 20
                                     poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
                                 }
@@ -697,6 +736,29 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
 
     private fun insertPunct(punct: String) {
         pushHistory()
+        // Live editor hybrid: when the live editor is active (HORIZONTAL canvas or a
+        // FREESTYLE-horizontal box), punctuation must be routed through the editor / cell
+        // model rather than via direct setColumnChar on a cell that the EditText is overlaying.
+        if (liveEditorActive && ::liveEditorCtrl.isInitialized) {
+            val current = liveEditorCtrl.getPendingText()
+            // If there's an in-progress word, commit it first as a synthetic space-terminated
+            // word so the punct ends up in a dedicated cell rather than glommed onto the word.
+            if (current.isNotEmpty()) {
+                liveEditorCtrl.commitWord("$current ", current.length)
+            }
+            val idx = focusedCellIndex.coerceAtLeast(0)
+            val nr = numRows.coerceAtLeast(1)
+            val cellCol = idx / nr
+            val cellRow = idx % nr
+            setColumnChar(cellCol, cellRow, punct)
+            poemCanvas.refreshContent(columnData)
+            // FREESTYLE intentionally uses MAX_COLUMNS not numColumns so the cursor (and the
+            // content it carries) can advance past the visible box bounds. Overflow cells are
+            // preserved by resizeBoxData; the user resizes the box later to see them.
+            advanceToNextCell(idx, MAX_COLUMNS * nr)
+            liveEditorCtrl.updatePosition()
+            return
+        }
         val idx = focusedCellIndex.coerceAtLeast(0)
         val nr = numRows.coerceAtLeast(1)
         val cellCol = idx / nr
@@ -720,6 +782,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private fun applyBackground(color: Int) {
         bgColor = color
         rootFrame.setBackgroundColor(color)
+        if (::liveEditorCtrl.isInitialized) liveEditorCtrl.applyColors(color, gridTextColor)
         viewFactory.syncColorSelectionUI()
         persistCurrentState()
     }
@@ -730,6 +793,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private fun applyTextColor(color: Int) {
         gridTextColor = color
         if (::poemCanvas.isInitialized) poemCanvas.updateTextColor(color)
+        if (::liveEditorCtrl.isInitialized) liveEditorCtrl.applyColors(bgColor, color)
         viewFactory.syncColorSelectionUI()
     }
 
@@ -753,8 +817,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         val iRow  = insertIdx % numRows
         val chars = raw.replace("\r\n", "\n").replace("\r", "\n").filter { it != '\n' }
         if (chars.isEmpty()) return
-        pasteCharsAt(iCol, iRow, chars)
-        val focusTarget = (iCol * numRows + iRow + chars.length).coerceAtMost((MAX_COLUMNS * numRows - 1).coerceAtLeast(0))
+        val cellsWritten = pasteCharsAt(iCol, iRow, chars)
+        val pasteSpan = if (liveEditorActive) cellsWritten else chars.length
+        val focusTarget = (iCol * numRows + iRow + pasteSpan).coerceAtMost((MAX_COLUMNS * numRows - 1).coerceAtLeast(0))
         postRefreshFocusColumn(focusTarget)
         Toast.makeText(this, getString(R.string.toast_pasted), Toast.LENGTH_SHORT).show()
     }
@@ -769,18 +834,30 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         val iRow  = insertIdx % numRows
         val chars = raw.replace("\r\n", "\n").replace("\r", "\n").filter { it != '\n' }
         if (chars.isEmpty()) return
-        pasteCharsAt(iCol, iRow, chars)
-        val focusTarget = (iCol * numRows + iRow + chars.length).coerceAtMost((MAX_COLUMNS * numRows - 1).coerceAtLeast(0))
+        val cellsWritten = pasteCharsAt(iCol, iRow, chars)
+        val pasteSpan = if (liveEditorActive) cellsWritten else chars.length
+        val focusTarget = (iCol * numRows + iRow + pasteSpan).coerceAtMost((MAX_COLUMNS * numRows - 1).coerceAtLeast(0))
         postRefreshFocusColumn(focusTarget)
         Toast.makeText(this, getString(R.string.toast_pasted), Toast.LENGTH_SHORT).show()
     }
 
-    private fun pasteCharsAt(iCol: Int, iRow: Int, chars: String) {
+    /** Returns the number of cells consumed by the paste. */
+    private fun pasteCharsAt(iCol: Int, iRow: Int, chars: String): Int {
+        // Horizontal hybrid: cells store word-per-cell, so the clipboard text (which is
+        // already space-delimited from copy's cell-concatenation) must be tokenized into
+        // word + space cells when pasted. Char-per-cell would overflow the line / drop chars.
+        if (liveEditorActive) {
+            return pasteCharsAtHorizontal(iCol, iRow, chars)
+        }
+        // Vertical / SCATTER modes use char-per-cell and don't have a notion of tab cells in
+        // the clipboard encoding; strip stray \t so we never write literal tab characters.
+        val sanitized = chars.replace("\t", "")
+        if (sanitized.isEmpty()) return 0
         val originalChar = columnData.getOrNull(iCol)?.getOrNull(iRow) ?: ""
         if (inputMode == InputMode.SCATTER && originalChar.isBlank()) {
             withRestoring {
                 var wc = iCol; var wr = iRow
-                for (ch in chars) {
+                for (ch in sanitized) {
                     if (wc >= MAX_COLUMNS) break
                     if (wc > iCol && columnBreaks.contains(wc)) break
                     setColumnChar(wc, wr, ch.toString())
@@ -788,8 +865,58 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 }
             }
         } else {
-            insertCharsAt(iCol, iRow, chars)
+            insertCharsAt(iCol, iRow, sanitized)
         }
+        return sanitized.length
+    }
+
+    /**
+     * Horizontal paste: tokenize the input into letter-or-apostrophe runs (words) and any
+     * other characters (boundaries — spaces, punctuation, digits, CJK). Each token lands
+     * in its own cell. Matches the live editor's commit tokenization so a typed string and
+     * a pasted string produce the same cell layout.
+     */
+    private fun pasteCharsAtHorizontal(iCol: Int, iRow: Int, chars: String): Int {
+        val nr = numRows.coerceAtLeast(1)
+        // Allow paste to overflow the visible box in FREESTYLE — surplus cells stay in
+        // storage and reappear on resize. For HORIZONTAL canvas, numColumns is already
+        // >= MAX_COLUMNS, so maxOf is a no-op there.
+        val maxCols = maxOf(numColumns, MAX_COLUMNS).coerceAtLeast(1)
+        var wc = iCol; var wr = iRow
+        var cells = 0
+        fun advance(): Boolean {
+            wr++
+            if (wr >= nr) { wr = 0; wc++ }
+            return wc < maxCols
+        }
+        fun isWordChar(c: Char) = c in 'a'..'z' || c in 'A'..'Z' || c == '\''
+        withRestoring {
+            var i = 0
+            while (i < chars.length) {
+                if (wc >= maxCols) break
+                val ch = chars[i]
+                if (ch == '\t') {
+                    // Tab in clipboard text = empty cell (copy preserved a leading/internal
+                    // gap). Advance without writing so the cell stays empty.
+                    cells++
+                    if (!advance()) break
+                    i++
+                } else if (!isWordChar(ch)) {
+                    setColumnChar(wc, wr, ch.toString())
+                    cells++
+                    if (!advance()) break
+                    i++
+                } else {
+                    val start = i
+                    while (i < chars.length && isWordChar(chars[i])) i++
+                    val word = chars.substring(start, i)
+                    setColumnChar(wc, wr, word)
+                    cells++
+                    if (!advance()) break
+                }
+            }
+        }
+        return cells
     }
 
     private fun selectEntireLine()      = selectionCtrl.selectEntireLine()
@@ -798,6 +925,64 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     // ── Reflow ─────────────────────────────────────────────────────────
     private fun reflowColumnData(newNumRows: Int) =
         GridLogicHelper.reflowColumnData(columnData, columnBreaks, newNumRows)
+
+    /**
+     * Visual-width-aware reflow for HORIZONTAL mode. Distributes cells across lines using
+     * each cell's actual rendered width (measureText for Latin word cells, cellSize for
+     * CJK / empty / markers). Wraps to the next line when the cumulative visual-X plus
+     * the next cell's measureText would exceed linePixelWidth (= newNumRows * cellSize).
+     * GridLogicHelper.reflowColumnData wraps purely by cell-count, which lets Latin word
+     * cells overflow the canvas's right edge.
+     */
+    private fun reflowColumnDataHorizontalVisual(newNumRows: Int, cellSize: Int) {
+        if (newNumRows <= 0 || cellSize <= 0) return
+        val linePixelWidth = newNumRows * cellSize
+        val paint = Paint().apply {
+            textSize = TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics
+            )
+            typeface = selectedTypeface
+        }
+
+        // 1. Flatten existing content into a stream (null = explicit column break).
+        val maxCol = maxOf(columnData.size, columnBreaks.maxOrNull()?.plus(1) ?: 0)
+        val stream = mutableListOf<String?>()
+        for (col in 0 until maxCol) {
+            if (col > 0 && columnBreaks.contains(col)) stream.add(null)
+            val colData = columnData.getOrNull(col) ?: continue
+            val lastNonEmpty = colData.indexOfLast { it.isNotEmpty() }
+            if (lastNonEmpty < 0) continue
+            for (row in 0..lastNonEmpty) stream.add(colData[row])
+        }
+
+        // 2. Reset and re-place with visual-width wrapping.
+        columnData.clear(); columnBreaks.clear()
+        var col = 0
+        var row = 0
+        var visualX = 0f
+        for (item in stream) {
+            if (item == null) {
+                col++; row = 0; visualX = 0f
+                columnBreaks.add(col)
+                continue
+            }
+            val cellWidth = when {
+                item.isEmpty() || item == FRONTIER_MARKER || item == LINE_END_MARKER ->
+                    cellSize.toFloat()
+                item[0].code in 1..127 -> paint.measureText(item)
+                else -> cellSize.toFloat()
+            }
+            // Wrap when (a) the row count is exhausted OR (b) placing this cell would
+            // push the cumulative visual-X past the line's pixel width. The (row > 0)
+            // guard prevents an infinite empty-line cascade for words wider than the line.
+            if (row >= newNumRows || (row > 0 && visualX + cellWidth > linePixelWidth)) {
+                col++; row = 0; visualX = 0f
+            }
+            GridLogicHelper.setColumnChar(columnData, col, row, item)
+            row++
+            visualX += cellWidth
+        }
+    }
 
     private fun squeezeScatterOutOfRange(newNumRows: Int) =
         GridLogicHelper.squeezeScatterOutOfRange(columnData, newNumRows)
@@ -827,6 +1012,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private fun performInsert(newChars: String): Int? {
         if (newChars.isEmpty()) return null
         val nr = numRows.coerceAtLeast(1)
+        // Use MAX_COLUMNS as the storage ceiling for all modes. In FREESTYLE the cursor /
+        // shifted content may end up past box.colCount; those cells are preserved by
+        // resizeBoxData and reappear when the user enlarges the box.
         val total = (MAX_COLUMNS * numRows).takeIf { it > 0 } ?: return null
         val iCol = focusedCellIndex / nr
         val iRow = focusedCellIndex % nr
@@ -864,8 +1052,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     // Enter key: place ↵ at cursor, move the tail to a new structural column, and jump there.
     // SEQUENTIAL uses a structural column insert so subsequent paragraphs shift right.
     // SCATTER writes ↵ in place and adds a column break without structural shift.
-    private fun handleEnter() {
+    override fun handleEnter() {
         val nr = numRows.coerceAtLeast(1)
+        val totalCells = MAX_COLUMNS * nr
         val iCol = focusedCellIndex / nr
         val iRow = focusedCellIndex % nr
         val nextCol = (iCol + 1).coerceAtMost(MAX_COLUMNS - 1)
@@ -1089,6 +1278,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         persistCurrentState()
     }
 
+
     private fun saveState() {
         imageCtrl.updateActiveImageRuntimeState()
         val matVals = getBgImageMatrixValues()
@@ -1146,6 +1336,18 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             ghostInput.setSelection(GHOST_SENTINEL.length)
         }
     }
+
+    // ── Live editor helpers ──────────────────────────────────────────────────
+
+    /**
+     * True when the hybrid live EditText should be active (visible + receiving IME) —
+     * either the full HORIZONTAL canvas, or a FREESTYLE text box with isHorizontal=true.
+     * In both cases Gboard composes / autocorrects natively for the visible field.
+     */
+    private val liveEditorActive: Boolean
+        get() = canvasMode == CanvasMode.HORIZONTAL ||
+                (canvasMode == CanvasMode.FREESTYLE &&
+                 textBoxes.find { it.id == activeTextBoxId }?.isHorizontal == true)
 
     private fun setupGhostInput() {
         resetGhostSentinel()
@@ -1205,6 +1407,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
 
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                 if (isRestoring || isPreviewing) return
+                if (liveEditorActive) return
                 val full = s?.toString() ?: return
                 val raw = if (full.startsWith(GHOST_SENTINEL)) full.drop(GHOST_SENTINEL.length) else full
                 val composing = s is Spanned && s.getSpans(0, s.length, Any::class.java)
@@ -1215,7 +1418,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
 
             override fun afterTextChanged(editable: Editable?) {
                 if (isRestoring || isPreviewing) return
+                // VERTICAL / SCATTER / FREESTYLE-vertical only — HORIZONTAL canvas and FREESTYLE
+                // horizontal boxes route IME through liveHorizontalEditor, where Gboard composes
+                // and autocorrects natively. Anything arriving in ghostInput while liveEditorActive
+                // is stale and must not be processed.
+                if (liveEditorActive) return
                 val nr = numRows.coerceAtLeast(1)
+                // MAX_COLUMNS * nr is the universal storage ceiling. In FREESTYLE the cursor
+                // is allowed to advance past the box's visible colCount; the overflow cells
+                // are preserved by resizeBoxData, and the user can enlarge the box later to
+                // see them rather than having further typing silently blocked.
                 val totalCells = MAX_COLUMNS * nr
                 if (totalCells <= 0) return
 
@@ -1233,68 +1445,16 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 val cellRow = index % nr
                 val originalChar = columnData.getOrNull(cellCol)?.getOrNull(cellRow) ?: ""
 
-                // ── HORIZONTAL mode: buffer Latin chars into whole words ───────
-                if (canvasMode == CanvasMode.HORIZONTAL && !text.contains('\n')) {
-                    latinWordBuffer.resetIfCellChanged(index)
-                    val cellFree = latinWordBuffer.isActive ||
-                                   originalChar.isBlank() || originalChar == FRONTIER_MARKER
-                    when {
-                        raw.isEmpty() && latinWordBuffer.isActive -> {
-                            val remaining = latinWordBuffer.backspace()
-                            resetGhostSentinel()
-                            setColumnChar(cellCol, cellRow, remaining ?: "")
-                            poemCanvas.refreshContent(columnData)
-                            return
-                        }
-                        text == " " -> {
-                            latinWordBuffer.clear()
-                            maybePushHistoryForTyping()
-                            resetGhostSentinel()
-                            advanceToNextCell(index, totalCells)
-                            return
-                        }
-                        text.length > 1 && text.all { GridLogicHelper.isLatinWordChar(it) } && cellFree -> {
-                            latinWordBuffer.clear()
-                            maybePushHistoryForTyping()
-                            setColumnChar(cellCol, cellRow, text)
-                            poemCanvas.refreshContent(columnData)
-                            resetGhostSentinel()
-                            advanceToNextCell(index, totalCells)
-                            return
-                        }
-                        text.length == 1 && GridLogicHelper.isLatinWordChar(text[0]) && cellFree -> {
-                            val word = latinWordBuffer.append(text[0], index)
-                            maybePushHistoryForTyping()
-                            setColumnChar(cellCol, cellRow, word)
-                            poemCanvas.refreshContent(columnData)
-                            resetGhostSentinel()
-                            return
-                        }
-                        latinWordBuffer.isActive -> {
-                            // Non-Latin after buffering: word done, write new char to next cell
-                            latinWordBuffer.clear()
-                            val nextIdx = (index + 1).coerceAtMost(totalCells - 1)
-                            val nCol = nextIdx / nr; val nRow = nextIdx % nr
-                            maybePushHistoryForTyping()
-                            setColumnChar(nCol, nRow, text)
-                            poemCanvas.refreshContent(columnData)
-                            resetGhostSentinel()
-                            val finalIdx = (nextIdx + 1).coerceAtMost(totalCells - 1)
-                            focusedCellIndex = finalIdx
-                            poemCanvas.setCursor(focusedCellIndex)
-                            scrollToColumn(finalIdx / nr)
-                            return
-                        }
-                    }
-                }
-                // ── end HORIZONTAL Latin buffering ────────────────────────────
-
                 if (raw.isEmpty()) {
                     // Sentinel deleted → backspace
                     pushHistoryBreakingBurst()
                     resetGhostSentinel()
+                    if (cellRow == 0 && cellCol > 0 && inputMode != InputMode.SCATTER
+                            && columnBreaks.contains(cellCol)) {
+                        removeColumnBreak(cellCol)
+                        return
+                    }
                     if (originalChar == LINE_END_MARKER && columnBreaks.contains(cellCol + 1)) {
-                        // Backspace on ↵ removes the column break, same as DEL at row-0 of break col.
                         removeColumnBreak(cellCol + 1)
                         return
                     }
@@ -1337,7 +1497,6 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 if (text.length > 1 || text.contains('\n')) {
                     pushHistoryBreakingBurst()
 
-                    // Multi-char paste
                     var pCol = cellCol; var pRow = cellRow; var charIdx = 0
                     columnBreaks.filter { it >= cellCol }.forEach { columnBreaks.remove(it) }
                     while (charIdx < text.length && text[charIdx] == '\n') {
@@ -1346,6 +1505,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                     }
                     var lastWrittenIdx = (pCol * nr + pRow).coerceAtMost(totalCells - 1)
                     if (charIdx < text.length) {
+                        // SCATTER cells are pinned to their on-screen positions, so paste
+                        // can't expand the canvas. Other modes use MAX_COLUMNS as the
+                        // storage ceiling — including FREESTYLE, where overflow cells
+                        // are preserved and become visible again on box resize.
                         val maxCol = if (inputMode == InputMode.SCATTER && nr > 0)
                             numColumns - 1
                         else MAX_COLUMNS - 1
@@ -1490,7 +1653,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             }
 
             MotionEvent.ACTION_MOVE -> {
-                val cs = currentCellSize.coerceAtLeast(1)
+                // Use the renderer's own cellSizePx so the math agrees exactly with the drawn
+                // cell grid. currentCellSize was computed in MainActivity with roundToInt while
+                // PoemCanvasView floors with toInt, which produced 1px-per-cell drift between
+                // the box's logical row count and its drawn height.
+                val cs = poemCanvas.cellSizePx.coerceAtLeast(1)
                 val canvasW = poemCanvas.width.coerceAtLeast(1)
                 val canvasH = poemCanvas.height.coerceAtLeast(1)
 
@@ -1500,8 +1667,12 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                     val dy = (y - freestyleCreateOriginY).coerceAtLeast(0f)
                     val maxCols = ((canvasW - freestyleCreateOriginX) / cs).toInt().coerceAtLeast(2)
                     val maxRows = ((canvasH - freestyleCreateOriginY) / cs).toInt().coerceAtLeast(2)
-                    val newCols = (dx / cs).roundToInt().coerceIn(2, maxCols)
-                    val newRows = (dy / cs).roundToInt().coerceIn(2, maxRows)
+                    // Floor: rowCount is the number of cells that fully fit inside the drag
+                    // rectangle. roundToInt rounded half-cells up, so a drag of 2.5 cells
+                    // produced a 3-cell box that visually exceeded the drag by ~half a cell —
+                    // perceived as "the input area exceeds one char".
+                    val newCols = (dx / cs).toInt().coerceIn(2, maxCols)
+                    val newRows = (dy / cs).toInt().coerceIn(2, maxRows)
                     if (newCols != creatingBox.colCount || newRows != creatingBox.rowCount) {
                         creatingBox.leftPx = freestyleCreateOriginX
                         creatingBox.topPx = freestyleCreateOriginY
@@ -1523,8 +1694,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                     val dy = y - freestyleResizeOriginY
                     val maxCols = ((canvasW - resizingBox.leftPx) / cs).toInt().coerceAtLeast(2)
                     val maxRows = ((canvasH - resizingBox.topPx) / cs).toInt().coerceAtLeast(2)
-                    val newCols = (freestyleResizeOrigCols + dx / cs).roundToInt().coerceIn(2, maxCols)
-                    val newRows = (freestyleResizeOrigRows + dy / cs).roundToInt().coerceIn(2, maxRows)
+                    // Same floor rule as the create path so resize doesn't overshoot the drag.
+                    val newCols = (freestyleResizeOrigCols + dx / cs).toInt().coerceIn(2, maxCols)
+                    val newRows = (freestyleResizeOrigRows + dy / cs).toInt().coerceIn(2, maxRows)
                     if (newCols != resizingBox.colCount || newRows != resizingBox.rowCount) {
                         resizingBox.colCount = newCols
                         resizingBox.rowCount = newRows
@@ -1607,6 +1779,21 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                             null -> {
                                 val cellIdx = poemCanvas.cellIndexAtTouch(x, y)
                                 if (cellIdx >= 0) {
+                                    // Double-tap → canvas selection mode (same UX as VERTICAL/
+                                    // HORIZONTAL). Without this, FREESTYLE boxes couldn't enter
+                                    // grey-handle selection from a canvas tap.
+                                    val now = System.currentTimeMillis()
+                                    if (!selectionCtrl.isSelecting &&
+                                        lastCanvasTapIndex == cellIdx &&
+                                        now - lastCanvasTapTime < 300L) {
+                                        lastCanvasTapTime = 0L; lastCanvasTapIndex = -1
+                                        selectionCtrl.enterSelectionMode(cellIdx)
+                                        return
+                                    }
+                                    if (selectionCtrl.isSelecting) {
+                                        selectionCtrl.clearSelection()
+                                    }
+                                    lastCanvasTapTime = now; lastCanvasTapIndex = cellIdx
                                     if (inputMode == InputMode.SEQUENTIAL) {
                                         val nr = numRows.coerceAtLeast(1)
                                         val cellChar = columnData.getOrNull(cellIdx / nr)?.getOrNull(cellIdx % nr) ?: ""
@@ -2063,7 +2250,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         )
     }
 
-    private fun pushHistory() {
+    override fun pushHistory() {
         editorViewModel.snapshotForUndo(snapshotState())
         updateUndoRedoButtons()
     }
@@ -2073,7 +2260,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     // Structural operations (delete, paste, Enter, insert-shift) call
     // pushHistoryBreakingBurst() instead, which always pushes and resets the burst so
     // the next typing run starts a fresh undo entry.
-    private fun maybePushHistoryForTyping() {
+    override fun maybePushHistoryForTyping() {
         if (!historyBurstActive) {
             pushHistory()
             historyBurstActive = true
@@ -2083,7 +2270,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             .also { historyBurstHandler.postDelayed(it, 1_000L) }
     }
 
-    private fun pushHistoryBreakingBurst() {
+    override fun pushHistoryBreakingBurst() {
         historyBurstActive = false
         historyBurstReset?.let { historyBurstHandler.removeCallbacks(it) }
         historyBurstReset = null
@@ -2273,6 +2460,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private fun loadSessionFile(id: String) {
         if (id == currentSessionId) return
         saveSession()
+        // Reset transient IME-bridge state so the incoming session doesn't inherit any
+        // in-progress composing text from the prior session.
+        if (::ghostInput.isInitialized) resetGhostSentinel()
+        if (::liveEditorCtrl.isInitialized) liveEditorCtrl.clearText()
         val j = editorViewModel.loadSessionJson(id) ?: return
         applyLoadedSession(SessionManager.parseSessionJson(j))
         if (mainScrollView.height > 0) {
@@ -2289,15 +2480,15 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         } else if (canvasMode == CanvasMode.FREESTYLE) {
             val fontPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, resources.displayMetrics)
             val gapPx = wordGapDp * resources.displayMetrics.density
-            val charSize = Paint().apply { textSize = fontPx; typeface = selectedTypeface }
-                .measureText("測").roundToInt().coerceAtLeast(1)
-            currentCellSize = (charSize + gapPx.roundToInt()).coerceAtLeast(1)
             if (::poemCanvas.isInitialized) {
                 val minW = mainScrollView.width.takeIf { it > 0 } ?: poemCanvas.freestyleMinW
                 val minH = mainScrollView.height.takeIf { it > 0 } ?: poemCanvas.freestyleMinH
                 poemCanvas.freestyleMinW = minW
                 poemCanvas.freestyleMinH = minH
                 poemCanvas.updateData(emptyList(), 10, 20, fontPx, gapPx, gridTextColor, selectedTypeface)
+                // Read cellSize back from the renderer so create/resize drag math uses the
+                // exact same value the canvas is rendering with.
+                currentCellSize = poemCanvas.cellSizePx.coerceAtLeast(1)
                 numRows = 10; numColumns = 20
                 poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
             }
@@ -2347,6 +2538,47 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         modeInputSectionRef?.visibility = if (showInput) View.VISIBLE else View.GONE
     }
 
+    /**
+     * Switches ghostInput's inputType and imeOptions to match the active canvas mode.
+     *
+     * ghostInput is now only the IME target for VERTICAL / SCATTER / FREESTYLE-vertical;
+     * HORIZONTAL canvas and FREESTYLE-horizontal boxes route input through liveHorizontalEditor.
+     * So ghostInput always uses NO_SUGGESTIONS + IME_ACTION_NONE — vertical character-by-character
+     * input has no meaningful word context for the IME. We also disable ghostInput entirely
+     * when the live editor is the IME target so a stray tap on the 48dp-tall invisible
+     * ghostInput strip at the top of rootFrame can't steal focus from the live editor
+     * (which would make typed characters vanish into a hidden field).
+     */
+    private fun updateGhostInputForCanvasMode() {
+        if (!::ghostInput.isInitialized) return
+        val live = liveEditorActive
+        val targetVis  = if (live) View.GONE else View.VISIBLE
+        val targetFocusable = !live
+        if (ghostInput.visibility != targetVis) ghostInput.visibility = targetVis
+        if (ghostInput.isFocusable != targetFocusable) {
+            ghostInput.isFocusable = targetFocusable
+            ghostInput.isFocusableInTouchMode = targetFocusable
+        }
+        val newType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        val newOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+        val newPrivate = "nm"
+        val typeChanged    = ghostInput.inputType != newType
+        val optionsChanged = ghostInput.imeOptions != newOptions
+        val privateChanged = ghostInput.privateImeOptions != newPrivate
+        if (!typeChanged && !optionsChanged && !privateChanged) return
+        withRestoring {
+            if (typeChanged)    ghostInput.inputType         = newType
+            if (optionsChanged) ghostInput.imeOptions        = newOptions
+            if (privateChanged) ghostInput.privateImeOptions = newPrivate
+        }
+        if (imeIsVisible) {
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.restartInput(ghostInput)
+        }
+    }
+
     private fun applyCanvasModeLayout() {
         when (canvasMode) {
             CanvasMode.HORIZONTAL -> {
@@ -2390,6 +2622,13 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
                 viewFactory.boxFillColorRow?.visibility = View.GONE
             }
         }
+        updateGhostInputForCanvasMode()
+        // Reset the live editor on any canvas-mode change so it never holds stale content.
+        // For HORIZONTAL the editor is shown by the next focusCell call; for FREESTYLE the
+        // editor is shown when a horizontal box is activated. For VERTICAL it stays hidden.
+        if (::liveEditorCtrl.isInitialized) {
+            if (liveEditorActive) liveEditorCtrl.clearText() else liveEditorCtrl.clearAndHide()
+        }
     }
 
     private fun rebuildHorizontalGrid(isInitialBoot: Boolean = false) {
@@ -2403,11 +2642,29 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             .measureText("測").roundToInt().coerceAtLeast(1)
         val cellSize = (charSize + gapPx.roundToInt()).coerceAtLeast(1)
 
+        // Ensure a one-cell-height visual gap above the first line. Without this the first
+        // line of typing renders flush against the canvas top, where the selection options
+        // popup has no headroom and the caret feels clipped to the screen border.
+        if (gridPaddingTopPx < cellSize) {
+            gridPaddingTopPx = cellSize
+            gridContainer.setPadding(
+                gridPaddingLeftPx, gridPaddingTopPx,
+                gridPaddingRightPx, gridPaddingBottomPx
+            )
+            if (mainScrollView.height > 0) {
+                stableMaxHeight = (mainScrollView.height - gridPaddingTopPx - gridPaddingBottomPx)
+                    .coerceAtLeast(1)
+            }
+        }
+
         // numRows = chars per line (horizontal), numColumns = line count (grows vertically)
         val newNumRows = (availW / cellSize).coerceAtLeast(1)
 
         if (inputMode != InputMode.SCATTER && (needsReflow || (numRows > 0 && newNumRows != numRows))) {
-            reflowColumnData(newNumRows)
+            // Horizontal mode uses visual-width-aware reflow so Latin word cells whose
+            // measureText exceeds the new line width wrap to the next line instead of
+            // overflowing the canvas's right edge.
+            reflowColumnDataHorizontalVisual(newNumRows, cellSize)
         }
         needsReflow = false
         numRows = newNumRows
@@ -2434,6 +2691,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             val focusIdx = if (lastRealIdx < 0) 0
                 else (lastRealIdx + 1).coerceAtMost(numColumns * numRows - 1)
             poemCanvas.postDelayed({ focusCell(focusIdx, showKeyboard = imeVisible) }, 50)
+        } else {
+            // On first boot, initialise cursor to cell 0 so the first keystroke
+            // always writes at row 0 of line 0 rather than wherever the user taps.
+            poemCanvas.post { focusCell(0) }
         }
     }
 
@@ -2501,6 +2762,14 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
 
         updateModeChipVisibility()
         viewFactory.syncBoxBorderUI(box)
+        // ghostInput inputType must be in sync before focusCell so IME restartInput
+        // sees the correct flags. (ghostInput is the IME target only for VERTICAL boxes;
+        // horizontal boxes route through the live editor controller, but the call is cheap.)
+        updateGhostInputForCanvasMode()
+        // Reset the live editor for the incoming box; activateFreestyleBox is called on both
+        // horizontal and vertical boxes, and a horizontal box's editor must not inherit any
+        // stale text from a prior active horizontal box.
+        if (::liveEditorCtrl.isInitialized) liveEditorCtrl.clearText()
         poemCanvas.post { focusCell(0, showKeyboard = showKeyboard) }
     }
 
@@ -2521,6 +2790,10 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         poemCanvas.updateFreestyleBoxes(textBoxes, null, 0f, 0f)
         updateModeChipVisibility()
         viewFactory.syncBoxBorderUI(null)
+        // activeTextBoxId is now null → liveEditorActive is false for FREESTYLE.
+        updateGhostInputForCanvasMode()
+        // Hide the live editor overlay so it doesn't linger after the box is deactivated.
+        if (::liveEditorCtrl.isInitialized) liveEditorCtrl.clearAndHide()
     }
 
     private fun deleteFreestyleBox(box: TextBoxInstance) {
@@ -2532,6 +2805,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     }
 
     private fun toggleFreestyleBoxFlow(box: TextBoxInstance) {
+        // Re-layout cells for the new flow direction (pure logic lives in GridLogicHelper).
+        GridLogicHelper.relayoutBoxForFlowToggle(box)
         box.isHorizontal = !box.isHorizontal
         activateFreestyleBox(box)
         persistCurrentState()
@@ -2565,16 +2840,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         // Activation deferred to ACTION_UP so the user can drag to resize first.
     }
 
-    private fun resizeBoxData(box: TextBoxInstance, newCols: Int, newRows: Int) {
-        while (box.columnData.size > newCols) box.columnData.removeAt(box.columnData.size - 1)
-        while (box.columnData.size < newCols) box.columnData.add(MutableList(newRows) { "" })
-        for (col in box.columnData) {
-            while (col.size > newRows) col.removeAt(col.size - 1)
-            while (col.size < newRows) col.add("")
-        }
-        box.colCount = newCols
-        box.rowCount = newRows
-    }
+    private fun resizeBoxData(box: TextBoxInstance, newCols: Int, newRows: Int) =
+        GridLogicHelper.resizeBoxData(box, newCols, newRows)
 
     private fun refreshModeChips() {
         val container = modeChipContainer ?: return
@@ -2633,6 +2900,26 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         imm.hideSoftInputFromWindow(rootFrame.windowToken, 0)
         currentFocus?.clearFocus()
     }
+
+    override fun onSelectionEntered() {
+        // Live editor would intercept double-taps inside the selected region and surface its
+        // own insertion/selection action mode (Paste bubble, blue handles), conflicting with
+        // the canvas selection UI. Drop any in-progress text and hide the overlay until
+        // selection clears.
+        if (::liveEditorCtrl.isInitialized && liveEditorActive) liveEditorCtrl.clearAndHide()
+    }
+
+    override fun onSelectionExited() {
+        if (liveEditorActive && ::liveEditorCtrl.isInitialized) liveEditorCtrl.updatePosition()
+    }
+
+    // ── LiveHorizontalEditorController.Callbacks ─────────────────────
+    override fun getGridTextColor(): Int = gridTextColor
+    override fun getBgColor(): Int = bgColor
+    override fun isLiveEditorActive(): Boolean = liveEditorActive
+    override fun isHostRestoring(): Boolean = isRestoring
+    override fun setFocusedCellIndex(idx: Int) { focusedCellIndex = idx }
+    override fun getSelectionController(): SelectionController = selectionCtrl
 
     // ── KeyboardToolbarController.Callbacks ───────────────────────────
     override fun getAllToolsPanel(): LinearLayout = allToolsPanel
@@ -2912,12 +3199,22 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     override fun onShowAllSessions() {
         val intent = Intent(this, SessionListActivity::class.java)
             .putExtra("current_session_id", currentSessionId)
-            .putExtra("current_canvas_mode", canvasMode.name)
         sessionListLauncher.launch(intent)
     }
 
     override fun onUndoAction() { performUndo() }
     override fun onRedoAction() { performRedo() }
+    override fun onAboutClicked() { startActivity(Intent(this, AboutActivity::class.java)) }
+    override fun onTabAction() {
+        val nr = numRows.coerceAtLeast(1)
+        val total = numColumns * nr
+        // HORIZONTAL hybrid: discard any pending text in the live editor and reposition
+        // it over the advanced focus cell. Without resetting the editor here, the
+        // focusedCellIndex would advance underneath stale composing text.
+        if (liveEditorActive && ::liveEditorCtrl.isInitialized) liveEditorCtrl.clearText()
+        advanceToNextCell(focusedCellIndex.coerceIn(0, total - 1), total)
+        if (liveEditorActive && ::liveEditorCtrl.isInitialized) liveEditorCtrl.updatePosition()
+    }
     override fun onScreenshot() { takeScreenshot() }
     override fun onInputFieldEdit() {
         val activeBox = textBoxes.find { it.id == activeTextBoxId }

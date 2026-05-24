@@ -12,6 +12,9 @@ import android.os.Handler
 import android.os.Looper
 import android.util.AttributeSet
 import android.view.View
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
 
 enum class FreestyleCornerAction { MOVE, DELETE, TOGGLE_FLOW, RESIZE }
 
@@ -33,11 +36,16 @@ class PoemCanvasView @JvmOverloads constructor(
         textAlign = Paint.Align.CENTER
         color = Color.GRAY
     }
+    // LEFT-aligned version of previewPaint for horizontal mode visual-X rendering
+    private val previewPaintLeft = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.LEFT
+        color = Color.GRAY
+    }
     private val lineEndPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         color = Color.argb(120, 160, 160, 160)
     }
-    private val wordPaint     = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+    private val wordPaint     = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.LEFT }
     private val selPaint     = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val cursorPaint  = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style       = Paint.Style.STROKE
@@ -86,6 +94,19 @@ class PoemCanvasView @JvmOverloads constructor(
     var isHorizontalMode = false
         set(value) { field = value; requestLayout(); invalidate() }
 
+    // True when MainActivity is overlaying liveHorizontalEditor on the focused cell.
+    // The cursor blinker is suppressed whenever this is set (the EditText draws its own
+    // cursor); the focused cell's CONTENT is only skipped when the editor has text
+    // ([liveEditorCoversCell] below). When the editor is empty we want the cell content
+    // to remain visible — otherwise focusing an existing word makes it vanish.
+    var liveEditorOverlayActive = false
+        set(value) { if (field != value) { field = value; invalidate() } }
+
+    // True only when the live editor is positioned over the focused cell AND has typed text
+    // covering it. The renderer skips drawing the cell's data only when this is true.
+    var liveEditorCoversCell = false
+        set(value) { if (field != value) { field = value; invalidate() } }
+
     // ── Freestyle mode ────────────────────────────────────────────
     // colCount = X dimension (width / cs), rowCount = Y dimension (height / cs)
     // regardless of the box's isHorizontal direction flag.
@@ -128,6 +149,8 @@ class PoemCanvasView @JvmOverloads constructor(
     }
 
     init {
+        // ghostInput in MainActivity is the real IME bridge; this view stays non-focusable
+        // so the system never routes key events here instead of to ghostInput.
         isFocusable          = false
         isFocusableInTouchMode = false
         selPaint.color = try {
@@ -135,6 +158,40 @@ class PoemCanvasView @JvmOverloads constructor(
         } catch (_: Exception) {
             Color.argb(80, 33, 150, 243)
         }
+    }
+
+    // True when the active input surface is horizontal (LTR) text — either the full
+    // HORIZONTAL canvas or a FREESTYLE box with isHorizontal = true. Mirrors the
+    // liveEditorActive property in MainActivity using this view's own state flags.
+    private val isHorizontalInput: Boolean
+        get() = isHorizontalMode || (isFreestyleMode && activeBox?.isHorizontal == true)
+
+    /**
+     * Describes to the IME how to treat this view if it ever becomes the focused target.
+     *
+     * fullEditor = isHorizontalInput:
+     *   true  → IME treats this as a real editor; English keyboards enable their prediction
+     *           dictionary and suggestion strip (required for AUTO_CORRECT to work).
+     *   false → IME treats this as a dummy/display-only view; English keyboards suppress
+     *           suggestions even when AUTO_CORRECT is set. CJK keyboards ignore this flag
+     *           and force the candidate bar open regardless.
+     *
+     * ghostInput (EditText) is the primary IME bridge and holds focus in practice;
+     * this method serves as the correct handshake if the view ever receives focus directly.
+     */
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+        val horizontal = isHorizontalInput
+        outAttrs.inputType = if (horizontal) {
+            EditorInfo.TYPE_CLASS_TEXT or EditorInfo.TYPE_TEXT_FLAG_AUTO_CORRECT
+        } else {
+            EditorInfo.TYPE_CLASS_TEXT or
+                    EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE or
+                    EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        outAttrs.imeOptions = EditorInfo.IME_ACTION_DONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+        outAttrs.initialSelStart = 0
+        outAttrs.initialSelEnd   = 0
+        return BaseInputConnection(this, horizontal)
     }
 
     // ── Public API ────────────────────────────────────────────────
@@ -155,10 +212,13 @@ class PoemCanvasView @JvmOverloads constructor(
         textPaint.textSize  = fontPx
         textPaint.typeface  = typeface
         textPaint.color     = textColor
+        wordPaint.textSize  = fontPx
         wordPaint.typeface  = typeface
         wordPaint.color     = textColor
         previewPaint.textSize = fontPx
         previewPaint.typeface = typeface
+        previewPaintLeft.textSize = fontPx
+        previewPaintLeft.typeface = typeface
         lineEndPaint.textSize = fontPx * 0.65f
         lineEndPaint.typeface = typeface
         cursorPaint.color     = textColor
@@ -232,6 +292,7 @@ class PoemCanvasView @JvmOverloads constructor(
 
     fun updateTextColor(color: Int) {
         textPaint.color = color
+        wordPaint.color = color   // horizontal-mode Latin word cells use wordPaint
         cursorPaint.color = color
         invalidate()
     }
@@ -339,6 +400,70 @@ class PoemCanvasView @JvmOverloads constructor(
         val col = (totalW - relX.toInt() - 1) / cs
         val row = relY.toInt() / cs
         return col.coerceIn(0, maxColsVal - 1) * nr + row.coerceIn(0, nr - 1)
+    }
+
+    /**
+     * Returns the visual-X canvas-local pixel position where the cell at the given index
+     * would START in HORIZONTAL mode, accounting for Latin words' real measureText widths
+     * (visual-X advance). For VERTICAL / FREESTYLE this just returns cellRect.left.
+     * Use this for overlay positioning (e.g. liveHorizontalEditor) so the overlay aligns
+     * with the canvas's drawn text instead of the grid.
+     */
+    /**
+     * Right edge of the given cell's visual content in canvas-local pixels. For HORIZONTAL
+     * input the right edge equals the next cell's visualXForCell. For other modes it falls
+     * back to cellRect.right. Returns null if the index is out of bounds.
+     */
+    fun visualEndXForCell(index: Int): Int? {
+        val cs = cellSizePx.takeIf { it > 0 } ?: return null
+        val nr = numRowsVal.takeIf { it > 0 } ?: return null
+        val col = index / nr; val row = index % nr
+        if (col >= maxColsVal || row < 0 || row >= nr) return null
+        if (!isHorizontalInput) return cellRect(index)?.right
+        val baseX = if (isFreestyleMode) activeBoxOffsetX else 0f
+        val colData = columnData.getOrNull(col)
+        var vx = baseX
+        for (r in 0..row) {
+            val ch = colData?.getOrNull(r) ?: ""
+            val effectiveCh = if (ch.isEmpty() || ch == GridLogicHelper.FRONTIER_MARKER)
+                (previewOverlay[col * nr + r] ?: ch)
+            else ch
+            vx = when {
+                effectiveCh.isEmpty() || effectiveCh == GridLogicHelper.FRONTIER_MARKER ||
+                        effectiveCh == GridLogicHelper.LINE_END_MARKER ->
+                    baseX + (r + 1) * cs.toFloat()
+                effectiveCh[0].code in 1..127 -> vx + textPaint.measureText(effectiveCh)
+                else -> baseX + (r + 1) * cs.toFloat()
+            }
+        }
+        return vx.toInt()
+    }
+
+    fun visualXForCell(index: Int): Int? {
+        val cs = cellSizePx.takeIf { it > 0 } ?: return null
+        val nr = numRowsVal.takeIf { it > 0 } ?: return null
+        val col = index / nr; val row = index % nr
+        if (col >= maxColsVal || row < 0 || row >= nr) return null
+        if (!isHorizontalInput) return cellRect(index)?.left
+        // FREESTYLE-horizontal cells draw inside a translated canvas region; the live editor
+        // overlay positions in rootFrame coords, so we must include the box offset here.
+        val baseX = if (isFreestyleMode) activeBoxOffsetX else 0f
+        val colData = columnData.getOrNull(col)
+        var vx = baseX
+        for (r in 0 until row) {
+            val ch = colData?.getOrNull(r) ?: ""
+            val effectiveCh = if (ch.isEmpty() || ch == GridLogicHelper.FRONTIER_MARKER)
+                (previewOverlay[col * nr + r] ?: ch)
+            else ch
+            vx = when {
+                effectiveCh.isEmpty() || effectiveCh == GridLogicHelper.FRONTIER_MARKER ||
+                        effectiveCh == GridLogicHelper.LINE_END_MARKER ->
+                    baseX + (r + 1) * cs.toFloat()
+                effectiveCh[0].code in 1..127 -> vx + textPaint.measureText(effectiveCh)
+                else -> baseX + (r + 1) * cs.toFloat()
+            }
+        }
+        return vx.toInt()
     }
 
     fun cellRect(index: Int): Rect? {
@@ -480,7 +605,8 @@ class PoemCanvasView @JvmOverloads constructor(
     }
 
     // Horizontal mode: col = line (top→bottom), row = char within line (left→right).
-    // Cursor is a vertical bar at the left edge of the cell.
+    // Latin words/spaces track real text-metric positions; CJK snaps back to the cell grid.
+    // Cursor is a vertical bar at the visual start of the focused cell.
     private fun drawHorizontalContent(canvas: Canvas, cs: Int, nr: Int) {
         val selFrom = selectionFrom; val selTo = selectionTo
         val hasSelection = selFrom >= 0 && selTo >= 0
@@ -495,52 +621,92 @@ class PoemCanvasView @JvmOverloads constructor(
             val colData = columnData.getOrNull(col)
             val lineTop = (col * cs).toFloat()
 
+            // Pre-compute the visual X start of each row, scanning from row 0.
+            // Must start from 0 so clipped lines get correct positions.
+            // For empty cells, preview overlay chars (composing) count toward visual advance
+            // so the grey preview sequence doesn't jump back to the grid.
+            val rowVisualX = FloatArray(nr)
+            var vx = 0f
+            for (r in 0 until nr) {
+                rowVisualX[r] = vx
+                val ch = colData?.getOrNull(r) ?: ""
+                // Use the preview char for advance if the cell is empty or carries only a
+                // FRONTIER_MARKER — the marker is non-empty so isEmpty() alone misses it.
+                val effectiveCh = if (ch.isEmpty() || ch == GridLogicHelper.FRONTIER_MARKER)
+                    (previewOverlay[col * nr + r] ?: ch)
+                else
+                    ch
+                vx = when {
+                    effectiveCh.isEmpty() || effectiveCh == GridLogicHelper.FRONTIER_MARKER ||
+                            effectiveCh == GridLogicHelper.LINE_END_MARKER ->
+                        (r + 1) * cs.toFloat()
+                    // ASCII (code 1-127): letters, digits, punctuation — use real metrics
+                    effectiveCh[0].code in 1..127 -> vx + textPaint.measureText(effectiveCh)
+                    // Non-ASCII (CJK, full-width symbols): snap to grid so wordGap applies
+                    else -> (r + 1) * cs.toFloat()
+                }
+            }
+
             for (row in startRow..endRow) {
-                val index = col * nr + row
+                val index   = col * nr + row
                 val cellLeft = (row * cs).toFloat()
-                val textX = cellLeft + cs / 2f
+                val textX   = cellLeft + cs / 2f
+                val vxHere  = rowVisualX[row]
 
                 if (hasSelection && index in selFrom..selTo) {
-                    canvas.drawRect(cellLeft, lineTop, cellLeft + cs, lineTop + cs, selPaint)
+                    // Highlight tracks visual-X so the rectangle covers the actual drawn
+                    // text (word-per-cell cells render narrower than cs). The next row's
+                    // visual-X is the right edge of this cell; for the last row in the
+                    // line, fall back to the visual extent reached by the loop above.
+                    val vxRight = if (row + 1 < nr) rowVisualX[row + 1] else vx
+                    canvas.drawRect(vxHere, lineTop, vxRight, lineTop + cs, selPaint)
                 }
 
                 val previewCh = previewOverlay[index]
-                val dataCh = colData?.getOrNull(row) ?: ""
+                val dataCh   = colData?.getOrNull(row) ?: ""
 
-                when {
+                // Skip drawing the focused cell only when the live EditText actually has
+                // text covering the cell — otherwise an empty editor would hide an already-
+                // committed word at the focus cell.
+                val skipForOverlay = liveEditorCoversCell && index == cursorIndex
+                if (skipForOverlay) {
+                    // skip both content and preview at this cell
+                } else when {
                     previewCh != null -> {
-                        canvas.drawText(previewCh, textX, lineTop + baselineOffset, previewPaint)
+                        // ASCII composing chars use visual-X (LEFT anchor); CJK preview stays on grid
+                        if (previewCh[0].code in 1..127)
+                            canvas.drawText(previewCh, vxHere, lineTop + baselineOffset, previewPaintLeft)
+                        else
+                            canvas.drawText(previewCh, textX, lineTop + baselineOffset, previewPaint)
                     }
                     dataCh == GridLogicHelper.LINE_END_MARKER && !hideLineEndMarkers -> {
                         canvas.drawText(dataCh, textX, lineTop + lineEndBaselineOffset, lineEndPaint)
                     }
                     dataCh.isNotEmpty() && dataCh != GridLogicHelper.FRONTIER_MARKER
                             && dataCh != GridLogicHelper.LINE_END_MARKER -> {
-                        if (dataCh.length > 1) {
-                            val measured = textPaint.measureText(dataCh)
-                            val scale = if (measured > cs * 0.88f) cs * 0.88f / measured else 1f
-                            wordPaint.textSize = textPaint.textSize * scale
-                            val wfm = wordPaint.fontMetrics
-                            val wBaseline = (cs - (wfm.descent - wfm.ascent)) / 2f - wfm.ascent
-                            canvas.drawText(dataCh, textX, lineTop + wBaseline, wordPaint)
-                        } else {
-                            canvas.drawText(dataCh, textX, lineTop + baselineOffset, textPaint)
+                        when {
+                            dataCh.length > 1 ->
+                                canvas.drawText(dataCh, vxHere, lineTop + baselineOffset, wordPaint)
+                            dataCh == " " -> { /* space advances vx but draws nothing */ }
+                            // All ASCII (letters, digits, punctuation like . , ! ?) use visual-X
+                            dataCh[0].code in 1..127 ->
+                                canvas.drawText(dataCh, vxHere, lineTop + baselineOffset, wordPaint)
+                            // Non-ASCII (CJK) stays centered on its grid cell
+                            else ->
+                                canvas.drawText(dataCh, textX, lineTop + baselineOffset, textPaint)
                         }
                     }
                 }
             }
 
-            if (cursorVisible && cursorIndex >= 0) {
+            if (cursorVisible && cursorIndex >= 0 && !liveEditorOverlayActive) {
                 val curCol = cursorIndex / nr
                 val curRow = cursorIndex % nr
                 if (curCol == col && curRow in startRow..endRow) {
-                    val cellLeft = (curRow * cs).toFloat()
+                    val curVx  = rowVisualX.getOrElse(curRow) { curRow * cs.toFloat() }
                     val margin = cs * 0.08f
-                    canvas.drawLine(
-                        cellLeft + margin, lineTop + 3f,
-                        cellLeft + margin, lineTop + cs - 3f,
-                        cursorPaint
-                    )
+                    canvas.drawLine(curVx + margin, lineTop + 3f,
+                                    curVx + margin, lineTop + cs - 3f, cursorPaint)
                 }
             }
         }
@@ -622,7 +788,15 @@ class PoemCanvasView @JvmOverloads constructor(
     }
 
     private fun drawInactiveBoxContent(canvas: Canvas, box: TextBoxInstance, cs: Int) {
-        inactiveBoxTextPaint.textSize = cs * 0.75f
+        // Match the active box's rendering size: both use the box's own fontPx so
+        // selecting / deselecting a box doesn't visibly resize the text. (Previously
+        // inactive boxes drew at cs * 0.75f, which made the text jump 25% smaller on
+        // deselect.)
+        val fontPx = android.util.TypedValue.applyDimension(
+            android.util.TypedValue.COMPLEX_UNIT_SP, box.fontSizeSp,
+            context.resources.displayMetrics
+        )
+        inactiveBoxTextPaint.textSize = fontPx
         inactiveBoxTextPaint.typeface = box.typeface
         inactiveBoxTextPaint.color = box.gridTextColor
         val fm = inactiveBoxTextPaint.fontMetrics
@@ -630,17 +804,41 @@ class PoemCanvasView @JvmOverloads constructor(
 
         if (box.isHorizontal) {
             // col = line index (0 until rowCount, Y), row = char within line (0 until colCount, X)
+            // Pack ASCII cells via cumulative measureText (visual-X), the same rule
+            // drawHorizontalContent uses for the active box. Without this, word cells were
+            // placed at the row*cs grid — leaving a cellSize-wide gap after each word once
+            // the box was deactivated.
+            val savedAlign = inactiveBoxTextPaint.textAlign
             for (col in 0 until box.rowCount) {
                 val colData = box.columnData.getOrNull(col)
                 val lineTop = (col * cs).toFloat()
+                var vx = 0f
                 for (row in 0 until box.colCount) {
                     val ch = colData?.getOrNull(row) ?: ""
-                    if (ch.isNotEmpty() && ch != GridLogicHelper.FRONTIER_MARKER
-                            && ch != GridLogicHelper.LINE_END_MARKER) {
-                        canvas.drawText(ch, row * cs + cs / 2f, lineTop + baseline, inactiveBoxTextPaint)
+                    val isMarker = ch.isEmpty() ||
+                            ch == GridLogicHelper.FRONTIER_MARKER ||
+                            ch == GridLogicHelper.LINE_END_MARKER
+                    if (!isMarker) {
+                        if (ch[0].code in 1..127) {
+                            // ASCII (letters, digits, punct, space, word-per-cell): visual-X left anchor.
+                            if (ch != " ") {
+                                inactiveBoxTextPaint.textAlign = Paint.Align.LEFT
+                                canvas.drawText(ch, vx, lineTop + baseline, inactiveBoxTextPaint)
+                            }
+                            vx += inactiveBoxTextPaint.measureText(ch)
+                        } else {
+                            // Non-ASCII (CJK / full-width): grid-centered.
+                            inactiveBoxTextPaint.textAlign = savedAlign
+                            canvas.drawText(ch, row * cs + cs / 2f, lineTop + baseline, inactiveBoxTextPaint)
+                            vx = (row + 1) * cs.toFloat()
+                        }
+                    } else {
+                        // Empty / marker cell: snap vx to the grid as in the active renderer.
+                        vx = (row + 1) * cs.toFloat()
                     }
                 }
             }
+            inactiveBoxTextPaint.textAlign = savedAlign
         } else {
             // col = column (0 until colCount, X from right), row = char (0 until rowCount, Y)
             val totalW = box.colCount * cs

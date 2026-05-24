@@ -9,3 +9,12 @@
 .cxx
 local.properties
 settings.local.json
+
+# Signing keys and credentials — never commit these
+*.keystore
+*.jks
+keystore.properties
+
+# Build outputs
+*.apk
+*.aab

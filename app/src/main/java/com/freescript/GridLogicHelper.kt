@@ -5,8 +5,6 @@ object GridLogicHelper {
     const val FRONTIER_MARKER = "​"   // zero-width space; writing-frontier cell in SEQUENTIAL
     const val LINE_END_MARKER = "↵"   // ↵; paragraph-end marker
 
-    fun isLatinWordChar(c: Char) = c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9'
-
     fun setColumnChar(columnData: MutableList<MutableList<String>>, col: Int, row: Int, ch: String) {
         while (columnData.size <= col) columnData.add(mutableListOf())
         while (columnData[col].size <= row) columnData[col].add("")
@@ -220,6 +218,98 @@ object GridLogicHelper {
                 }
             }
         }
+    }
+
+    /**
+     * Grow [box].columnData (and each column) to at least [newCols] × [newRows] cells.
+     * Never trims on shrink — resize is a viewport change, not a delete, so out-of-bounds
+     * content stays in storage and reappears if the box is later enlarged.
+     */
+    fun resizeBoxData(box: TextBoxInstance, newCols: Int, newRows: Int) {
+        while (box.columnData.size < newCols) box.columnData.add(MutableList(newRows) { "" })
+        for (col in box.columnData) {
+            while (col.size < newRows) col.add("")
+        }
+        box.colCount = newCols
+        box.rowCount = newRows
+    }
+
+    /**
+     * Re-layouts [box].columnData when flipping its flow direction. Reads the existing
+     * content in the current flow's reading order, then re-packs it into the swapped
+     * shape per destination mode:
+     *  - H→V: vertical mode is char-per-cell — every char gets its own cell.
+     *  - V→H: horizontal mode is word-per-cell — letter+apostrophe runs collapse to a
+     *    single cell, non-letter chars get their own cell (matches the live editor's
+     *    commit tokenization, so the converted text reads like it was typed).
+     *
+     * Markers (FRONTIER / LINE_END) are dropped; columnBreaks are cleared because the
+     * column-index semantics differ across the shape change.
+     */
+    fun relayoutBoxForFlowToggle(box: TextBoxInstance) {
+        val wasHorizontal = box.isHorizontal
+        val outerCount: Int
+        val innerCount: Int
+        if (wasHorizontal) {
+            outerCount = box.rowCount
+            innerCount = box.colCount
+        } else {
+            outerCount = box.colCount
+            innerCount = box.rowCount
+        }
+        val chars = mutableListOf<String>()
+        for (outer in 0 until outerCount) {
+            val list = box.columnData.getOrNull(outer) ?: continue
+            for (inner in 0 until innerCount) {
+                val cell = list.getOrNull(inner) ?: continue
+                if (cell.isEmpty() || cell == FRONTIER_MARKER || cell == LINE_END_MARKER) continue
+                for (ch in cell) chars.add(ch.toString())
+            }
+        }
+        val newOuter: Int
+        val newInner: Int
+        if (wasHorizontal) {
+            newOuter = box.colCount
+            newInner = box.rowCount
+        } else {
+            newOuter = box.rowCount
+            newInner = box.colCount
+        }
+        box.columnData.clear()
+        for (o in 0 until newOuter) box.columnData.add(MutableList(newInner) { "" })
+        val tokens: List<String> = if (wasHorizontal) {
+            chars
+        } else {
+            buildList {
+                var i = 0
+                while (i < chars.size) {
+                    val c = chars[i]
+                    val isLetter = c.length == 1 &&
+                            (c[0] in 'a'..'z' || c[0] in 'A'..'Z' || c[0] == '\'')
+                    if (!isLetter) {
+                        add(c); i++
+                    } else {
+                        val sb = StringBuilder()
+                        while (i < chars.size) {
+                            val cn = chars[i]
+                            val ln = cn.length == 1 &&
+                                    (cn[0] in 'a'..'z' || cn[0] in 'A'..'Z' || cn[0] == '\'')
+                            if (!ln) break
+                            sb.append(cn); i++
+                        }
+                        add(sb.toString())
+                    }
+                }
+            }
+        }
+        var wO = 0; var wI = 0
+        for (tok in tokens) {
+            if (wO >= newOuter) break
+            box.columnData[wO][wI] = tok
+            wI++
+            if (wI >= newInner) { wI = 0; wO++ }
+        }
+        box.columnBreaks.clear()
     }
 
     fun findSequentialTapTarget(

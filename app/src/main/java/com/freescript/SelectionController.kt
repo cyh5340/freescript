@@ -43,6 +43,12 @@ class SelectionController(
 
         // IME
         fun hideIme()
+
+        // Lifecycle hooks for selection mode. The live EditText overlay in HORIZONTAL mode
+        // would otherwise intercept double-taps inside the selection region; the host hides
+        // it on entry and restores it on exit.
+        fun onSelectionEntered() {}
+        fun onSelectionExited() {}
     }
 
     // ── Mutable selection state ───────────────────────────────────────
@@ -68,10 +74,12 @@ class SelectionController(
         isSelecting = true
         highlightFrom = -1
         selectionStart = index; selectionEnd = index
+        cb.onSelectionEntered()
         updateSelectionHighlight()
     }
 
     fun clearSelection() {
+        val wasSelecting = isSelecting
         isSelecting = false; selectionStart = -1; selectionEnd = -1
         cb.getPoemCanvas().clearSelectionHighlight()
         highlightFrom = -1; highlightTo = -1
@@ -82,6 +90,7 @@ class SelectionController(
         cb.getSelectionOptionsView()?.visibility = View.GONE
         cb.getHandlePasteView()?.visibility = View.GONE
         tappedHandleIsStart = null
+        if (wasSelecting) cb.onSelectionExited()
     }
 
     // ── Highlight ─────────────────────────────────────────────────────
@@ -121,10 +130,20 @@ class SelectionController(
         val canvasLoc = IntArray(2); canvas.getLocationOnScreen(canvasLoc)
         val rootLoc   = IntArray(2); cb.getRootFrame().getLocationOnScreen(rootLoc)
         val sz = handle.layoutParams.width.toFloat()
-        val x  = (canvasLoc[0] - rootLoc[0] + cellRect.left + cellRect.width() / 2f - sz / 2f)
+        // In horizontal input mode the cell grid (row * cs) diverges from where the text
+        // actually renders (cumulative measureText), so anchor handles at the visual edge
+        // of the cell rather than the grid. For other modes visualXForCell/visualEndXForCell
+        // fall back to cellRect.left/right.
+        val anchorX = if (atTop)
+            (canvas.visualXForCell(index) ?: cellRect.left).toFloat()
+        else
+            (canvas.visualEndXForCell(index) ?: cellRect.right).toFloat()
+        val x  = (canvasLoc[0] - rootLoc[0] + anchorX - sz / 2f)
         val y  = (canvasLoc[1] - rootLoc[1] + if (atTop) cellRect.top.toFloat() - sz else cellRect.bottom.toFloat())
-        if (x == 0f) return
-        handle.x = x; handle.y = y.coerceAtLeast(0f)
+        // (Previously had `if (x == 0f) return` as a "layout not yet measured" guard; with
+        // visual-X anchoring x can legitimately compute to 0 — that guard hides handles for
+        // first-row first-column selections, which is exactly the regression we hit.)
+        handle.x = x.coerceAtLeast(0f); handle.y = y.coerceAtLeast(0f)
         handle.visibility = View.VISIBLE
     }
 
@@ -161,13 +180,23 @@ class SelectionController(
         val canvas = cb.getPoemCanvas()
         val canvasLoc = IntArray(2); canvas.getLocationOnScreen(canvasLoc)
         val rootLoc   = IntArray(2); cb.getRootFrame().getLocationOnScreen(rootLoc)
-        val cellScreenX = canvasLoc[0] - rootLoc[0] + cellRect.left
+        // Anchor at the visual-X start of the selection's first cell so the popup tracks
+        // word-per-cell layout in horizontal mode. Falls back to cellRect.left for other modes.
+        val anchorLeft = canvas.visualXForCell(from) ?: cellRect.left
+        val cellScreenX = canvasLoc[0] - rootLoc[0] + anchorLeft
         val cellScreenY = canvasLoc[1] - rootLoc[1] + cellRect.top
 
         var pvX = cellScreenX - popW - gap
         val rootW = cb.getRootFrame().width.toFloat()
         if (pvX < gap) pvX = (cellScreenX + cellRect.width() + gap).coerceAtMost(rootW - popW - gap)
-        pop.x = pvX; pop.y = cellScreenY.toFloat()
+        // Clamp Y so the popup never disappears off the top of the screen (notably for cells
+        // on the first line in HORIZONTAL mode where cellScreenY can be 0 / negative).
+        val popH = cachedPopupH.toFloat().coerceAtLeast(0f)
+        val rootH = cb.getRootFrame().height.toFloat()
+        var pvY = cellScreenY.toFloat()
+        if (pvY < gap) pvY = (cellScreenY + cellRect.height() + gap).coerceAtLeast(gap)
+        pvY = pvY.coerceAtMost((rootH - popH - gap).coerceAtLeast(gap))
+        pop.x = pvX; pop.y = pvY
         pop.visibility = View.VISIBLE
     }
 
@@ -192,17 +221,24 @@ class SelectionController(
         for (brk in breaks) { if (brk <= curCol) paraStartCol = brk else break }
         var paraEndCol = numColumns - 1
         for (brk in breaks) { if (brk > curCol) { paraEndCol = brk - 1; break } }
-        var first = -1; var last = -1
+        var hasContent = false
+        var last = -1
         for (col in paraStartCol..paraEndCol) {
             val cells = cb.getColumnData().getOrNull(col) ?: continue
             for (row in cells.indices) {
                 if (cells[row].isNotBlank()) {
-                    val idx = col * nr + row
-                    if (first < 0) first = idx; last = idx
+                    hasContent = true
+                    last = col * nr + row
                 }
             }
         }
-        if (first >= 0) { selectionStart = first; selectionEnd = last; updateSelectionHighlight() }
+        if (hasContent) {
+            // Anchor at the paragraph's first cell so any leading tab / blank cells before
+            // the first word are part of the selection.
+            selectionStart = paraStartCol * nr
+            selectionEnd = last
+            updateSelectionHighlight()
+        }
     }
 
     fun selectAll(maxColumns: Int) {
@@ -217,7 +253,20 @@ class SelectionController(
                 }
             }
         }
-        if (first >= 0) { selectionStart = first; selectionEnd = last; updateSelectionHighlight() }
+        if (first >= 0) {
+            // Enter selection mode if the caller invoked selectAll without first entering
+            // it (e.g. from the EditText action mode in HORIZONTAL hybrid). Without this,
+            // updateSelectionHighlight() bails on !isSelecting and the highlight never paints.
+            val entered = !isSelecting
+            if (entered) {
+                cb.hideIme()
+                isSelecting = true
+                highlightFrom = -1
+            }
+            selectionStart = first; selectionEnd = last
+            if (entered) cb.onSelectionEntered()
+            updateSelectionHighlight()
+        }
     }
 
     // ── Drag state helpers (called by MainActivity.dispatchTouchEvent) ─
@@ -276,7 +325,13 @@ class SelectionController(
         for (i in from..to) {
             val c = i / nr; val r = i % nr
             if (c != prevCol) { if (cb.getColumnBreaks().contains(c)) sb.append('\n'); prevCol = c }
-            sb.append(cb.getColumnData().getOrNull(c)?.getOrNull(r) ?: "")
+            val cell = cb.getColumnData().getOrNull(c)?.getOrNull(r) ?: ""
+            when {
+                cell.isEmpty() -> sb.append('\t')   // empty cell = tab; preserved by paste
+                cell == GridLogicHelper.FRONTIER_MARKER -> { /* skip marker */ }
+                cell == GridLogicHelper.LINE_END_MARKER -> { /* skip marker */ }
+                else -> sb.append(cell)
+            }
         }
         return sb.toString()
     }

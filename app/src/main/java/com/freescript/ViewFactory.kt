@@ -144,6 +144,8 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
         fun onCollapsePanel()
         fun onUndoAction()
         fun onRedoAction()
+        fun onTabAction()
+        fun onAboutClicked()
         fun onScreenshot()
         fun onKeyboardToggle()
         fun onInputFieldEdit()
@@ -353,6 +355,14 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             }
             redoButton = redoBtn
             addView(redoBtn)
+            addView(divider(toolbarH, dp))
+
+            addView(TextView(context).apply {
+                text = "→∣"; textSize = 14f; gravity = Gravity.CENTER
+                setTextColor(context.getColor(R.color.text_dark))
+                layoutParams = LinearLayout.LayoutParams(iconW, toolbarH)
+                setOnClickListener { cb.onTabAction() }
+            })
 
             addView(divider(toolbarH, dp))
 
@@ -528,6 +538,8 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
 
             addView(buildFileHeaderRow(dp))
             addView(subDivider(dp))
+
+            addView(buildMoreRow(dp))
         }
 
         val scrollView = NestedScrollView(context).apply {
@@ -1119,6 +1131,42 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
                 }
                 modeInputSectionRef = inputModeSection
                 addView(inputModeSection)
+            }
+
+        // ── More row ──────────────────────────────────────────────────────────
+        private fun buildMoreRow(dp: Float): LinearLayout =
+            LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(MP, WC)
+                val hPad = (16 * dp).roundToInt(); val vPad = (10 * dp).roundToInt()
+                setPadding(hPad, vPad, hPad, vPad)
+                isClickable = true; isFocusable = true
+                setOnClickListener { cb.onAboutClicked() }
+
+                addView(TextView(context).apply {
+                    text = context.getString(R.string.btn_more)
+                    textSize = 14f
+                    setTextColor(context.getColor(R.color.text_dark))
+                    layoutParams = LinearLayout.LayoutParams(0, WC, 1f)
+                })
+
+                // Circle ⓘ icon
+                val iconSz = (22 * dp).roundToInt()
+                addView(TextView(context).apply {
+                    text = "i"
+                    textSize = 11f
+                    gravity = Gravity.CENTER
+                    setTextColor(context.getColor(R.color.text_dark))
+                    typeface = android.graphics.Typeface.create(
+                        android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL
+                        setStroke((1.5f * dp).roundToInt(), context.getColor(R.color.text_dark))
+                        setColor(android.graphics.Color.TRANSPARENT)
+                    }
+                    layoutParams = LinearLayout.LayoutParams(iconSz, iconSz)
+                })
             }
 
         // ── File header row (檔案 section) ────────────────────────────────────
