@@ -159,6 +159,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     private var lastKeyboardHeight = 0   // last measured IME height; allToolsPanel matches this height
     private var toolsVisible = false     // true when allToolsPanel is showing
     private var imeIsVisible = false     // tracks current IME visibility via insets listener
+    private var isLandscape = false      // true when width > height; toolbar moves to left panel
     private var keyboardCellRef: LinearLayout? = null
     private val historyBurstHandler = Handler(Looper.getMainLooper())
     private var historyBurstReset: Runnable? = null
@@ -507,10 +508,12 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             isFocusable = false
         }
 
-        // Main vertical layout: mainScrollView fills remaining space above bottomPanel.
-        // Keyboard visibility is handled by insets + viewport-aware caret scrolling.
+        isLandscape = resources.displayMetrics.let { it.widthPixels > it.heightPixels }
+
+        // Portrait: vertical stack (scrollView above bottomPanel).
+        // Landscape: horizontal split (leftPanel | divider | scrollView).
         mainLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+            orientation = if (isLandscape) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
             layoutParams = FrameLayout.LayoutParams(MP, MP)
         }
 
@@ -578,7 +581,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         gridContainer.addView(hScroll)
 
         viewFactory      = ViewFactory(this, this)
-        bottomPanel      = viewFactory.buildBottomPanel(dp)
+        bottomPanel      = viewFactory.buildBottomPanel(dp, isLandscape)
         allToolsPanel    = viewFactory.allToolsPanel!!
         punctToolbar     = viewFactory.punctToolbar!!
         toolsCell        = viewFactory.toolsCell
@@ -599,9 +602,24 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         keyboardToolbarCtrl  = KeyboardToolbarController(this, this)
         scrollCoordinator    = ScrollCoordinator(resources, this)
         updateToolbarSessionName()
-        mainLayout.addView(viewFactory.buildScrollIndicator(dp))
-        mainLayout.addView(mainScrollView)
-        mainLayout.addView(bottomPanel)
+        if (isLandscape) {
+            // Left panel (toolbar strip) | 1dp divider | content column (scroll indicator + canvas)
+            mainLayout.addView(bottomPanel)
+            mainLayout.addView(View(this).apply {
+                layoutParams = LinearLayout.LayoutParams((1f * dp).roundToInt(), ViewGroup.LayoutParams.MATCH_PARENT)
+                setBackgroundColor(getColor(R.color.divider_dark))
+            })
+            mainLayout.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+                addView(viewFactory.buildScrollIndicator(dp))
+                addView(mainScrollView)
+            })
+        } else {
+            mainLayout.addView(viewFactory.buildScrollIndicator(dp))
+            mainLayout.addView(mainScrollView)
+            mainLayout.addView(bottomPanel)
+        }
         rootFrame.addView(mainLayout)
         rootFrame.addView(allToolsPanel)
         setContentView(rootFrame)
@@ -945,6 +963,9 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
         }
 
         // 1. Flatten existing content into a stream (null = explicit column break).
+        //    FRONTIER and LINE_END are positional metadata, not content — placeFrontierMarker
+        //    re-places them after reflow; streaming them parks them at arbitrary positions
+        //    and produces "separated space" artifacts on the next reflow.
         val maxCol = maxOf(columnData.size, columnBreaks.maxOrNull()?.plus(1) ?: 0)
         val stream = mutableListOf<String?>()
         for (col in 0 until maxCol) {
@@ -952,7 +973,11 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             val colData = columnData.getOrNull(col) ?: continue
             val lastNonEmpty = colData.indexOfLast { it.isNotEmpty() }
             if (lastNonEmpty < 0) continue
-            for (row in 0..lastNonEmpty) stream.add(colData[row])
+            for (row in 0..lastNonEmpty) {
+                val ch = colData[row]
+                if (ch == FRONTIER_MARKER || ch == LINE_END_MARKER) continue
+                stream.add(ch)
+            }
         }
 
         // 2. Reset and re-place with visual-width wrapping.
@@ -1077,7 +1102,7 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
             val tail = mutableListOf<String>()
             if (colData != null) {
                 for (r in iRow until colData.size) tail.add(colData[r])
-                while (tail.isNotEmpty() && (tail.last().isBlank() || tail.last() == LINE_END_MARKER)) tail.removeLast()
+                while (tail.isNotEmpty() && (tail.last().isBlank() || tail.last() == LINE_END_MARKER)) tail.removeAt(tail.lastIndex)
                 while (colData.size > iRow) colData.removeAt(colData.size - 1)
             }
             // LINE_END_MARKER renders as a visible glyph in HORIZONTAL mode, so skip it there.
@@ -2935,6 +2960,8 @@ class MainActivity : AppCompatActivity(), ViewFactory.Callbacks,
     override fun getColorTextHint(): Int = getColor(R.color.text_hint)
     override fun getToolbarStripHeight(): Int =
         bottomPanel.height - if (punctToolbar.visibility == android.view.View.VISIBLE) punctToolbar.height else 0
+    override fun getToolbarStripWidth(): Int = (54 * resources.displayMetrics.density).roundToInt()
+    override fun isLandscape(): Boolean = this.isLandscape
     override fun onBeforeSwitchToTools() { selectionCtrl.clearSelection(); currentFocus?.clearFocus() }
     override fun onAfterSwitchToTools() { refreshInsertedImagePanel() }
 

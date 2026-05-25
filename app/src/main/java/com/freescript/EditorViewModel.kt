@@ -25,7 +25,7 @@ class EditorViewModel(
 
     fun snapshotForUndo(snapshot: EditorHistoryState) {
         undoStack.addLast(snapshot)
-        if (undoStack.size > maxHistory) undoStack.removeFirst()
+        if (undoStack.size > maxHistory) undoStack.removeAt(0)
         redoStack.clear()
     }
 

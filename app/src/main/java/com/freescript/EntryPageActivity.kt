@@ -20,6 +20,7 @@ class EntryPageActivity : AppCompatActivity() {
 
     private lateinit var recentSessionsContainer: LinearLayout
     private lateinit var sessionListLauncher: ActivityResultLauncher<Intent>
+    private var isLandscape = false
 
     override fun attachBaseContext(base: android.content.Context) {
         super.attachBaseContext(LocaleHelper.wrap(base))
@@ -51,7 +52,16 @@ class EntryPageActivity : AppCompatActivity() {
         populateRecentSessions()
     }
 
-    // ── Root ───────────────────────────────────────────────────────────────
+    // ── Root dispatcher ────────────────────────────────────────────────────
+
+    private fun buildRoot(): View {
+        val dm = resources.displayMetrics
+        isLandscape = dm.widthPixels > dm.heightPixels
+        return if (isLandscape) buildRootLandscape(dm, dm.density)
+               else             buildRootPortrait(dm, dm.density)
+    }
+
+    // ── Portrait layout ────────────────────────────────────────────────────
     //
     //  ┌──────────────────┬──────────┐
     //  │  自  fS×fS       │          │  top row height = vH = avail
@@ -63,16 +73,13 @@ class EntryPageActivity : AppCompatActivity() {
     //  │       橫  avail×hH           │
     //  └──────────────────────────────┘
 
-    private fun buildRoot(): View {
-        val dm   = resources.displayMetrics
-        val dp   = dm.density
+    private fun buildRootPortrait(dm: android.util.DisplayMetrics, dp: Float): View {
         val pad  = (16 * dp).roundToInt()
         val avail = dm.widthPixels - 2 * pad
 
-        val gapH = (20 * dp).roundToInt()   // gap between freestyle and vertical, also used vertically
+        val gapH = (20 * dp).roundToInt()
         val gapV = gapH
         val u    = (avail - gapH).toDouble()
-        // Solve fS² = vW×avail where fS = avail-gapH-vW → (u-vW)² = vW×avail
         val vW       = ((2*u + avail - sqrt(avail * (4*u + avail))) / 2.0).roundToInt()
         val leftColW = avail - gapH - vW
         val fS       = leftColW
@@ -148,6 +155,137 @@ class EntryPageActivity : AppCompatActivity() {
                         setOnClickListener {
                             startActivity(Intent(this@EntryPageActivity, AboutActivity::class.java))
                         }
+                    })
+                    addView(android.widget.TextView(this@EntryPageActivity).apply {
+                        text = "  " + (try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (_: Exception) { "" })
+                        textSize = 10f
+                        setTextColor(getColor(R.color.text_hint))
+                    })
+                })
+            })
+        }
+    }
+
+    // ── Landscape layout ───────────────────────────────────────────────────
+    //
+    //  ┌──────────────────────┬─────────────────────┐
+    //  │  自  fS×fS  │        │  session list        │
+    //  │             │ 直 vW×vH│  (scrollable)        │
+    //  │  (gap)      │        ├─────────────────────┤
+    //  ├─────────────┴────────┤  All files →         │
+    //  │  橫  avail×hH        │  logo + ⚙            │
+    //  └──────────────────────┴─────────────────────┘
+
+    private fun buildRootLandscape(dm: android.util.DisplayMetrics, dp: Float): View {
+        val pad   = (16 * dp).roundToInt()
+        val gapH  = (20 * dp).roundToInt()
+        val gapV  = gapH
+        val halfW = dm.widthPixels / 2
+
+        // Same proportion math as portrait, but based on left-half available width
+        val avail    = halfW - pad - pad / 2
+        val u        = (avail - gapH).toDouble()
+        val vW       = ((2*u + avail - sqrt(avail * (4*u + avail))) / 2.0).roundToInt()
+        val leftColW = avail - gapH - vW
+        val fS       = leftColW
+        val hH       = vW
+        // Cap top-row height so top row + gap + horizontal card fits within screen height
+        val availScreenH = dm.heightPixels - 2 * pad
+        val vH = minOf(avail, availScreenH - gapV - hH)
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(getColor(R.color.surface))
+            layoutParams = ViewGroup.LayoutParams(MP, MP)
+
+            // Left half: FREESTYLE top-left, VERTICAL top-right, HORIZONTAL bottom
+            addView(LinearLayout(this@EntryPageActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(halfW, MP)
+                setPadding(pad, pad, pad / 2, pad)
+
+                // Top row: FREESTYLE (left col) + VERTICAL (right col)
+                addView(LinearLayout(this@EntryPageActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    layoutParams = LinearLayout.LayoutParams(MP, vH)
+
+                    addView(LinearLayout(this@EntryPageActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        layoutParams = LinearLayout.LayoutParams(leftColW, MP)
+                        addView(buildModeCard(CanvasMode.FREESTYLE, dp),
+                            LinearLayout.LayoutParams(fS, fS))
+                    })
+
+                    addView(hGap(gapH))
+
+                    addView(buildModeCard(CanvasMode.VERTICAL, dp),
+                        LinearLayout.LayoutParams(vW, vH))
+                })
+
+                addView(vGap(gapV))
+
+                addView(buildModeCard(CanvasMode.HORIZONTAL, dp, horizontal = true),
+                    LinearLayout.LayoutParams(avail, hH))
+            })
+
+            // Vertical divider
+            addView(View(this@EntryPageActivity).apply {
+                setBackgroundColor(getColor(R.color.divider))
+                layoutParams = LinearLayout.LayoutParams((1 * dp).roundToInt(), MP)
+            })
+
+            // Right half: scrollable session list + all files + logo
+            addView(LinearLayout(this@EntryPageActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, MP, 1f)
+                setPadding(pad / 2, pad, pad, pad)
+
+                // Scrollable session list fills available space
+                addView(ScrollView(this@EntryPageActivity).apply {
+                    layoutParams = LinearLayout.LayoutParams(MP, 0, 1f)
+                    isScrollbarFadingEnabled = true
+                    addView(LinearLayout(this@EntryPageActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        layoutParams = ViewGroup.LayoutParams(MP, WC)
+                        recentSessionsContainer = this
+                    })
+                })
+
+                addView(buildAllFilesRow(dp))
+
+                // Logo + settings gear
+                addView(android.widget.FrameLayout(this@EntryPageActivity).apply {
+                    layoutParams = LinearLayout.LayoutParams(MP, (224 * dp).roundToInt())
+                    addView(android.widget.ImageView(this@EntryPageActivity).apply {
+                        setImageResource(R.drawable.poemeditor_logo)
+                        scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                        layoutParams = android.widget.FrameLayout.LayoutParams(MP, MP)
+                    })
+                    addView(LinearLayout(this@EntryPageActivity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        layoutParams = android.widget.FrameLayout.LayoutParams(WC, WC,
+                            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).also {
+                            it.bottomMargin = (6 * dp).roundToInt()
+                        }
+                        addView(android.widget.TextView(this@EntryPageActivity).apply {
+                            text = "2026"
+                            textSize = 10f
+                            setTextColor(getColor(R.color.text_hint))
+                        })
+                        addView(android.widget.TextView(this@EntryPageActivity).apply {
+                            text = "  ⚙"
+                            textSize = 13f
+                            setTextColor(getColor(R.color.text_hint))
+                            setOnClickListener {
+                                startActivity(Intent(this@EntryPageActivity, AboutActivity::class.java))
+                            }
+                        })
+                        addView(android.widget.TextView(this@EntryPageActivity).apply {
+                            text = "  " + (try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (_: Exception) { "" })
+                            textSize = 10f
+                            setTextColor(getColor(R.color.text_hint))
+                        })
                     })
                 })
             })
@@ -255,7 +393,8 @@ class EntryPageActivity : AppCompatActivity() {
     private fun populateRecentSessions() {
         val dp = resources.displayMetrics.density
         recentSessionsContainer.removeAllViews()
-        val sessions = SessionManager.listSessions(filesDir).take(3)
+        val sessions = if (isLandscape) SessionManager.listSessions(filesDir)
+                      else            SessionManager.listSessions(filesDir).take(3)
         sessions.forEachIndexed { i, meta ->
             if (i > 0) recentSessionsContainer.addView(
                 hDivider().also { it.layoutParams = LinearLayout.LayoutParams(MP, 1) }

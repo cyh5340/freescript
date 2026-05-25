@@ -294,9 +294,13 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
         }
     }
 
-    // ── Bottom panel ─────────────────────────────────────────────────────
-    fun buildBottomPanel(dp: Float): LinearLayout {
+    // ── Bottom panel (portrait) / Left panel (landscape) ─────────────────
+    fun buildBottomPanel(dp: Float, isLandscape: Boolean = false): LinearLayout {
         allToolsPanel = buildAllToolsPanel(dp)
+        return if (isLandscape) buildLeftPanel(dp) else buildPortraitBottomPanel(dp)
+    }
+
+    private fun buildPortraitBottomPanel(dp: Float): LinearLayout {
         val toolbar = buildToolbar(dp)
         punctToolbar = buildPunctToolbar(dp)
         return LinearLayout(context).apply {
@@ -308,6 +312,87 @@ class ViewFactory(private val context: Context, private val cb: Callbacks) {
             })
             addView(punctToolbar)
             addView(toolbar)
+        }
+    }
+
+    // Vertical toolbar strip shown on the left side in landscape mode.
+    // Same buttons as the portrait bottom bar, stacked as equal-height rows.
+    private fun buildLeftPanel(dp: Float): LinearLayout {
+        val sz = (54 * dp).roundToInt()
+        punctToolbar = buildPunctToolbar(dp)  // keeps the ref valid; not added to any view
+
+        fun lBtn(label: String, size: Float): TextView = TextView(context).apply {
+            text = label; textSize = size; gravity = Gravity.CENTER
+            setTextColor(context.getColor(R.color.text_dark))
+            layoutParams = LinearLayout.LayoutParams(sz, sz)
+        }
+
+        fun hDiv(): View = View(context).apply {
+            layoutParams = LinearLayout.LayoutParams(sz, (1f * dp).roundToInt())
+            setBackgroundColor(context.getColor(R.color.divider))
+        }
+
+        return LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(sz, ViewGroup.LayoutParams.MATCH_PARENT)
+            setBackgroundColor(context.getColor(R.color.surface))
+
+            // top flex spacer — centers button group and clears ghostInput's 48dp touch zone
+            addView(View(context).apply { layoutParams = LinearLayout.LayoutParams(sz, 0, 1f) })
+
+            // ⚙ tools toggle
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(sz, sz)
+                addView(iconText("⚙", 14f))
+                setOnClickListener { cb.onToolsToggle() }
+            }.also { toolsCell = it })
+
+            addView(hDiv())
+
+            // ⟲ undo
+            addView(lBtn("⟲", 18f).also {
+                it.setTextColor(context.getColor(if (cb.canUndo()) R.color.text_dark else R.color.text_hint))
+                it.setOnClickListener { cb.onUndoAction() }
+                undoButton = it
+            })
+
+            // ⟳ redo
+            addView(lBtn("⟳", 18f).also {
+                it.setTextColor(context.getColor(if (cb.canRedo()) R.color.text_dark else R.color.text_hint))
+                it.setOnClickListener { cb.onRedoAction() }
+                redoButton = it
+            })
+
+            addView(hDiv())
+
+            // →∣ tab
+            addView(lBtn("→∣", 14f).apply { setOnClickListener { cb.onTabAction() } })
+
+            addView(hDiv())
+
+            // ⌨ keyboard toggle
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(sz, sz)
+                addView(iconText("⌨", 14f))
+                setOnClickListener { cb.onKeyboardToggle() }
+            }.also { keyboardCell = it })
+
+            // ⌗ input field (divider ref kept for show/hide logic)
+            hDiv().also { inputFieldDividerRef = it; addView(it) }
+            addView(lBtn("⌗", 18f).also {
+                it.setOnClickListener { cb.onInputFieldEdit() }
+                inputFieldCellRef = it
+            })
+
+            addView(hDiv())
+
+            // ⛶ screenshot
+            addView(lBtn("⛶", 14f).apply { setOnClickListener { cb.onScreenshot() } })
+
+            // bottom flex spacer (equal weight to top spacer = centered)
+            addView(View(context).apply { layoutParams = LinearLayout.LayoutParams(sz, 0, 1f) })
         }
     }
 

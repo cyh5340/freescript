@@ -1,6 +1,7 @@
 package com.freescript
 
 import android.content.Context
+import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
@@ -41,6 +42,8 @@ class KeyboardToolbarController(
         fun getColorRowActive(): Int
         fun getColorTextHint(): Int
         fun getToolbarStripHeight(): Int  // toolbar + divider height, excluding punctToolbar
+        fun getToolbarStripWidth(): Int   // left-panel width in landscape (px)
+        fun isLandscape(): Boolean
 
         // Side-effects triggered by switching
         fun onBeforeSwitchToTools()     // e.g. clearSelection()
@@ -53,21 +56,33 @@ class KeyboardToolbarController(
         cb.onBeforeSwitchToTools()
         val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         imm.hideSoftInputFromWindow(cb.getRootFrame().windowToken, 0)
-
         cb.onAfterSwitchToTools()
 
-        val h = if (cb.getLastKeyboardHeight() > 0) cb.getLastKeyboardHeight()
-                else (280 * context.resources.displayMetrics.density).roundToInt()
         val lp = cb.getAllToolsPanel().layoutParams as FrameLayout.LayoutParams
-        lp.height = h
-        lp.bottomMargin = cb.getToolbarStripHeight()
+        if (cb.isLandscape()) {
+            // Landscape: panel opens as a left sidebar to the right of the toolbar strip.
+            // Use Gravity.LEFT|TOP explicitly — Gravity.START can resolve to the right side
+            // when any view in the hierarchy has RTL layout direction (e.g. hScroll).
+            val panelW = (280 * context.resources.displayMetrics.density).roundToInt()
+            lp.width = panelW
+            lp.height = -1  // MATCH_PARENT
+            lp.gravity = Gravity.LEFT or Gravity.TOP
+            lp.leftMargin = cb.getToolbarStripWidth()
+            lp.topMargin = 0; lp.rightMargin = 0; lp.bottomMargin = 0
+        } else {
+            val h = if (cb.getLastKeyboardHeight() > 0) cb.getLastKeyboardHeight()
+                    else (280 * context.resources.displayMetrics.density).roundToInt()
+            lp.width = -1  // MATCH_PARENT
+            lp.height = h
+            lp.gravity = Gravity.BOTTOM
+            lp.leftMargin = 0; lp.topMargin = 0; lp.rightMargin = 0
+            lp.bottomMargin = cb.getToolbarStripHeight()
+            (cb.getMainScrollView() as? androidx.core.widget.NestedScrollView)
+                ?.setPadding(0, 0, 0, h)
+                ?: cb.getMainScrollView().setPadding(0, 0, 0, h)
+        }
         cb.getAllToolsPanel().layoutParams = lp
         cb.getAllToolsPanel().visibility = View.VISIBLE
-
-        (cb.getMainScrollView() as? androidx.core.widget.NestedScrollView)
-            ?.setPadding(0, 0, 0, h)
-            ?: cb.getMainScrollView().setPadding(0, 0, 0, h)
-
         cb.setToolsVisible(true)
         cb.getToolsCell()?.setBackgroundColor(cb.getColorRowActive())
     }

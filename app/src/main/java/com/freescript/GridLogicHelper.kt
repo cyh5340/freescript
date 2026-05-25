@@ -24,7 +24,16 @@ object GridLogicHelper {
             val colData = columnData.getOrNull(col) ?: continue
             val lastNonEmpty = colData.indexOfLast { it.isNotEmpty() }
             if (lastNonEmpty < 0) continue
-            for (row in 0..lastNonEmpty) stream.add(colData[row])
+            for (row in 0..lastNonEmpty) {
+                val ch = colData[row]
+                // FRONTIER and LINE_END are positional metadata, not content — they will
+                // be re-placed by placeFrontierMarker after reflow. Streaming them treats
+                // them as characters and parks them at arbitrary positions in the new
+                // layout, which placeFrontierMarker then demotes to " ". That's the
+                // "separated space" artifact that breaks the paragraph visual.
+                if (ch == FRONTIER_MARKER || ch == LINE_END_MARKER) continue
+                stream.add(ch)
+            }
         }
         columnData.clear(); columnBreaks.clear()
         var col = 0; var row = 0
@@ -54,7 +63,7 @@ object GridLogicHelper {
             for (r in rStart until colData.size) flat.add(colData[r])
             c++; rStart = 0
         }
-        while (flat.isNotEmpty() && flat.last().isBlank()) flat.removeLast()
+        while (flat.isNotEmpty() && flat.last().isBlank()) flat.removeAt(flat.lastIndex)
 
         c = insertCol; rStart = insertRow
         while (c < maxColumns) {
@@ -113,8 +122,16 @@ object GridLogicHelper {
             }
 
             val frontierIdx = lastRealIdx + 1
-            val markerIdx = if (isLastPara) frontierIdx
-                           else ((lastRealIdx / numRows) + 1) * numRows
+            // Preferred LINE_END position for non-last paragraphs is row 0 of the next
+            // column (gives the marker its own "header cell"). If that next column is
+            // already outside the paragraph (i.e., the paragraph filled its allotted
+            // columns exactly), fall back to placing the marker immediately after the
+            // last real character — without this fallback the marker is dropped
+            // entirely and the paragraph break becomes invisible after reflow.
+            val preferredMarkerIdx = if (isLastPara) frontierIdx
+                                     else ((lastRealIdx / numRows) + 1) * numRows
+            val markerIdx = if (preferredMarkerIdx / numRows > paraEnd) frontierIdx
+                            else preferredMarkerIdx
             val markerCol = markerIdx / numRows
             val markerRow = markerIdx % numRows
             if (markerCol > paraEnd) continue

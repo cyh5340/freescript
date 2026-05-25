@@ -64,6 +64,15 @@ class AboutActivity : AppCompatActivity() {
                             gravity = Gravity.CENTER
                             setTextColor(getColor(R.color.text_hint))
                         })
+                        addView(TextView(this@AboutActivity).apply {
+                            text = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (_: Exception) { "" }
+                            textSize = 10f
+                            gravity = Gravity.CENTER
+                            setTextColor(getColor(R.color.text_hint))
+                            layoutParams = LinearLayout.LayoutParams(WC, WC).also {
+                                it.marginStart = (6 * dp).roundToInt()
+                            }
+                        })
                         addView(ImageView(this@AboutActivity).apply {
                             setImageResource(R.drawable.ic_github)
                             imageTintList = android.content.res.ColorStateList.valueOf(

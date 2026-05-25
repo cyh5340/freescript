@@ -23,6 +23,8 @@ class ScrollCoordinator(
         fun getPoemCanvas(): PoemCanvasView
         fun getMainScrollView(): NestedScrollView
         fun getHScrollView(): HorizontalScrollView?
+        fun isImeVisible(): Boolean
+        fun getLastKeyboardHeight(): Int
     }
 
     private val translateHandler = Handler(Looper.getMainLooper())
@@ -95,8 +97,22 @@ class ScrollCoordinator(
             val targetRect = Rect(cellRect).apply { bottom += margin }
             mainScrollView.offsetDescendantRectToMyCoords(poemCanvas, targetRect)
 
+            // On Android 15 (edge-to-edge) the window no longer shrinks when the keyboard
+            // appears — the keyboard overlays the content instead. mainScrollView.height
+            // therefore stays full-size and would make visibleBottom incorrectly large.
+            // Clamp the scrollView's screen-bottom against the keyboard top so the effective
+            // viewport is the area actually visible above the keyboard in both cases:
+            //   • Android 14 (adjustResize): window already shrunk → clamp has no effect.
+            //   • Android 15 (no resize): clamp trims the invisible keyboard-covered zone.
+            val loc = IntArray(2)
+            mainScrollView.getLocationOnScreen(loc)
+            val imeH = if (cb.isImeVisible()) cb.getLastKeyboardHeight() else 0
+            val screenH = resources.displayMetrics.heightPixels
+            val effectiveHeight = (minOf(loc[1] + mainScrollView.height, screenH - imeH) - loc[1])
+                .coerceAtLeast(0)
+
             val visibleTop = mainScrollView.scrollY
-            val visibleBottom = visibleTop + mainScrollView.height
+            val visibleBottom = visibleTop + effectiveHeight
             val delta = when {
                 targetRect.bottom > visibleBottom -> targetRect.bottom - visibleBottom
                 targetRect.top < visibleTop -> targetRect.top - visibleTop
